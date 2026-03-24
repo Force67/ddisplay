@@ -1,0 +1,40 @@
+[package]
+name = "ddisplay-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Web server + WebSocket
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+
+# X11 screen capture and input (pure Rust)
+x11rb = { version = "0.14", features = ["allow-unsafe-code", "shm", "xfixes", "xtest", "randr", "damage"] }
+
+# Dynamic library loading (for NVENC/CUDA)
+libloading = "0.8"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# CLI arguments
+clap = { version = "4", features = ["derive"] }
+
+# Image processing
+image = "0.25"
+
+# Misc
+bytes = "1"
+parking_lot = "0.12"

@@ -1,3 +1,4 @@
+pub mod ffmpeg;
 pub mod nvenc;
 pub mod nvenc_sys;
 

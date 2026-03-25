@@ -12,7 +12,7 @@ axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 
 # X11 screen capture and input (pure Rust)
-x11rb = { version = "0.13", features = ["allow-unsafe-code", "shm", "xfixes", "xtest", "randr", "damage"] }
+x11rb = { version = "0.13", default-features = false, features = ["allow-unsafe-code", "shm", "xfixes", "xtest", "randr", "damage"] }
 
 # Dynamic library loading (for NVENC/CUDA)
 libloading = "0.8"

@@ -12,8 +12,6 @@ mod transport;
 mod input;
 
 use capture::x11::X11Capturer;
-use cuda::CudaContext;
-use encoder::nvenc::NvencEncoder;
 use encoder::Encoder;
 use input::x11::X11InputInjector;
 use protocol::ClientEvent;
@@ -58,16 +56,18 @@ async fn main() -> anyhow::Result<()> {
     let screen_h = capturer.screen_height();
     tracing::info!("Screen: {}x{}", screen_w, screen_h);
 
-    // --- CUDA + NVENC ---
-    let cuda_ctx = CudaContext::new()?;
-    let encoder = NvencEncoder::new(&cuda_ctx, screen_w, screen_h, args.fps, args.bitrate)?;
-    tracing::info!(
-        "NVENC encoder initialised ({}x{} @ {} fps, {} bps)",
-        screen_w,
-        screen_h,
-        args.fps,
-        args.bitrate,
-    );
+    // --- Encoder: try NVENC first, fallback to ffmpeg ---
+    let encoder: Box<dyn Encoder> = match try_nvenc(screen_w, screen_h, args.fps, args.bitrate) {
+        Ok(enc) => {
+            tracing::info!("Using NVENC hardware encoder");
+            Box::new(enc)
+        }
+        Err(e) => {
+            tracing::warn!("NVENC not available ({}), falling back to ffmpeg/libx264", e);
+            let enc = encoder::ffmpeg::FfmpegEncoder::new(screen_w, screen_h, args.fps, args.bitrate)?;
+            Box::new(enc)
+        }
+    };
 
     // --- X11 input injector ---
     let injector = X11InputInjector::new()?;
@@ -86,6 +86,17 @@ async fn main() -> anyhow::Result<()> {
     run_capture_loop(capturer, encoder, frame_tx, screen_w, screen_h, args.fps).await?;
 
     Ok(())
+}
+
+/// Attempt to create an NVENC hardware encoder.
+fn try_nvenc(
+    width: u32,
+    height: u32,
+    fps: u32,
+    bitrate: u32,
+) -> anyhow::Result<encoder::nvenc::NvencEncoder> {
+    let cuda_ctx = cuda::CudaContext::new()?;
+    encoder::nvenc::NvencEncoder::new(&cuda_ctx, width, height, fps, bitrate)
 }
 
 /// Spawn a dedicated blocking task that reads client input events and
@@ -119,7 +130,7 @@ fn spawn_input_handler(injector: X11InputInjector, mut input_rx: mpsc::Receiver<
 /// encoded packets to all connected WebSocket clients.
 async fn run_capture_loop(
     mut capturer: X11Capturer,
-    mut encoder: NvencEncoder,
+    mut encoder: Box<dyn Encoder>,
     frame_tx: transport::websocket::FrameSender,
     screen_w: u32,
     screen_h: u32,
@@ -156,7 +167,7 @@ async fn run_capture_loop(
             encoder::EncodedPacket,
             Option<capture::CursorInfo>,
             X11Capturer,
-            NvencEncoder,
+            Box<dyn Encoder>,
         )> {
             let frame = capturer.capture_frame()?;
             let packet = encoder.encode(

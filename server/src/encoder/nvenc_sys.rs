@@ -14,19 +14,34 @@ use std::ffi::c_void;
 // NVENC API versioning
 // ---------------------------------------------------------------------------
 
-/// NVENC API major version.
+/// NVENC API major version (minimum we require).
 pub const NVENCAPI_MAJOR_VERSION: u32 = 12;
 
 /// NVENC API minor version.
-pub const NVENCAPI_MINOR_VERSION: u32 = 2;
+pub const NVENCAPI_MINOR_VERSION: u32 = 0;
 
 /// Packed NVENC API version: major in low bits, minor shifted left 24 bits.
+/// This is the format used in `apiVersion` fields and struct version tags.
 pub const NVENCAPI_VERSION: u32 = NVENCAPI_MAJOR_VERSION | (NVENCAPI_MINOR_VERSION << 24);
 
 /// Compute a versioned struct tag. The NVENC convention is:
 ///   (struct_version) | (NVENCAPI_VERSION << 16) | (0x7 << 28)
 pub const fn nvenc_struct_version(ver: u32) -> u32 {
     ver | (NVENCAPI_VERSION << 16) | (0x7 << 28)
+}
+
+/// Compute a struct version using a runtime API version value.
+/// `api_ver` should be in NVENCAPI_VERSION format (major | (minor << 24)).
+pub fn nvenc_struct_version_runtime(ver: u32, api_ver: u32) -> u32 {
+    ver | (api_ver << 16) | (0x7 << 28)
+}
+
+/// Convert the format returned by NvEncodeAPIGetMaxSupportedVersion
+/// ((major << 4) | minor) to the NVENCAPI_VERSION format (major | (minor << 24)).
+pub fn max_ver_to_api_version(max_ver: u32) -> u32 {
+    let major = max_ver >> 4;
+    let minor = max_ver & 0xF;
+    major | (minor << 24)
 }
 
 // ---------------------------------------------------------------------------
@@ -246,23 +261,24 @@ pub struct NvEncOpenEncodeSessionExParams {
     pub device: *mut c_void,
     pub reserved: *mut c_void,
     pub apiVersion: u32,
-    pub reserved1: u32,
+    pub reserved1: [u32; 253],
     pub reserved2: [*mut c_void; 64],
 }
 
 impl Default for NvEncOpenEncodeSessionExParams {
     fn default() -> Self {
-        Self {
-            version: NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER,
-            deviceType: 0,
-            device: std::ptr::null_mut(),
-            reserved: std::ptr::null_mut(),
-            apiVersion: NVENCAPI_VERSION,
-            reserved1: 0,
-            reserved2: [std::ptr::null_mut(); 64],
+        unsafe {
+            let mut s: Self = std::mem::zeroed();
+            s.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
+            s.apiVersion = NVENCAPI_VERSION;
+            s
         }
     }
 }
+
+/// `NvEncodeAPIGetMaxSupportedVersion` function type.
+pub type NvEncodeAPIGetMaxSupportedVersionFn =
+    unsafe extern "C" fn(version: *mut u32) -> NVENCSTATUS;
 
 // ---------------------------------------------------------------------------
 // NV_ENC_RC_PARAMS — rate-control sub-structure inside NV_ENC_CONFIG

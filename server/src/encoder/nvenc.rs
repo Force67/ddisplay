@@ -64,6 +64,9 @@ pub struct NvencEncoder {
 
     /// Monotonically increasing presentation timestamp counter.
     pts_counter: u64,
+
+    /// API version (in NVENCAPI_VERSION format) for runtime struct versioning.
+    api_version: u32,
 }
 
 // SAFETY: The NVENC API is thread-safe when each encoder session is only used
@@ -107,7 +110,35 @@ impl NvencEncoder {
                 .get(b"NvEncodeAPICreateInstance\0")
                 .context("Failed to find NvEncodeAPICreateInstance")?;
 
-            let mut fn_list = NvEncFunctionList::default();
+            // Query the maximum supported NVENC API version
+            // Query the driver's maximum supported NVENC API version.
+            let get_max_ver: libloading::Symbol<NvEncodeAPIGetMaxSupportedVersionFn> = lib
+                .get(b"NvEncodeAPIGetMaxSupportedVersion\0")
+                .context("Failed to find NvEncodeAPIGetMaxSupportedVersion")?;
+
+            let mut max_ver_raw: u32 = 0;
+            let status = get_max_ver(&mut max_ver_raw);
+            check(status, "NvEncodeAPIGetMaxSupportedVersion")?;
+
+            // max_ver_raw is (major << 4) | minor format
+            let drv_major = max_ver_raw >> 4;
+            let drv_minor = max_ver_raw & 0xF;
+            tracing::info!(
+                "Driver supports NVENC API version {}.{} (raw: 0x{:04X})",
+                drv_major,
+                drv_minor,
+                max_ver_raw,
+            );
+
+            // Convert to NVENCAPI_VERSION format and use the driver's version
+            let api_version = max_ver_to_api_version(max_ver_raw);
+            tracing::info!("Using NVENC API version 0x{:08X}", api_version);
+
+            // Helper to compute struct versions with the driver's API version
+            let sv = |ver: u32| -> u32 { nvenc_struct_version_runtime(ver, api_version) };
+
+            let mut fn_list: NvEncFunctionList = unsafe { std::mem::zeroed() };
+            fn_list.version = sv(2);
             let status = create_instance(&mut fn_list);
             check(status, "NvEncodeAPICreateInstance")?;
 
@@ -116,10 +147,19 @@ impl NvencEncoder {
             // ------------------------------------------------------------------
             // 3. Open an encode session on the CUDA context
             // ------------------------------------------------------------------
-            let mut session_params = NvEncOpenEncodeSessionExParams::default();
+            let mut session_params: NvEncOpenEncodeSessionExParams = unsafe { std::mem::zeroed() };
+            session_params.version = sv(1);
             session_params.deviceType = NV_ENC_DEVICE_TYPE_CUDA;
             session_params.device = cuda_ctx.as_ptr();
-            session_params.apiVersion = NVENCAPI_VERSION;
+            session_params.apiVersion = api_version;
+
+            tracing::info!(
+                "OpenEncodeSessionEx: version=0x{:08X}, deviceType={}, apiVersion=0x{:08X}, struct_size={}",
+                session_params.version,
+                session_params.deviceType,
+                session_params.apiVersion,
+                std::mem::size_of::<NvEncOpenEncodeSessionExParams>(),
+            );
 
             let mut encoder: *mut c_void = ptr::null_mut();
 
@@ -127,6 +167,16 @@ impl NvencEncoder {
                 .nvEncOpenEncodeSessionEx
                 .context("nvEncOpenEncodeSessionEx is null")?;
             let status = open_fn(&mut session_params, &mut encoder);
+            if status != NV_ENC_SUCCESS {
+                // Try to get error string
+                if let Some(get_err) = fn_list.nvEncGetLastErrorString {
+                    let err_str = get_err(encoder);
+                    if !err_str.is_null() {
+                        let msg = std::ffi::CStr::from_ptr(err_str.cast()).to_string_lossy();
+                        tracing::error!("NVENC error detail: {}", msg);
+                    }
+                }
+            }
             check(status, "nvEncOpenEncodeSessionEx")?;
 
             tracing::debug!("NVENC encode session opened");
@@ -134,7 +184,9 @@ impl NvencEncoder {
             // ------------------------------------------------------------------
             // 4. Query preset config (P4 + low-latency tuning)
             // ------------------------------------------------------------------
-            let mut preset_config = NvEncPresetConfig::default();
+            let mut preset_config: NvEncPresetConfig = unsafe { std::mem::zeroed() };
+            preset_config.version = sv(4);
+            preset_config.presetCfg.version = sv(8);
 
             let get_preset_fn = fn_list
                 .nvEncGetEncodePresetConfigEx
@@ -154,7 +206,7 @@ impl NvencEncoder {
             // 5. Customise the encode configuration
             // ------------------------------------------------------------------
             let mut encode_config = preset_config.presetCfg.clone();
-            encode_config.version = NV_ENC_CONFIG_VER;
+            encode_config.version = sv(8);
 
             // Profile: Baseline (widely supported by decoders)
             encode_config.profileGUID = NV_ENC_H264_PROFILE_BASELINE_GUID;
@@ -182,7 +234,8 @@ impl NvencEncoder {
             // ------------------------------------------------------------------
             // 6. Initialise the encoder
             // ------------------------------------------------------------------
-            let mut init_params = NvEncInitializeParams::default();
+            let mut init_params: NvEncInitializeParams = unsafe { std::mem::zeroed() };
+            init_params.version = sv(6);
             init_params.encodeGUID = NV_ENC_CODEC_H264_GUID;
             init_params.presetGUID = NV_ENC_PRESET_P4_GUID;
             init_params.encodeWidth = width;
@@ -215,7 +268,8 @@ impl NvencEncoder {
             // ------------------------------------------------------------------
             // 7. Create input buffer (ARGB / BGRA, encoder-managed system memory)
             // ------------------------------------------------------------------
-            let mut input_buf_params = NvEncCreateInputBuffer::default();
+            let mut input_buf_params: NvEncCreateInputBuffer = unsafe { std::mem::zeroed() };
+            input_buf_params.version = sv(1);
             input_buf_params.width = width;
             input_buf_params.height = height;
             input_buf_params.bufferFmt = NV_ENC_BUFFER_FORMAT_ARGB;
@@ -233,7 +287,8 @@ impl NvencEncoder {
             // ------------------------------------------------------------------
             // 8. Create output bitstream buffer
             // ------------------------------------------------------------------
-            let mut output_buf_params = NvEncCreateBitstreamBuffer::default();
+            let mut output_buf_params: NvEncCreateBitstreamBuffer = unsafe { std::mem::zeroed() };
+            output_buf_params.version = sv(1);
 
             let create_output_fn = fn_list
                 .nvEncCreateBitstreamBuffer
@@ -253,8 +308,14 @@ impl NvencEncoder {
                 width,
                 height,
                 pts_counter: 0,
+                api_version,
             })
         }
+    }
+
+    /// Compute a struct version using this encoder's API version.
+    fn sv(&self, ver: u32) -> u32 {
+        nvenc_struct_version_runtime(ver, self.api_version)
     }
 
     /// Copy a BGRA frame into the NVENC input buffer, row by row.
@@ -279,7 +340,8 @@ impl NvencEncoder {
             .nvEncLockInputBuffer
             .context("nvEncLockInputBuffer is null")?;
 
-        let mut lock_params = NvEncLockInputBuffer::default();
+        let mut lock_params: NvEncLockInputBuffer = unsafe { std::mem::zeroed() };
+        lock_params.version = self.sv(1);
         lock_params.inputBuffer = self.input_buffer;
 
         let status = unsafe { lock_fn(self.encoder, &mut lock_params) };
@@ -345,7 +407,8 @@ impl NvencEncoder {
             .nvEncLockBitstream
             .context("nvEncLockBitstream is null")?;
 
-        let mut lock_params = NvEncLockBitstream::default();
+        let mut lock_params: NvEncLockBitstream = unsafe { std::mem::zeroed() };
+        lock_params.version = self.sv(1);
         lock_params.outputBitstream = self.output_buffer;
 
         let status = unsafe { lock_fn(self.encoder, &mut lock_params) };
@@ -397,7 +460,8 @@ impl Encoder for NvencEncoder {
             let pitch = self.upload_frame(frame_data, width, height, stride)?;
 
             // 2. Build encode picture params.
-            let mut pic_params = NvEncPicParams::default();
+            let mut pic_params: NvEncPicParams = unsafe { std::mem::zeroed() };
+            pic_params.version = self.sv(6);
             pic_params.inputWidth = width;
             pic_params.inputHeight = height;
             pic_params.inputPitch = pitch;
@@ -439,9 +503,9 @@ impl Encoder for NvencEncoder {
 
         unsafe {
             // Send an EOS notification to flush any buffered frames.
-            let mut pic_params = NvEncPicParams::default();
+            let mut pic_params: NvEncPicParams = unsafe { std::mem::zeroed() };
+            pic_params.version = self.sv(6);
             pic_params.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
-            pic_params.version = NV_ENC_PIC_PARAMS_VER;
 
             let encode_fn = self
                 .fn_list

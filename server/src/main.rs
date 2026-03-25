@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- WebSocket transport ---
     let client_dir = PathBuf::from(&args.client_dir);
-    let (frame_tx, input_rx) =
+    let (frame_tx, input_rx, keyframe_cache) =
         transport::websocket::start_server(args.bind.clone(), client_dir).await?;
 
     tracing::info!("Listening on http://{}", args.bind);
@@ -83,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
     spawn_input_handler(injector, input_rx);
 
     // --- Capture / encode loop ---
-    run_capture_loop(capturer, encoder, frame_tx, screen_w, screen_h, args.fps).await?;
+    run_capture_loop(capturer, encoder, frame_tx, keyframe_cache, screen_w, screen_h, args.fps).await?;
 
     Ok(())
 }
@@ -132,6 +132,7 @@ async fn run_capture_loop(
     mut capturer: X11Capturer,
     mut encoder: Box<dyn Encoder>,
     frame_tx: transport::websocket::FrameSender,
+    keyframe_cache: transport::websocket::KeyframeCache,
     screen_w: u32,
     screen_h: u32,
     fps: u32,
@@ -201,6 +202,12 @@ async fn run_capture_loop(
             screen_h as u16,
             &packet.data,
         );
+
+        // Cache keyframes so new clients get one immediately.
+        if packet.keyframe {
+            *keyframe_cache.lock() = Some(wire.clone());
+        }
+
         // Ignore send errors -- they just mean no clients are connected.
         let _ = frame_tx.send(wire);
 

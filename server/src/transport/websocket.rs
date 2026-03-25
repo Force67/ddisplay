@@ -10,16 +10,20 @@ use tower_http::services::ServeDir;
 use tokio::sync::{broadcast, mpsc};
 use std::path::PathBuf;
 use std::sync::Arc;
+use parking_lot::Mutex;
 use crate::protocol::{self, ClientEvent};
 
 /// Broadcast sender for encoded frames (server -> all clients).
 pub type FrameSender = broadcast::Sender<Vec<u8>>;
 /// Receiver end for input events from clients (client -> server).
 pub type InputReceiver = mpsc::Receiver<protocol::ClientEvent>;
+/// Shared cache for the latest keyframe.
+pub type KeyframeCache = Arc<Mutex<Option<Vec<u8>>>>;
 
 struct AppState {
     frame_tx: FrameSender,
     input_tx: mpsc::Sender<ClientEvent>,
+    keyframe_cache: KeyframeCache,
 }
 
 /// Start the WebSocket server.
@@ -29,17 +33,15 @@ struct AppState {
 pub async fn start_server(
     bind_addr: String,
     client_dir: PathBuf,
-) -> anyhow::Result<(FrameSender, InputReceiver)> {
-    // Frame broadcast channel: generous capacity so slow clients drop frames
-    // rather than blocking the encoder pipeline.
+) -> anyhow::Result<(FrameSender, InputReceiver, KeyframeCache)> {
     let (frame_tx, _) = broadcast::channel::<Vec<u8>>(120);
-
-    // Input channel from all clients -> single consumer in the main loop.
     let (input_tx, input_rx) = mpsc::channel::<ClientEvent>(1024);
+    let keyframe_cache: KeyframeCache = Arc::new(Mutex::new(None));
 
     let state = Arc::new(AppState {
         frame_tx: frame_tx.clone(),
         input_tx,
+        keyframe_cache: keyframe_cache.clone(),
     });
 
     let app = Router::new()
@@ -56,7 +58,7 @@ pub async fn start_server(
         }
     });
 
-    Ok((frame_tx, input_rx))
+    Ok((frame_tx, input_rx, keyframe_cache))
 }
 
 /// Axum handler that upgrades an HTTP request to a WebSocket connection.
@@ -73,6 +75,15 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>) {
     tracing::info!("{}: WebSocket connected", peer);
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
+
+    // Send cached keyframe immediately so the client can start decoding.
+    let cached_kf = state.keyframe_cache.lock().clone();
+    if let Some(kf) = cached_kf {
+        if ws_sender.send(Message::Binary(kf.into())).await.is_err() {
+            return;
+        }
+        tracing::debug!("Sent cached keyframe to new client");
+    }
 
     // Subscribe to the frame broadcast so this client receives all future frames.
     let mut frame_rx = state.frame_tx.subscribe();

@@ -14,6 +14,9 @@ tower-http = { version = "0.6", features = ["cors", "fs"] }
 # X11 screen capture and input (pure Rust)
 x11rb = { version = "0.13", default-features = false, features = ["allow-unsafe-code", "shm", "xfixes", "xtest", "randr", "damage"] }
 
+# H.264 encoder (Cisco OpenH264, built from source)
+openh264 = "0.9"
+
 # Dynamic library loading (for NVENC/CUDA)
 libloading = "0.8"
 

@@ -1,4 +1,4 @@
-pub mod ffmpeg;
+pub mod openh264_enc;
 pub mod nvenc;
 pub mod nvenc_sys;
 

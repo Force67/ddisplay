@@ -56,15 +56,17 @@ async fn main() -> anyhow::Result<()> {
     let screen_h = capturer.screen_height();
     tracing::info!("Screen: {}x{}", screen_w, screen_h);
 
-    // --- Encoder: try NVENC first, fallback to ffmpeg ---
+    // --- Encoder: try NVENC first, then OpenH264 ---
     let encoder: Box<dyn Encoder> = match try_nvenc(screen_w, screen_h, args.fps, args.bitrate) {
         Ok(enc) => {
             tracing::info!("Using NVENC hardware encoder");
             Box::new(enc)
         }
         Err(e) => {
-            tracing::warn!("NVENC not available ({}), falling back to ffmpeg/libx264", e);
-            let enc = encoder::ffmpeg::FfmpegEncoder::new(screen_w, screen_h, args.fps, args.bitrate)?;
+            tracing::info!("NVENC not available ({e}), using OpenH264 software encoder");
+            let enc = encoder::openh264_enc::OpenH264Encoder::new(
+                screen_w, screen_h, args.fps, args.bitrate,
+            )?;
             Box::new(enc)
         }
     };

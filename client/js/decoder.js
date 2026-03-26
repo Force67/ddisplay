@@ -118,7 +118,7 @@ export class H264Decoder {
         });
 
         this.#decoder.configure({
-            codec: 'avc1.42001e',
+            codec: 'avc1.42c028',
             codedWidth: width,
             codedHeight: height,
             optimizeForLatency: true,

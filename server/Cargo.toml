@@ -17,9 +17,6 @@ x11rb = { version = "0.13", default-features = false, features = ["allow-unsafe-
 # H.264 encoder (Cisco OpenH264, built from source)
 openh264 = "0.9"
 
-# Dynamic library loading (for NVENC/CUDA)
-libloading = "0.8"
-
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -30,13 +27,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Error handling
 anyhow = "1"
-thiserror = "2"
 
 # CLI arguments
 clap = { version = "4", features = ["derive"] }
-
-# Image processing
-image = "0.25"
 
 # Stream utilities (needed for WebSocket split)
 futures-util = "0.3"
@@ -44,6 +37,5 @@ futures-util = "0.3"
 # System V shared memory (for X11 SHM capture)
 libc = "0.2"
 
-# Misc
-bytes = "1"
+# Shared state
 parking_lot = "0.12"

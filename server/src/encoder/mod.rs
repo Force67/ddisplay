@@ -1,6 +1,4 @@
 pub mod openh264_enc;
-pub mod nvenc;
-pub mod nvenc_sys;
 
 /// Encoded video packet.
 #[derive(Debug)]

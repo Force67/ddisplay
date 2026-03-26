@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use std::ptr;
 use x11rb::connection::Connection;
-use x11rb::protocol::shm::{self, ConnectionExt as ShmConnectionExt};
-use x11rb::protocol::xfixes::{self, ConnectionExt as XFixesConnectionExt};
-use x11rb::protocol::xproto::{self, ConnectionExt, ImageFormat};
+use x11rb::protocol::shm::{self, ConnectionExt as _};
+use x11rb::protocol::xfixes::{self};
+use x11rb::protocol::xproto::{self, ImageFormat};
 use x11rb::rust_connection::RustConnection;
 
 use super::{CapturedFrame, CursorInfo};

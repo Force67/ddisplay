@@ -7,7 +7,6 @@ use tracing_subscriber::EnvFilter;
 mod protocol;
 mod capture;
 mod encoder;
-mod cuda;
 mod transport;
 mod input;
 
@@ -17,18 +16,18 @@ use input::x11::X11InputInjector;
 use protocol::ClientEvent;
 
 #[derive(Parser)]
-#[command(name = "ddisplay-server", about = "GPU-accelerated remote display server")]
+#[command(name = "ddisplay-server", about = "Remote display server with H.264 streaming")]
 struct Args {
     /// Address to bind the WebSocket server to.
     #[arg(short, long, default_value = "0.0.0.0:9550")]
     bind: String,
 
     /// Target frames per second.
-    #[arg(short, long, default_value_t = 60)]
+    #[arg(short, long, default_value_t = 30)]
     fps: u32,
 
     /// Video bitrate in bits per second.
-    #[arg(long, default_value_t = 10_000_000)]
+    #[arg(long, default_value_t = 5_000_000)]
     bitrate: u32,
 
     /// Path to the directory containing the web client files.
@@ -40,7 +39,6 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // Initialise structured logging.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -56,20 +54,10 @@ async fn main() -> anyhow::Result<()> {
     let screen_h = capturer.screen_height();
     tracing::info!("Screen: {}x{}", screen_w, screen_h);
 
-    // --- Encoder: try NVENC first, then OpenH264 ---
-    let encoder: Box<dyn Encoder> = match try_nvenc(screen_w, screen_h, args.fps, args.bitrate) {
-        Ok(enc) => {
-            tracing::info!("Using NVENC hardware encoder");
-            Box::new(enc)
-        }
-        Err(e) => {
-            tracing::info!("NVENC not available ({e}), using OpenH264 software encoder");
-            let enc = encoder::openh264_enc::OpenH264Encoder::new(
-                screen_w, screen_h, args.fps, args.bitrate,
-            )?;
-            Box::new(enc)
-        }
-    };
+    // --- H.264 encoder ---
+    let encoder = encoder::openh264_enc::OpenH264Encoder::new(
+        screen_w, screen_h, args.fps, args.bitrate,
+    )?;
 
     // --- X11 input injector ---
     let injector = X11InputInjector::new()?;
@@ -90,25 +78,11 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Attempt to create an NVENC hardware encoder.
-fn try_nvenc(
-    width: u32,
-    height: u32,
-    fps: u32,
-    bitrate: u32,
-) -> anyhow::Result<encoder::nvenc::NvencEncoder> {
-    let cuda_ctx = cuda::CudaContext::new()?;
-    encoder::nvenc::NvencEncoder::new(&cuda_ctx, width, height, fps, bitrate)
-}
-
 /// Spawn a dedicated blocking task that reads client input events and
 /// injects them into the X11 server.
 fn spawn_input_handler(injector: X11InputInjector, mut input_rx: mpsc::Receiver<ClientEvent>) {
-    // Bridge from the async tokio mpsc channel to a std::sync::mpsc so the
-    // blocking thread can loop without touching the async runtime.
     let (sync_tx, sync_rx) = std::sync::mpsc::channel::<ClientEvent>();
 
-    // Async relay: tokio mpsc -> std mpsc.
     tokio::spawn(async move {
         while let Some(event) = input_rx.recv().await {
             if sync_tx.send(event).is_err() {
@@ -117,7 +91,6 @@ fn spawn_input_handler(injector: X11InputInjector, mut input_rx: mpsc::Receiver<
         }
     });
 
-    // Blocking consumer that owns the X11 connection.
     tokio::task::spawn_blocking(move || {
         for event in sync_rx {
             if let Err(e) = injector.inject_event(&event) {
@@ -128,11 +101,11 @@ fn spawn_input_handler(injector: X11InputInjector, mut input_rx: mpsc::Receiver<
     });
 }
 
-/// Capture frames from X11, encode them via NVENC, and broadcast the
-/// encoded packets to all connected WebSocket clients.
+/// Capture frames from X11, encode with H.264, and broadcast to all
+/// connected WebSocket clients.
 async fn run_capture_loop(
     mut capturer: X11Capturer,
-    mut encoder: Box<dyn Encoder>,
+    mut encoder: encoder::openh264_enc::OpenH264Encoder,
     frame_tx: transport::websocket::FrameSender,
     keyframe_cache: transport::websocket::KeyframeCache,
     screen_w: u32,
@@ -141,36 +114,31 @@ async fn run_capture_loop(
 ) -> anyhow::Result<()> {
     let frame_interval = std::time::Duration::from_secs_f64(1.0 / fps as f64);
     let mut interval = tokio::time::interval(frame_interval);
-    // If we fall behind, skip missed ticks instead of bursting.
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut frame_count: u64 = 0;
-    let mut force_keyframe = true; // First frame is always a keyframe.
+    let mut force_keyframe = true;
     let mut fps_timer = Instant::now();
     let mut fps_frame_count: u64 = 0;
 
     loop {
         interval.tick().await;
 
-        // Periodically force a keyframe so new clients can start decoding
-        // quickly (every 2 seconds).
+        // Force keyframe every 2 seconds for late-joining clients.
         if frame_count > 0 && frame_count % (fps as u64 * 2) == 0 {
             force_keyframe = true;
         }
 
         let kf = force_keyframe;
         force_keyframe = false;
-
         let fc = frame_count;
 
-        // Capture + encode are CPU/GPU-bound; run on the blocking pool.
-        // We move capturer and encoder in and get them back out so the
-        // next iteration can reuse them.
+        // Capture + encode on the blocking pool.
         let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(
             encoder::EncodedPacket,
             Option<capture::CursorInfo>,
             X11Capturer,
-            Box<dyn Encoder>,
+            encoder::openh264_enc::OpenH264Encoder,
         )> {
             let frame = capturer.capture_frame()?;
             let packet = encoder.encode(
@@ -181,7 +149,6 @@ async fn run_capture_loop(
                 kf,
             )?;
 
-            // Grab cursor info every 10 frames.
             let cursor = if fc % 10 == 0 {
                 capturer.get_cursor_info().ok()
             } else {
@@ -196,7 +163,6 @@ async fn run_capture_loop(
         capturer = cap;
         encoder = enc;
 
-        // Broadcast the encoded frame.
         let wire = protocol::encode_video_frame(
             packet.keyframe,
             packet.pts,
@@ -205,15 +171,12 @@ async fn run_capture_loop(
             &packet.data,
         );
 
-        // Cache keyframes so new clients get one immediately.
         if packet.keyframe {
             *keyframe_cache.lock() = Some(wire.clone());
         }
 
-        // Ignore send errors -- they just mean no clients are connected.
         let _ = frame_tx.send(wire);
 
-        // Broadcast cursor update if available.
         if let Some(ci) = cursor {
             let wire = protocol::encode_cursor_update(
                 ci.x.max(0) as u16,
@@ -226,7 +189,6 @@ async fn run_capture_loop(
         frame_count += 1;
         fps_frame_count += 1;
 
-        // Log actual FPS every 5 seconds.
         let elapsed = fps_timer.elapsed();
         if elapsed.as_secs() >= 5 {
             let actual_fps = fps_frame_count as f64 / elapsed.as_secs_f64();

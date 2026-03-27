@@ -50,11 +50,14 @@ export class Renderer {
      *
      * @param {VideoFrame} frame
      */
+    #renderCount = 0;
+
     drawFrame(frame) {
         const w = frame.displayWidth;
         const h = frame.displayHeight;
 
         if (w !== this.#remoteWidth || h !== this.#remoteHeight) {
+            console.log(`[renderer] resolution change: ${w}x${h}`);
             this.#remoteWidth = w;
             this.#remoteHeight = h;
             this.#canvas.width = w;
@@ -63,6 +66,12 @@ export class Renderer {
 
         try {
             this.#ctx.drawImage(frame, 0, 0, w, h);
+            this.#renderCount++;
+            if (this.#renderCount <= 3) {
+                console.log(`[renderer] drew frame #${this.#renderCount}: ${w}x${h}`);
+            }
+        } catch (e) {
+            console.error('[renderer] drawImage error:', e);
         } finally {
             frame.close();
         }

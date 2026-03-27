@@ -11,32 +11,38 @@ export class H264Decoder {
     #configuredHeight = 0;
     /** @type {boolean} */
     #awaitingKeyframe = true;
+    /** @type {number} */
+    #frameCount = 0;
 
-    /** Maximum number of chunks queued before dropping non-keyframes. */
     static MAX_QUEUE_SIZE = 8;
 
     /**
-     * Called with each decoded VideoFrame. The receiver MUST call frame.close()
-     * when finished to release GPU memory.
+     * Called with each decoded VideoFrame.
      * @type {((frame: VideoFrame) => void)|null}
      */
     onFrame = null;
 
-    /** Number of chunks currently queued in the underlying decoder. */
     get queueSize() {
         return this.#decoder ? this.#decoder.decodeQueueSize : 0;
     }
 
     /**
-     * Submit an H.264 Annex B frame for decoding.
-     *
-     * @param {Uint8Array} data       Raw Annex B bitstream data
-     * @param {boolean}    isKeyframe Whether this is an IDR / keyframe
-     * @param {number}     timestamp  Presentation timestamp in microseconds
-     * @param {number}     width      Frame width signalled by the server
-     * @param {number}     height     Frame height signalled by the server
+     * @param {Uint8Array} data       Raw Annex B bitstream
+     * @param {boolean}    isKeyframe
+     * @param {number}     timestamp  PTS in microseconds
+     * @param {number}     width
+     * @param {number}     height
      */
     decode(data, isKeyframe, timestamp, width, height) {
+        // Check WebCodecs support
+        if (typeof VideoDecoder === 'undefined') {
+            if (this.#frameCount === 0) {
+                console.error('[decoder] WebCodecs VideoDecoder not available in this browser');
+            }
+            this.#frameCount++;
+            return;
+        }
+
         const needsConfigure =
             !this.#decoder ||
             this.#decoder.state === 'closed' ||
@@ -45,7 +51,6 @@ export class H264Decoder {
 
         if (needsConfigure) {
             if (!isKeyframe) {
-                // Cannot configure without a keyframe; wait.
                 return;
             }
             this.#configure(width, height);
@@ -55,7 +60,6 @@ export class H264Decoder {
             return;
         }
 
-        // Backpressure: drop non-keyframes when the queue backs up.
         if (!isKeyframe && this.#decoder.decodeQueueSize >= H264Decoder.MAX_QUEUE_SIZE) {
             return;
         }
@@ -69,34 +73,26 @@ export class H264Decoder {
         try {
             this.#decoder.decode(chunk);
             this.#awaitingKeyframe = false;
+            this.#frameCount++;
+            if (this.#frameCount <= 3 || this.#frameCount % 300 === 0) {
+                console.log(`[decoder] decoded frame #${this.#frameCount}, kf=${isKeyframe}, size=${data.byteLength}, queue=${this.#decoder.decodeQueueSize}`);
+            }
         } catch (e) {
             console.warn('[decoder] decode error, awaiting next keyframe:', e);
             this.#awaitingKeyframe = true;
         }
     }
 
-    /** Release decoder resources. */
     destroy() {
         if (this.#decoder && this.#decoder.state !== 'closed') {
             this.#decoder.close();
         }
         this.#decoder = null;
-        this.#configuredWidth = 0;
-        this.#configuredHeight = 0;
-        this.#awaitingKeyframe = true;
     }
 
-    // -- internals --
-
-    /**
-     * (Re-)configure the underlying VideoDecoder for the given resolution.
-     * @param {number} width
-     * @param {number} height
-     */
     #configure(width, height) {
-        // Tear down previous decoder if any.
         if (this.#decoder && this.#decoder.state !== 'closed') {
-            try { this.#decoder.close(); } catch (_) { /* ignore */ }
+            try { this.#decoder.close(); } catch (_) {}
         }
 
         this.#configuredWidth = width;
@@ -117,11 +113,20 @@ export class H264Decoder {
             },
         });
 
+        // Try configuring with the codec from the SPS.
+        // OpenH264 Constrained Baseline Level 4.0
+        const codec = 'avc1.42c028';
+
+        console.log(`[decoder] configuring: codec=${codec}, ${width}x${height}`);
+
         this.#decoder.configure({
-            codec: 'avc1.42c028',
+            codec,
             codedWidth: width,
             codedHeight: height,
             optimizeForLatency: true,
+            hardwareAcceleration: 'prefer-software',
         });
+
+        console.log(`[decoder] configured, state=${this.#decoder.state}`);
     }
 }

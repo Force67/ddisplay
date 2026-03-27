@@ -27,9 +27,16 @@ const input     = new InputHandler(canvas);
 input.onSend = (buf) => transport.send(buf);
 
 // ---- Wiring: transport -> decoder -> renderer ----
+let msgCount = 0;
+
 transport.onMessage = (data) => {
     const view = new DataView(data);
     const type = view.getUint8(0);
+    msgCount++;
+
+    if (msgCount <= 5) {
+        console.log(`[ws] msg #${msgCount}: type=0x${type.toString(16)}, size=${data.byteLength}`);
+    }
 
     switch (type) {
         case SRV_VIDEO_FRAME:
@@ -42,6 +49,7 @@ transport.onMessage = (data) => {
             handleSessionInfo(data);
             break;
         default:
+            console.warn(`[ws] unknown message type: 0x${type.toString(16)}`);
             break;
     }
 };
@@ -50,19 +58,20 @@ transport.onMessage = (data) => {
  * Parse and decode a VideoFrame message.
  * Layout: [type:u8][keyframe:u8][pts:u64 LE][width:u16 LE][height:u16 LE][data...]
  */
+let frameIndex = 0;
+
 function handleVideoFrame(view, data) {
     const keyframe  = view.getUint8(1) !== 0;
-    // Read u64 LE timestamp (microseconds).  DataView has no getUint64, so
-    // reconstruct from two 32-bit halves.  Precision beyond 2^53 is not
-    // required for presentation timestamps.
-    const ptsLow    = view.getUint32(2, true);
-    const ptsHigh   = view.getUint32(6, true);
-    const pts       = ptsLow + ptsHigh * 0x100000000;
     const width     = view.getUint16(10, true);
     const height    = view.getUint16(12, true);
     const payload   = new Uint8Array(data, 14);
 
-    decoder.decode(payload, keyframe, pts, width, height);
+    // WebCodecs needs timestamps in microseconds. The server sends a frame
+    // counter, so we generate monotonic timestamps locally.
+    const timestamp = frameIndex * 33333; // ~30fps in microseconds
+    frameIndex++;
+
+    decoder.decode(payload, keyframe, timestamp, width, height);
 }
 
 /**

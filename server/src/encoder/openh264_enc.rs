@@ -32,7 +32,7 @@ impl OpenH264Encoder {
             .rate_control_mode(RateControlMode::Bitrate)
             .usage_type(UsageType::ScreenContentRealTime)
             .sps_pps_strategy(SpsPpsStrategy::ConstantId)
-            .skip_frames(false)
+            .skip_frames(true)
             .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(fps)); // IDR every second
 
         let encoder = Encoder::with_api_config(

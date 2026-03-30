@@ -1,63 +1,44 @@
 /**
- * Canvas2D renderer for decoded VideoFrame objects.
+ * Canvas2D renderer. Draws video frames (from <video> element or VideoFrame) to canvas.
  */
 export class Renderer {
     /** @type {HTMLCanvasElement} */
     #canvas;
     /** @type {CanvasRenderingContext2D} */
     #ctx;
-
-    /** @type {number} Remote desktop width. */
     #remoteWidth = 0;
-    /** @type {number} Remote desktop height. */
     #remoteHeight = 0;
-
-    // FPS tracking
-    /** @type {number[]} Timestamps of recent frames for FPS calculation. */
+    /** @type {number[]} */
     #frameTimes = [];
-    /** @type {number} Calculated FPS, updated once per second. */
     #fps = 0;
-    /** @type {number} */
-    #fpsUpdateTimer = 0;
 
-    /**
-     * @param {HTMLCanvasElement} canvas
-     */
     constructor(canvas) {
         this.#canvas = canvas;
         this.#ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
-        this.#fpsUpdateTimer = setInterval(() => this.#updateFps(), 1000);
+        setInterval(() => this.#updateFps(), 1000);
     }
 
-    /** Current FPS value. */
-    get fps() {
-        return this.#fps;
-    }
-
-    /** Current remote resolution width. */
-    get remoteWidth() {
-        return this.#remoteWidth;
-    }
-
-    /** Current remote resolution height. */
-    get remoteHeight() {
-        return this.#remoteHeight;
-    }
+    get fps() { return this.#fps; }
+    get remoteWidth() { return this.#remoteWidth; }
+    get remoteHeight() { return this.#remoteHeight; }
 
     /**
-     * Draw a decoded VideoFrame to the canvas and close it.
-     * Automatically resizes the canvas backing store when the remote resolution changes.
-     *
-     * @param {VideoFrame} frame
+     * Draw a <video> element or VideoFrame to the canvas.
+     * @param {HTMLVideoElement|VideoFrame} source
      */
-    #renderCount = 0;
-
-    drawFrame(frame) {
-        const w = frame.displayWidth;
-        const h = frame.displayHeight;
+    drawVideoFrame(source) {
+        let w, h;
+        if (source instanceof HTMLVideoElement) {
+            w = source.videoWidth;
+            h = source.videoHeight;
+            if (w === 0 || h === 0) return;
+        } else {
+            w = source.displayWidth;
+            h = source.displayHeight;
+        }
 
         if (w !== this.#remoteWidth || h !== this.#remoteHeight) {
-            console.log(`[renderer] resolution change: ${w}x${h}`);
+            console.log(`[renderer] resolution: ${w}x${h}`);
             this.#remoteWidth = w;
             this.#remoteHeight = h;
             this.#canvas.width = w;
@@ -65,30 +46,20 @@ export class Renderer {
         }
 
         try {
-            this.#ctx.drawImage(frame, 0, 0, w, h);
-            this.#renderCount++;
-            if (this.#renderCount <= 3) {
-                console.log(`[renderer] drew frame #${this.#renderCount}: ${w}x${h}`);
-            }
+            this.#ctx.drawImage(source, 0, 0, w, h);
         } catch (e) {
-            console.error('[renderer] drawImage error:', e);
-        } finally {
-            frame.close();
+            // Ignore transient errors (e.g., video not ready)
+        }
+
+        if (source instanceof VideoFrame) {
+            source.close();
         }
 
         this.#frameTimes.push(performance.now());
     }
 
-    /** Release resources. */
-    destroy() {
-        clearInterval(this.#fpsUpdateTimer);
-    }
-
-    // -- internals --
-
     #updateFps() {
         const now = performance.now();
-        // Keep only frames from the last 1000 ms.
         this.#frameTimes = this.#frameTimes.filter(t => now - t < 1000);
         this.#fps = this.#frameTimes.length;
     }

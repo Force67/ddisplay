@@ -117,8 +117,8 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>) {
             match msg {
                 Message::Binary(data) => {
                     if let Some(event) = protocol::parse_client_message(&data) {
+                        tracing::debug!("Input event: {:?}", event);
                         if input_tx.send(event).await.is_err() {
-                            // Main loop dropped the receiver – nothing to do.
                             break;
                         }
                     }

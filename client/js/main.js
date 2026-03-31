@@ -86,8 +86,10 @@ function handleVideoFrame(view, data) {
 }
 
 function handleCursorUpdate(view) {
+    const x = view.getUint16(1, true);
+    const y = view.getUint16(3, true);
     const visible = view.getUint8(5) !== 0;
-    canvas.style.cursor = visible ? 'default' : 'none';
+    renderer.setCursor(x, y, visible);
 }
 
 function handleSessionInfo(data) {

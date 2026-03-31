@@ -20,7 +20,7 @@ html, body {
     width: 100vw;
     height: 100vh;
     object-fit: contain;
-    cursor: none;
+    cursor: default;
 }
 
 /* Connection status overlay */

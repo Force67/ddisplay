@@ -1,16 +1,17 @@
 /// H.264 encoder using Cisco's OpenH264 library.
 ///
-/// Accepts BGRA frames from X11 capture, converts to YUV420P internally,
-/// and produces H.264 Annex B encoded output.
+/// Accepts BGRA frames from X11 capture, converts to YUV420P using our
+/// own fast batch converter, and feeds raw planes to OpenH264.
 
 use anyhow::{Context, Result};
 use openh264::encoder::{
     Encoder, EncoderConfig, FrameType,
     RateControlMode, SpsPpsStrategy, UsageType,
 };
-use openh264::formats::{BgraSliceU8, YUVBuffer};
+use openh264::formats::YUVBuffer;
 use openh264::Timestamp;
 
+use super::color;
 use super::{EncodedPacket, Encoder as EncoderTrait};
 
 pub struct OpenH264Encoder {
@@ -18,8 +19,10 @@ pub struct OpenH264Encoder {
     width: u32,
     height: u32,
     pts_counter: u64,
-    /// Pre-allocated YUV buffer for color conversion.
-    yuv_buf: YUVBuffer,
+    /// Single contiguous buffer for YUV data: [Y | U | V]
+    yuv_data: Vec<u8>,
+    y_len: usize,
+    u_len: usize,
 }
 
 unsafe impl Send for OpenH264Encoder {}
@@ -33,14 +36,18 @@ impl OpenH264Encoder {
             .usage_type(UsageType::ScreenContentRealTime)
             .sps_pps_strategy(SpsPpsStrategy::ConstantId)
             .skip_frames(true)
-            .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(fps)); // IDR every second
+            .intra_frame_period(openh264::encoder::IntraFramePeriod::from_num_frames(fps));
 
         let encoder = Encoder::with_api_config(
             openh264::OpenH264API::from_source(),
             config,
         ).context("Failed to create OpenH264 encoder")?;
 
-        let yuv_buf = YUVBuffer::new(width as usize, height as usize);
+        let w = width as usize;
+        let h = height as usize;
+        let y_len = w * h;
+        let u_len = (w / 2) * (h / 2);
+        let yuv_data = vec![0u8; y_len + u_len + u_len];
 
         tracing::info!(
             "OpenH264 encoder initialized: {}x{} @ {} fps, {} bps",
@@ -52,7 +59,9 @@ impl OpenH264Encoder {
             width,
             height,
             pts_counter: 0,
-            yuv_buf,
+            yuv_data,
+            y_len,
+            u_len,
         })
     }
 }
@@ -77,38 +86,30 @@ impl EncoderTrait for OpenH264Encoder {
             self.encoder.force_intra_frame();
         }
 
-        // Convert BGRA to YUV420P.
-        // If stride matches width*4, we can use BgraSliceU8 directly.
-        // Otherwise, we need to compact the data first.
-        let row_bytes = width as usize * 4;
-        let expected_size = row_bytes * height as usize;
+        let w = width as usize;
+        let h = height as usize;
 
-        if stride as usize == row_bytes {
-            let bgra = BgraSliceU8::new(
-                &frame_data[..expected_size],
-                (width as usize, height as usize),
-            );
-            self.yuv_buf.read_rgb(bgra);
-        } else {
-            // Compact rows into a contiguous buffer
-            let mut compact = vec![0u8; expected_size];
-            for y in 0..height as usize {
-                let src_offset = y * stride as usize;
-                let dst_offset = y * row_bytes;
-                compact[dst_offset..dst_offset + row_bytes]
-                    .copy_from_slice(&frame_data[src_offset..src_offset + row_bytes]);
-            }
-            let bgra = BgraSliceU8::new(
-                &compact,
-                (width as usize, height as usize),
-            );
-            self.yuv_buf.read_rgb(bgra);
-        }
+        // Fast BGRA -> YUV420 conversion into our contiguous buffer.
+        // Split the buffer into Y, U, V plane slices.
+        let (y_plane, uv_rest) = self.yuv_data.split_at_mut(self.y_len);
+        let (u_plane, v_plane) = uv_rest.split_at_mut(self.u_len);
 
-        // Encode the YUV frame.
-        let timestamp = Timestamp::from_millis(self.pts_counter * 33); // ~30fps timing
+        color::bgra_to_yuv420(
+            frame_data,
+            w,
+            h,
+            stride as usize,
+            y_plane,
+            u_plane,
+            v_plane,
+        );
+
+        // Clone ~3MB YUV data into YUVBuffer (it takes ownership).
+        let yuv_buf = YUVBuffer::from_vec(self.yuv_data.clone(), w, h);
+
+        let timestamp = Timestamp::from_millis(self.pts_counter * 16);
         let bitstream = self.encoder
-            .encode_at(&self.yuv_buf, timestamp)
+            .encode_at(&yuv_buf, timestamp)
             .context("OpenH264 encode failed")?;
 
         let keyframe = matches!(bitstream.frame_type(), FrameType::IDR | FrameType::I);

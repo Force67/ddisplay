@@ -6,7 +6,7 @@ use x11rb::protocol::xfixes::{self};
 use x11rb::protocol::xproto::{self, ImageFormat};
 use x11rb::rust_connection::RustConnection;
 
-use super::{CapturedFrame, CursorInfo};
+use super::{CapturedFrame, CapturedFrameRef, CursorInfo};
 
 /// X11 screen capturer using MIT-SHM for zero-copy frame grabs.
 ///
@@ -141,13 +141,11 @@ impl X11Capturer {
         })
     }
 
-    /// Capture a full-screen frame using MIT-SHM.
+    /// Capture a full-screen frame into SHM and return a zero-copy reference.
     ///
-    /// The X server writes pixel data directly into our shared memory segment,
-    /// and we copy it into a new `Vec<u8>`. The returned data is in BGRA format
-    /// (native X11 pixel order on little-endian systems with 32-bit depth).
-    pub fn capture_frame(&self) -> Result<CapturedFrame> {
-        // Request the X server to dump the root window contents into our SHM segment
+    /// The returned `CapturedFrameRef` borrows the SHM buffer directly — no
+    /// 8 MB copy. The data is valid until the next call to `capture_frame_ref`.
+    pub fn capture_frame_ref(&self) -> Result<CapturedFrameRef<'_>> {
         self.conn
             .shm_get_image(
                 self.root,
@@ -155,26 +153,34 @@ impl X11Capturer {
                 0,
                 self.width,
                 self.height,
-                0xFFFFFFFF, // plane mask: all planes
+                0xFFFFFFFF,
                 ImageFormat::Z_PIXMAP.into(),
                 self.shm_seg,
-                0, // offset into SHM segment
+                0,
             )?
             .reply()
             .context("shm_get_image failed")?;
 
-        // Copy the pixel data out of shared memory
         let data = unsafe {
-            std::slice::from_raw_parts(self.shm_ptr, self.shm_size).to_vec()
+            std::slice::from_raw_parts(self.shm_ptr, self.shm_size)
         };
 
-        let stride = self.width as u32 * 4;
-
-        Ok(CapturedFrame {
+        Ok(CapturedFrameRef {
             data,
             width: self.width as u32,
             height: self.height as u32,
-            stride,
+            stride: self.width as u32 * 4,
+        })
+    }
+
+    /// Capture a full-screen frame using MIT-SHM (allocating copy).
+    pub fn capture_frame(&self) -> Result<CapturedFrame> {
+        let frame_ref = self.capture_frame_ref()?;
+        Ok(CapturedFrame {
+            data: frame_ref.data.to_vec(),
+            width: frame_ref.width,
+            height: frame_ref.height,
+            stride: frame_ref.stride,
         })
     }
 

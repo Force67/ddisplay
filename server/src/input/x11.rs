@@ -40,6 +40,23 @@ impl X11InputInjector {
         Ok(Self { conn, root, keymap })
     }
 
+    /// Best-effort reset of common modifiers/buttons that may have been left
+    /// logically pressed by an interrupted remote session.
+    pub fn release_stuck_inputs(&self) -> anyhow::Result<()> {
+        // Common browser keyCodes for modifiers and lock/meta keys.
+        for keycode in [16_u32, 17, 18, 20, 91, 92, 93] {
+            let _ = self.key_event(keycode, false);
+        }
+
+        // Common mouse buttons a remote client may have left pressed.
+        for button in [0_u8, 1, 2, 3, 4] {
+            let _ = self.mouse_button(button, false);
+        }
+
+        self.conn.flush()?;
+        Ok(())
+    }
+
     /// Dispatch a client input event to the appropriate X11 injection method.
     pub fn inject_event(&self, event: &ClientEvent) -> anyhow::Result<()> {
         match event {

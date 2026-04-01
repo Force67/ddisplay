@@ -1,6 +1,6 @@
 use clap::Parser;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
@@ -27,7 +27,7 @@ struct Args {
     fps: u32,
 
     /// Video bitrate in bits per second.
-    #[arg(long, default_value_t = 5_000_000)]
+    #[arg(long, default_value_t = 8_000_000)]
     bitrate: u32,
 
     /// Path to the directory containing the web client files.
@@ -61,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- X11 input injector ---
     let injector = X11InputInjector::new()?;
+    injector.release_stuck_inputs()?;
 
     // --- WebSocket transport ---
     let client_dir = PathBuf::from(&args.client_dir);
@@ -69,11 +70,18 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Listening on http://{}", args.bind);
 
-    // --- Input handler task ---
+    // --- Input handler (dedicated blocking thread) ---
     spawn_input_handler(injector, input_rx);
 
-    // --- Capture / encode loop ---
-    run_capture_loop(capturer, encoder, frame_tx, keyframe_cache, screen_w, screen_h, args.fps).await?;
+    // --- Capture+encode loop (dedicated thread, zero-copy) ---
+    let fps = args.fps;
+    let kf_cache = keyframe_cache;
+
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = capture_encode_loop(capturer, encoder, frame_tx, kf_cache, screen_w, screen_h, fps) {
+            tracing::error!("Capture loop error: {}", e);
+        }
+    }).await?;
 
     Ok(())
 }
@@ -101,10 +109,11 @@ fn spawn_input_handler(injector: X11InputInjector, mut input_rx: mpsc::Receiver<
     });
 }
 
-/// Capture frames from X11, encode with H.264, and broadcast to all
-/// connected WebSocket clients.
-async fn run_capture_loop(
-    mut capturer: X11Capturer,
+/// Tight capture+encode loop running on a dedicated OS thread.
+///
+/// Avoids per-frame `spawn_blocking` overhead and uses zero-copy SHM reads.
+fn capture_encode_loop(
+    capturer: X11Capturer,
     mut encoder: encoder::openh264_enc::OpenH264Encoder,
     frame_tx: transport::websocket::FrameSender,
     keyframe_cache: transport::websocket::KeyframeCache,
@@ -112,57 +121,44 @@ async fn run_capture_loop(
     screen_h: u32,
     fps: u32,
 ) -> anyhow::Result<()> {
-    let frame_interval = std::time::Duration::from_secs_f64(1.0 / fps as f64);
-    let mut interval = tokio::time::interval(frame_interval);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let frame_interval = Duration::from_secs_f64(1.0 / fps as f64);
+    let keyframe_interval = fps as u64 * 2; // IDR every 2 seconds
 
     let mut frame_count: u64 = 0;
-    let mut force_keyframe = true;
+    let mut next_frame_time = Instant::now();
     let mut fps_timer = Instant::now();
     let mut fps_frame_count: u64 = 0;
 
     loop {
-        interval.tick().await;
-
-        // Force keyframe every 2 seconds for late-joining clients.
-        if frame_count > 0 && frame_count % (fps as u64 * 2) == 0 {
-            force_keyframe = true;
+        // Sleep until next frame time
+        let now = Instant::now();
+        if next_frame_time > now {
+            std::thread::sleep(next_frame_time - now);
+        }
+        next_frame_time += frame_interval;
+        // If we fell behind, skip to now instead of trying to catch up
+        if next_frame_time < Instant::now() {
+            next_frame_time = Instant::now() + frame_interval;
         }
 
-        let kf = force_keyframe;
-        force_keyframe = false;
-        let fc = frame_count;
+        let force_kf = frame_count == 0 || frame_count % keyframe_interval == 0;
 
-        // Capture + encode on the blocking pool.
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(
-            encoder::EncodedPacket,
-            Option<capture::CursorInfo>,
-            X11Capturer,
-            encoder::openh264_enc::OpenH264Encoder,
-        )> {
-            let frame = capturer.capture_frame()?;
-            let packet = encoder.encode(
-                &frame.data,
-                frame.width,
-                frame.height,
-                frame.stride,
-                kf,
-            )?;
+        // Zero-copy capture: borrow SHM buffer directly
+        let frame = capturer.capture_frame_ref()?;
 
-            let cursor = if fc % 10 == 0 {
-                capturer.get_cursor_info().ok()
-            } else {
-                None
-            };
+        // Encode directly from the SHM reference (no 8MB copy)
+        let packet = encoder.encode(
+            frame.data,
+            frame.width,
+            frame.height,
+            frame.stride,
+            force_kf,
+        )?;
 
-            Ok((packet, cursor, capturer, encoder))
-        })
-        .await?;
+        // Get cursor position (cheap X11 roundtrip, do it every frame)
+        let cursor = capturer.get_cursor_info().ok();
 
-        let (packet, cursor, cap, enc) = result?;
-        capturer = cap;
-        encoder = enc;
-
+        // Build wire messages
         let wire = protocol::encode_video_frame(
             packet.keyframe,
             packet.pts,

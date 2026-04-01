@@ -1,3 +1,4 @@
+pub mod color;
 pub mod openh264_enc;
 
 /// Encoded video packet.

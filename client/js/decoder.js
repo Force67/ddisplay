@@ -69,11 +69,14 @@ export class H264Decoder {
             node: this.#video,
             mode: 'video',
             flushingTime: 0,
+            maxDelay: 100,   // max 100ms buffer before dropping
             fps: this.#fps,
             clearBuffer: true,
             debug: false,
             onReady: () => {
                 console.log('[decoder] jMuxer ready');
+                // Minimize video element buffering
+                this.#video.playbackRate = 1.0;
                 this.#video.play().catch(() => {});
             },
             onError: (e) => {

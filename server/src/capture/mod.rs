@@ -11,6 +11,14 @@ pub struct CapturedFrame {
     pub stride: u32,
 }
 
+/// A zero-copy reference to pixel data in shared memory.
+pub struct CapturedFrameRef<'a> {
+    pub data: &'a [u8],
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+}
+
 /// Cursor position information.
 #[derive(Debug, Clone, Copy)]
 pub struct CursorInfo {

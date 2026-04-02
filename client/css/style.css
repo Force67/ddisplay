@@ -96,3 +96,49 @@ html, body {
 .stats span {
     white-space: nowrap;
 }
+
+.session-switcher,
+.helper-bar {
+    position: fixed;
+    right: 8px;
+    display: flex;
+    gap: 8px;
+    padding: 8px 10px;
+    background: rgba(0, 0, 0, 0.72);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border-radius: 8px;
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.8);
+    z-index: 60;
+}
+
+.session-switcher {
+    top: 8px;
+}
+
+.helper-bar {
+    bottom: 8px;
+    pointer-events: none;
+}
+
+.session-button {
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 999px;
+    padding: 6px 10px;
+    color: inherit;
+    text-decoration: none;
+    background: rgba(255, 255, 255, 0.04);
+    transition: background 0.2s ease, border-color 0.2s ease, color 0.2s ease;
+}
+
+.session-button:hover {
+    background: rgba(255, 255, 255, 0.1);
+    border-color: rgba(255, 255, 255, 0.24);
+}
+
+.session-button.active {
+    background: #7c8aff;
+    border-color: #7c8aff;
+    color: #0f1220;
+}

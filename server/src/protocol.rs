@@ -14,6 +14,7 @@
 ///   0x12 MouseScroll: [dx: i16 LE] [dy: i16 LE] [x: u16 LE] [y: u16 LE]
 ///   0x13 KeyEvent: [keycode: u32 LE] [pressed: u8]
 ///   0x14 ClientReady: (no payload)
+///   0x15 PasteText: [utf8 text...]
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +28,7 @@ pub const MSG_MOUSE_BUTTON: u8 = 0x11;
 pub const MSG_MOUSE_SCROLL: u8 = 0x12;
 pub const MSG_KEY_EVENT: u8 = 0x13;
 pub const MSG_CLIENT_READY: u8 = 0x14;
+pub const MSG_PASTE_TEXT: u8 = 0x15;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
@@ -81,6 +83,7 @@ pub enum ClientEvent {
     MouseScroll { dx: i16, dy: i16, x: u16, y: u16 },
     KeyEvent { keycode: u32, pressed: bool },
     ClientReady,
+    PasteText { text: String },
 }
 
 /// Parse a binary message from the client.
@@ -114,6 +117,10 @@ pub fn parse_client_message(data: &[u8]) -> Option<ClientEvent> {
             Some(ClientEvent::KeyEvent { keycode, pressed })
         }
         MSG_CLIENT_READY => Some(ClientEvent::ClientReady),
+        MSG_PASTE_TEXT if data.len() >= 2 => {
+            let text = String::from_utf8(data[1..].to_vec()).ok()?;
+            Some(ClientEvent::PasteText { text })
+        }
         _ => None,
     }
 }

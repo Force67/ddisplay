@@ -18,12 +18,21 @@ export class InputHandler {
     #lockInitialised = false;
     /** @type {AbortController} */
     #abort;
+    /** @type {Set<number>} */
+    #pressedKeys = new Set();
+    /** @type {Set<number>} */
+    #pressedButtons = new Set();
+    /** @type {number} */
+    #lastEscapeTapAt = 0;
+    /** @type {boolean} */
+    #swallowEscapeKeyup = false;
 
     // Protocol message type constants.
     static MSG_MOUSE_MOVE   = 0x10;
     static MSG_MOUSE_BUTTON = 0x11;
     static MSG_MOUSE_SCROLL = 0x12;
     static MSG_KEY_EVENT    = 0x13;
+    static MSG_PASTE_TEXT   = 0x15;
 
     /**
      * Called with an ArrayBuffer to send to the server.
@@ -53,8 +62,18 @@ export class InputHandler {
     /** Stop listening for events. */
     destroy() {
         this.#abort.abort();
+        this.releaseCapture();
+    }
+
+    releaseCapture() {
+        this.#releaseAllInputs();
+        this.#lockInitialised = false;
+        this.#lastEscapeTapAt = 0;
         if (document.pointerLockElement === this.#target) {
             document.exitPointerLock();
+        }
+        if (document.activeElement === this.#target) {
+            this.#target.blur();
         }
     }
 
@@ -66,13 +85,27 @@ export class InputHandler {
 
         // Request pointer lock on click.
         el.addEventListener('click', () => {
+            el.focus({ preventScroll: true });
             if (document.pointerLockElement !== el) {
                 el.requestPointerLock();
             }
         }, opts);
 
         document.addEventListener('pointerlockchange', () => {
+            const wasLocked = this.#pointerLocked;
             this.#pointerLocked = document.pointerLockElement === el;
+            if (wasLocked && !this.#pointerLocked) {
+                this.#lockInitialised = false;
+                this.#releaseAllInputs();
+            }
+        }, opts);
+
+        window.addEventListener('blur', () => this.#releaseAllInputs(), opts);
+        window.addEventListener('pagehide', () => this.#releaseAllInputs(), opts);
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'hidden') {
+                this.#releaseAllInputs();
+            }
         }, opts);
 
         // ---- Mouse ----
@@ -105,13 +138,16 @@ export class InputHandler {
 
         el.addEventListener('mousedown', (e) => {
             e.preventDefault();
+            el.focus({ preventScroll: true });
             const { x, y } = this.#currentCoords(e);
+            this.#pressedButtons.add(e.button);
             this.#sendMouseButton(e.button, true, x, y);
         }, opts);
 
         el.addEventListener('mouseup', (e) => {
             e.preventDefault();
             const { x, y } = this.#currentCoords(e);
+            this.#pressedButtons.delete(e.button);
             this.#sendMouseButton(e.button, false, x, y);
         }, opts);
 
@@ -133,15 +169,38 @@ export class InputHandler {
             if (!this.#pointerLocked && document.activeElement !== el) return;
             // Allow browser F12 devtools shortcut through.
             if (e.key === 'F12') return;
+            if (e.key === 'Escape') {
+                this.#handleEscapeKey(e);
+                return;
+            }
+            if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === 'v') {
+                return;
+            }
             e.preventDefault();
+            this.#pressedKeys.add(e.keyCode);
             this.#sendKeyEvent(e.keyCode, true);
         }, opts);
 
         window.addEventListener('keyup', (e) => {
             if (!this.#pointerLocked && document.activeElement !== el) return;
             if (e.key === 'F12') return;
+            if (e.key === 'Escape' && this.#swallowEscapeKeyup) {
+                e.preventDefault();
+                this.#swallowEscapeKeyup = false;
+                return;
+            }
             e.preventDefault();
+            this.#pressedKeys.delete(e.keyCode);
             this.#sendKeyEvent(e.keyCode, false);
+        }, opts);
+
+        window.addEventListener('paste', (e) => {
+            if (!this.#pointerLocked && document.activeElement !== el) return;
+            const text = e.clipboardData?.getData('text/plain') ?? '';
+            if (!text) return;
+            e.preventDefault();
+            this.#releaseAllInputs();
+            this.#sendPasteText(text);
         }, opts);
     }
 
@@ -218,10 +277,53 @@ export class InputHandler {
         this.#emit(buf);
     }
 
+    /** @param {string} text */
+    #sendPasteText(text) {
+        const encoded = new TextEncoder().encode(text);
+        const buf = new ArrayBuffer(1 + encoded.length);
+        const view = new Uint8Array(buf);
+        view[0] = InputHandler.MSG_PASTE_TEXT;
+        view.set(encoded, 1);
+        this.#emit(buf);
+    }
+
     /** @param {ArrayBuffer} buf */
     #emit(buf) {
         if (this.onSend) {
             this.onSend(buf);
         }
+    }
+
+    #releaseAllInputs() {
+        if (this.#pressedButtons.size > 0) {
+            const { x, y } = { x: Math.round(this.#lockX), y: Math.round(this.#lockY) };
+            for (const button of this.#pressedButtons) {
+                this.#sendMouseButton(button, false, x, y);
+            }
+            this.#pressedButtons.clear();
+        }
+
+        if (this.#pressedKeys.size > 0) {
+            for (const keycode of this.#pressedKeys) {
+                this.#sendKeyEvent(keycode, false);
+            }
+            this.#pressedKeys.clear();
+        }
+    }
+
+    /** @param {KeyboardEvent} e */
+    #handleEscapeKey(e) {
+        const now = performance.now();
+        e.preventDefault();
+        this.#swallowEscapeKeyup = true;
+
+        if (now - this.#lastEscapeTapAt <= 450) {
+            this.releaseCapture();
+            return;
+        }
+
+        this.#lastEscapeTapAt = now;
+        this.#sendKeyEvent(27, true);
+        this.#sendKeyEvent(27, false);
     }
 }

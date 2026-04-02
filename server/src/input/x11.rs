@@ -77,6 +77,7 @@ impl X11InputInjector {
             }
             ClientEvent::KeyEvent { keycode, pressed } => self.key_event(*keycode, *pressed),
             ClientEvent::ClientReady => Ok(()), // informational only
+            ClientEvent::PasteText { text } => self.paste_text(text),
         }
     }
 
@@ -159,6 +160,40 @@ impl X11InputInjector {
         Ok(())
     }
 
+    fn paste_text(&self, text: &str) -> anyhow::Result<()> {
+        self.release_stuck_inputs()?;
+
+        for ch in text.chars() {
+            self.type_char(ch)?;
+        }
+
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    fn type_char(&self, ch: char) -> anyhow::Result<()> {
+        let (keycode, shift) = match char_to_js_keycode(ch) {
+            Some(mapping) => mapping,
+            None => {
+                tracing::warn!("Paste dropped unsupported character {:?}", ch);
+                return Ok(());
+            }
+        };
+
+        if shift {
+            self.key_event(16, true)?;
+        }
+
+        self.key_event(keycode, true)?;
+        self.key_event(keycode, false)?;
+
+        if shift {
+            self.key_event(16, false)?;
+        }
+
+        Ok(())
+    }
+
     fn js_keycode_to_x11_keycode(&self, js_key: u32) -> Option<u8> {
         // Convert the JS keyCode to an X11 keysym, then look it up in our
         // pre-built keymap.
@@ -233,6 +268,50 @@ fn js_keycode_to_keysym(js_key: u32) -> Option<u32> {
         144 => 0xFF7F, // Num Lock
         145 => 0xFF14, // Scroll Lock
 
+        _ => return None,
+    })
+}
+
+fn char_to_js_keycode(ch: char) -> Option<(u32, bool)> {
+    Some(match ch {
+        'a'..='z' => (ch.to_ascii_uppercase() as u32, false),
+        'A'..='Z' => (ch as u32, true),
+        '0'..='9' => (ch as u32, false),
+        ' ' => (32, false),
+        '\n' | '\r' => (13, false),
+        '\t' => (9, false),
+        '!' => (49, true),
+        '@' => (50, true),
+        '#' => (51, true),
+        '$' => (52, true),
+        '%' => (53, true),
+        '^' => (54, true),
+        '&' => (55, true),
+        '*' => (56, true),
+        '(' => (57, true),
+        ')' => (48, true),
+        '-' => (189, false),
+        '_' => (189, true),
+        '=' => (187, false),
+        '+' => (187, true),
+        '[' => (219, false),
+        '{' => (219, true),
+        ']' => (221, false),
+        '}' => (221, true),
+        '\\' => (220, false),
+        '|' => (220, true),
+        ';' => (186, false),
+        ':' => (186, true),
+        '\'' => (222, false),
+        '"' => (222, true),
+        ',' => (188, false),
+        '<' => (188, true),
+        '.' => (190, false),
+        '>' => (190, true),
+        '/' => (191, false),
+        '?' => (191, true),
+        '`' => (192, false),
+        '~' => (192, true),
         _ => return None,
     })
 }

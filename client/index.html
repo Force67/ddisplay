@@ -7,7 +7,7 @@
     <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
-    <canvas id="display"></canvas>
+    <canvas id="display" tabindex="0"></canvas>
     <video id="video" muted playsinline autoplay style="display:none"></video>
 
     <div id="overlay" class="overlay">
@@ -21,6 +21,13 @@
         <span id="stat-fps">0 FPS</span>
         <span id="stat-latency">q:0</span>
         <span id="stat-resolution">-</span>
+    </div>
+
+    <div id="session-switcher" class="session-switcher"></div>
+    <div id="helper-bar" class="helper-bar">
+        <span id="helper-session">session:-</span>
+        <span>Esc×2 release</span>
+        <span>Ctrl/Cmd+V paste</span>
     </div>
 
     <script src="js/jmuxer.min.js"></script>

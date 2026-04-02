@@ -128,10 +128,12 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>) {
             match msg {
                 Message::Binary(data) => {
                     if let Some(event) = protocol::parse_client_message(&data) {
-                        track_input_state(&recv_input_state, &event);
-                        tracing::debug!("Input event: {:?}", event);
-                        if recv_input_tx.send(event).await.is_err() {
-                            break;
+                        let forwarded_events = normalize_input_events(&recv_input_state, event);
+                        for forwarded_event in forwarded_events {
+                            tracing::debug!("Input event: {:?}", forwarded_event);
+                            if recv_input_tx.send(forwarded_event).await.is_err() {
+                                return;
+                            }
                         }
                     }
                 }
@@ -161,31 +163,59 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>) {
     tracing::info!("WebSocket disconnected");
 }
 
-fn track_input_state(state: &Arc<Mutex<ConnectionInputState>>, event: &ClientEvent) {
+fn normalize_input_events(
+    state: &Arc<Mutex<ConnectionInputState>>,
+    event: ClientEvent,
+) -> Vec<ClientEvent> {
     let mut state = state.lock();
     match event {
         ClientEvent::MouseMove { x, y } => {
-            state.last_pointer = (*x, *y);
+            state.last_pointer = (x, y);
+            vec![ClientEvent::MouseMove { x, y }]
         }
         ClientEvent::MouseButton { button, pressed, x, y } => {
-            state.last_pointer = (*x, *y);
-            if *pressed {
-                state.pressed_buttons.insert(*button);
+            state.last_pointer = (x, y);
+            if pressed {
+                let already_pressed = state.pressed_buttons.contains(&button);
+                state.pressed_buttons.insert(button);
+                if already_pressed {
+                    tracing::warn!("Button {} was already pressed; injecting release+press to resync", button);
+                    vec![
+                        ClientEvent::MouseButton { button, pressed: false, x, y },
+                        ClientEvent::MouseButton { button, pressed: true, x, y },
+                    ]
+                } else {
+                    vec![ClientEvent::MouseButton { button, pressed: true, x, y }]
+                }
             } else {
-                state.pressed_buttons.remove(button);
+                state.pressed_buttons.remove(&button);
+                vec![ClientEvent::MouseButton { button, pressed: false, x, y }]
             }
         }
-        ClientEvent::MouseScroll { x, y, .. } => {
-            state.last_pointer = (*x, *y);
+        ClientEvent::MouseScroll { dx, dy, x, y } => {
+            state.last_pointer = (x, y);
+            vec![ClientEvent::MouseScroll { dx, dy, x, y }]
         }
         ClientEvent::KeyEvent { keycode, pressed } => {
-            if *pressed {
-                state.pressed_keys.insert(*keycode);
+            if pressed {
+                let already_pressed = state.pressed_keys.contains(&keycode);
+                state.pressed_keys.insert(keycode);
+                if already_pressed {
+                    tracing::warn!("Key {} was already pressed; injecting release+press to resync", keycode);
+                    vec![
+                        ClientEvent::KeyEvent { keycode, pressed: false },
+                        ClientEvent::KeyEvent { keycode, pressed: true },
+                    ]
+                } else {
+                    vec![ClientEvent::KeyEvent { keycode, pressed: true }]
+                }
             } else {
-                state.pressed_keys.remove(keycode);
+                state.pressed_keys.remove(&keycode);
+                vec![ClientEvent::KeyEvent { keycode, pressed: false }]
             }
         }
-        ClientEvent::ClientReady => {}
+        ClientEvent::ClientReady => vec![ClientEvent::ClientReady],
+        ClientEvent::PasteText { text } => vec![ClientEvent::PasteText { text }],
     }
 }
 

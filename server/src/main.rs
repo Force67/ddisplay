@@ -33,11 +33,26 @@ struct Args {
     /// Path to the directory containing the web client files.
     #[arg(short, long, default_value = "./client")]
     client_dir: String,
+
+    /// X11 display to capture and inject into, for example `:10`.
+    #[arg(long)]
+    display: Option<String>,
+
+    /// Xauthority file to use for the selected X11 display.
+    #[arg(long)]
+    xauthority: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+
+    if let Some(display) = &args.display {
+        unsafe { std::env::set_var("DISPLAY", display) };
+    }
+    if let Some(xauthority) = &args.xauthority {
+        unsafe { std::env::set_var("XAUTHORITY", xauthority) };
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -47,6 +62,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     tracing::info!("ddisplay-server starting");
+    tracing::info!(
+        "X11 target: DISPLAY={} XAUTHORITY={}",
+        std::env::var("DISPLAY").unwrap_or_else(|_| "<unset>".to_string()),
+        std::env::var("XAUTHORITY").unwrap_or_else(|_| "<unset>".to_string()),
+    );
 
     // --- X11 screen capturer ---
     let capturer = X11Capturer::new()?;

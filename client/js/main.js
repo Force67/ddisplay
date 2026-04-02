@@ -17,12 +17,20 @@ const connectionLabel = document.getElementById('connection-status');
 const statFps         = document.getElementById('stat-fps');
 const statLatency     = document.getElementById('stat-latency');
 const statResolution  = document.getElementById('stat-resolution');
+const sessionSwitcher = document.getElementById('session-switcher');
+const helperSession   = document.getElementById('helper-session');
 
 // Modules
 const transport = new Transport();
 const decoder   = new H264Decoder(videoEl, 30);
 const renderer  = new Renderer(canvas);
 const input     = new InputHandler(canvas);
+
+const SESSION_PORTS = {
+    virtual: '9550',
+    physical: '9551',
+};
+const currentSession = location.port === SESSION_PORTS.physical ? 'physical' : 'virtual';
 
 // Input -> transport
 input.onSend = (buf) => transport.send(buf);
@@ -138,6 +146,25 @@ function updateStats() {
     setTimeout(updateStats, 500);
 }
 updateStats();
+
+function renderSessionSwitcher() {
+    const sessions = [
+        { id: 'virtual', label: 'Virtual', port: SESSION_PORTS.virtual },
+        { id: 'physical', label: 'Physical', port: SESSION_PORTS.physical },
+    ];
+
+    helperSession.textContent = `session:${currentSession}`;
+    sessionSwitcher.replaceChildren(
+        ...sessions.map((session) => {
+            const link = document.createElement('a');
+            link.className = `session-button${session.id === currentSession ? ' active' : ''}`;
+            link.href = `${location.protocol}//${location.hostname}:${session.port}/`;
+            link.textContent = session.label;
+            return link;
+        }),
+    );
+}
+renderSessionSwitcher();
 
 // Fullscreen
 function toggleFullscreen() {

@@ -7,27 +7,97 @@
     <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
-    <canvas id="display" tabindex="0"></canvas>
-    <video id="video" muted playsinline autoplay style="display:none"></video>
+    <div id="app-shell" class="app-shell">
+        <main class="stage">
+            <canvas id="display" tabindex="0"></canvas>
+            <video id="video" muted playsinline autoplay style="display:none"></video>
 
-    <div id="overlay" class="overlay">
-        <div class="overlay-content">
-            <div class="spinner"></div>
-            <div id="connection-status">Connecting...</div>
-        </div>
-    </div>
+            <div id="overlay" class="overlay">
+                <div class="overlay-content">
+                    <div class="spinner"></div>
+                    <div id="connection-status">Connecting...</div>
+                </div>
+            </div>
 
-    <div id="stats" class="stats">
-        <span id="stat-fps">0 FPS</span>
-        <span id="stat-latency">q:0</span>
-        <span id="stat-resolution">-</span>
-    </div>
+            <button id="btn-sidebar-peek" class="sidebar-peek hidden" type="button" aria-controls="sidebar" aria-expanded="false">
+                Controls
+            </button>
+        </main>
 
-    <div id="session-switcher" class="session-switcher"></div>
-    <div id="helper-bar" class="helper-bar">
-        <span id="helper-session">session:-</span>
-        <span>Esc×2 release</span>
-        <span>Ctrl/Cmd+V paste</span>
+        <aside id="sidebar" class="sidebar">
+            <div class="sidebar-header">
+                <div class="sidebar-heading">
+                    <div class="sidebar-kicker">ddisplay</div>
+                    <h1>Remote Control</h1>
+                </div>
+                <div class="sidebar-header-actions">
+                    <div id="helper-session" class="session-pill">session:-</div>
+                    <button id="btn-sidebar-collapse" class="sidebar-toggle" type="button" aria-controls="sidebar-body" aria-expanded="true">
+                        Hide
+                    </button>
+                </div>
+            </div>
+
+            <div id="sidebar-body" class="sidebar-body">
+                <div id="warning-banner" class="warning-banner hidden"></div>
+
+                <section class="panel">
+                    <div class="panel-title">Sessions</div>
+                    <div id="session-switcher" class="session-switcher"></div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-title">Stream</div>
+                    <div id="stats" class="stats">
+                        <span id="stat-fps">0 FPS</span>
+                        <span id="stat-latency">q:0</span>
+                        <span id="stat-resolution">-</span>
+                    </div>
+                    <div id="status-panel" class="status-panel"></div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-title">Controls</div>
+                    <div id="control-panel" class="control-panel">
+                        <button id="btn-reconnect" type="button">Reconnect</button>
+                        <button id="btn-readonly" type="button">Read-Only</button>
+                        <select id="bitrate-select">
+                            <option value="4000000">4 Mbps</option>
+                            <option value="8000000" selected>8 Mbps</option>
+                            <option value="12000000">12 Mbps</option>
+                            <option value="16000000">16 Mbps</option>
+                            <option value="24000000">24 Mbps</option>
+                        </select>
+                        <button id="btn-restart" type="button">Restart / Apply Bitrate</button>
+                        <button id="btn-release-keys" type="button">Release Keys</button>
+                        <button id="btn-release-mouse" type="button">Release Mouse</button>
+                        <button id="btn-release-all" type="button">Release All</button>
+                        <button id="btn-pull-clipboard" type="button">Pull Remote Clipboard</button>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="panel-title">Text And Clipboard</div>
+                    <div id="paste-panel" class="paste-panel">
+                        <textarea id="paste-text" placeholder="Paste or type text to send to the remote session"></textarea>
+                        <div class="paste-actions">
+                            <button id="btn-send-text" type="button">Send Text</button>
+                            <button id="btn-clear-text" type="button">Clear</button>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="panel panel-helpers">
+                    <div class="panel-title">Shortcuts</div>
+                    <div id="helper-bar" class="helper-bar">
+                        <span>Esc x2 release</span>
+                        <span>Ctrl/Cmd+V send</span>
+                        <span>Double click fullscreen</span>
+                        <span>F11 fullscreen</span>
+                    </div>
+                </section>
+            </div>
+        </aside>
     </div>
 
     <script src="js/jmuxer.min.js"></script>

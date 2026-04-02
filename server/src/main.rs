@@ -14,6 +14,7 @@ use capture::x11::X11Capturer;
 use encoder::Encoder;
 use input::x11::X11InputInjector;
 use protocol::ClientEvent;
+use transport::websocket::{ServerMetadata, ServerRuntimeConfig};
 
 #[derive(Parser)]
 #[command(name = "ddisplay-server", about = "Remote display server with H.264 streaming")]
@@ -41,6 +42,10 @@ struct Args {
     /// Xauthority file to use for the selected X11 display.
     #[arg(long)]
     xauthority: Option<PathBuf>,
+
+    /// Human-readable session name shown in the client UI.
+    #[arg(long, default_value = "session")]
+    session_name: String,
 }
 
 #[tokio::main]
@@ -85,8 +90,27 @@ async fn main() -> anyhow::Result<()> {
 
     // --- WebSocket transport ---
     let client_dir = PathBuf::from(&args.client_dir);
+    let metadata = ServerMetadata {
+        session_name: args.session_name.clone(),
+        display: std::env::var("DISPLAY").unwrap_or_else(|_| "<unset>".to_string()),
+        xauthority: std::env::var("XAUTHORITY").unwrap_or_else(|_| "<unset>".to_string()),
+        width: screen_w,
+        height: screen_h,
+        fps: args.fps,
+        bitrate: args.bitrate,
+        codec: "h264".to_string(),
+    };
+    let runtime = ServerRuntimeConfig {
+        bind_addr: args.bind.clone(),
+        client_dir: client_dir.clone(),
+        session_name: args.session_name.clone(),
+        display: metadata.display.clone(),
+        xauthority: metadata.xauthority.clone(),
+        fps: args.fps,
+        bitrate: args.bitrate,
+    };
     let (frame_tx, input_rx, keyframe_cache) =
-        transport::websocket::start_server(args.bind.clone(), client_dir).await?;
+        transport::websocket::start_server(args.bind.clone(), client_dir, metadata, runtime).await?;
 
     tracing::info!("Listening on http://{}", args.bind);
 

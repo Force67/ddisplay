@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
+use x11rb::protocol::Event;
 use x11rb::protocol::xproto::ConnectionExt as _;
 use x11rb::protocol::xtest;
 use x11rb::rust_connection::RustConnection;
@@ -43,12 +45,44 @@ impl X11InputInjector {
     /// Best-effort reset of common modifiers/buttons that may have been left
     /// logically pressed by an interrupted remote session.
     pub fn release_stuck_inputs(&self) -> anyhow::Result<()> {
-        // Common browser keyCodes for modifiers and lock/meta keys.
-        for keycode in [16_u32, 17, 18, 20, 91, 92, 93] {
+        self.release_all_keys()?;
+        self.release_all_mouse_buttons()?;
+        Ok(())
+    }
+
+    pub fn release_all_keys(&self) -> anyhow::Result<()> {
+        // Common browser keyCodes for modifiers, locks, navigation and text editing.
+        for keycode in [
+            8_u32, 9, 13, 16, 17, 18, 20, 27, 32, 33, 34, 35, 36, 37, 38, 39, 40, 45, 46, 91, 92, 93,
+            144, 145,
+        ] {
             let _ = self.key_event(keycode, false);
         }
 
-        // Common mouse buttons a remote client may have left pressed.
+        for keycode in 48_u32..=57 {
+            let _ = self.key_event(keycode, false);
+        }
+        for keycode in 65_u32..=90 {
+            let _ = self.key_event(keycode, false);
+        }
+        for keycode in 96_u32..=111 {
+            let _ = self.key_event(keycode, false);
+        }
+        for keycode in 112_u32..=123 {
+            let _ = self.key_event(keycode, false);
+        }
+        for keycode in 186_u32..=192 {
+            let _ = self.key_event(keycode, false);
+        }
+        for keycode in 219_u32..=222 {
+            let _ = self.key_event(keycode, false);
+        }
+
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    pub fn release_all_mouse_buttons(&self) -> anyhow::Result<()> {
         for button in [0_u8, 1, 2, 3, 4] {
             let _ = self.mouse_button(button, false);
         }
@@ -78,6 +112,9 @@ impl X11InputInjector {
             ClientEvent::KeyEvent { keycode, pressed } => self.key_event(*keycode, *pressed),
             ClientEvent::ClientReady => Ok(()), // informational only
             ClientEvent::PasteText { text } => self.paste_text(text),
+            ClientEvent::ReleaseKeys => self.release_all_keys(),
+            ClientEvent::ReleaseMouse => self.release_all_mouse_buttons(),
+            ClientEvent::ReleaseAll => self.release_stuck_inputs(),
         }
     }
 
@@ -314,6 +351,81 @@ fn char_to_js_keycode(ch: char) -> Option<(u32, bool)> {
         '~' => (192, true),
         _ => return None,
     })
+}
+
+pub fn read_selection_text(selection_name: &str) -> anyhow::Result<Option<String>> {
+    let (conn, screen_num) = x11rb::connect(None)?;
+    let screen = &conn.setup().roots[screen_num];
+    let window = conn.generate_id()?;
+
+    conn.create_window(
+        0,
+        window,
+        screen.root,
+        0,
+        0,
+        1,
+        1,
+        0,
+        x11rb::protocol::xproto::WindowClass::INPUT_OUTPUT,
+        x11rb::COPY_FROM_PARENT,
+        &x11rb::protocol::xproto::CreateWindowAux::new(),
+    )?
+    .check()?;
+
+    let selection_atom = intern_atom(&conn, selection_name)?;
+    let utf8_atom = intern_atom(&conn, "UTF8_STRING")?;
+    let string_atom = intern_atom(&conn, "STRING")?;
+    let property_atom = intern_atom(&conn, "DDISPLAY_SELECTION")?;
+
+    let result = read_selection_with_target(&conn, window, selection_atom, utf8_atom, property_atom)?
+        .or_else(|| read_selection_with_target(&conn, window, selection_atom, string_atom, property_atom).ok().flatten());
+
+    let _ = conn.destroy_window(window);
+    let _ = conn.flush();
+
+    Ok(result)
+}
+
+fn intern_atom(conn: &RustConnection, name: &str) -> anyhow::Result<u32> {
+    Ok(conn.intern_atom(false, name.as_bytes())?.reply()?.atom)
+}
+
+fn read_selection_with_target(
+    conn: &RustConnection,
+    window: u32,
+    selection_atom: u32,
+    target_atom: u32,
+    property_atom: u32,
+) -> anyhow::Result<Option<String>> {
+    conn.convert_selection(window, selection_atom, target_atom, property_atom, x11rb::CURRENT_TIME)?
+        .check()?;
+    conn.flush()?;
+
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        if let Some(event) = conn.poll_for_event()? {
+            if let Event::SelectionNotify(notify) = event {
+                if notify.requestor != window {
+                    continue;
+                }
+                if notify.property == x11rb::NONE {
+                    return Ok(None);
+                }
+                let reply = conn
+                    .get_property(false, window, property_atom, target_atom, 0, u32::MAX)?
+                    .reply()?;
+                if reply.value_len == 0 {
+                    return Ok(Some(String::new()));
+                }
+                return Ok(Some(String::from_utf8_lossy(&reply.value).into_owned()));
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Read the X server keyboard mapping and build a reverse lookup table

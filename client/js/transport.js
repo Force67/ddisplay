@@ -67,6 +67,12 @@ export class Transport {
         this.#setState('disconnected');
     }
 
+    reconnect() {
+        const url = this.#url;
+        this.disconnect();
+        this.connect(url);
+    }
+
     // -- internals --
 
     #open() {

@@ -26,6 +26,8 @@ export class InputHandler {
     #lastEscapeTapAt = 0;
     /** @type {boolean} */
     #swallowEscapeKeyup = false;
+    /** @type {boolean} */
+    #readOnly = false;
 
     // Protocol message type constants.
     static MSG_MOUSE_MOVE   = 0x10;
@@ -33,6 +35,9 @@ export class InputHandler {
     static MSG_MOUSE_SCROLL = 0x12;
     static MSG_KEY_EVENT    = 0x13;
     static MSG_PASTE_TEXT   = 0x15;
+    static MSG_RELEASE_KEYS = 0x16;
+    static MSG_RELEASE_MOUSE = 0x17;
+    static MSG_RELEASE_ALL = 0x18;
 
     /**
      * Called with an ArrayBuffer to send to the server.
@@ -77,6 +82,38 @@ export class InputHandler {
         }
     }
 
+    setReadOnly(readOnly) {
+        this.#readOnly = readOnly;
+        if (readOnly) {
+            this.releaseCapture();
+        }
+    }
+
+    get isReadOnly() {
+        return this.#readOnly;
+    }
+
+    releaseRemoteKeys() {
+        this.#releaseAllInputs();
+        this.#sendControlMessage(InputHandler.MSG_RELEASE_KEYS);
+    }
+
+    releaseRemoteMouse() {
+        this.#releaseAllInputs();
+        this.#sendControlMessage(InputHandler.MSG_RELEASE_MOUSE);
+    }
+
+    releaseRemoteAll() {
+        this.#releaseAllInputs();
+        this.#sendControlMessage(InputHandler.MSG_RELEASE_ALL);
+    }
+
+    pasteText(text) {
+        if (!text) return;
+        this.#releaseAllInputs();
+        this.#sendPasteText(text);
+    }
+
     // -- internals --
 
     #bind() {
@@ -86,6 +123,9 @@ export class InputHandler {
         // Request pointer lock on click.
         el.addEventListener('click', () => {
             el.focus({ preventScroll: true });
+            if (this.#readOnly) {
+                return;
+            }
             if (document.pointerLockElement !== el) {
                 el.requestPointerLock();
             }
@@ -111,6 +151,7 @@ export class InputHandler {
         // ---- Mouse ----
 
         el.addEventListener('mousemove', (e) => {
+            if (this.#readOnly) return;
             if (this.#remoteWidth === 0 || this.#remoteHeight === 0) return;
 
             let x, y;
@@ -137,6 +178,7 @@ export class InputHandler {
         }, opts);
 
         el.addEventListener('mousedown', (e) => {
+            if (this.#readOnly) return;
             e.preventDefault();
             el.focus({ preventScroll: true });
             const { x, y } = this.#currentCoords(e);
@@ -145,6 +187,7 @@ export class InputHandler {
         }, opts);
 
         el.addEventListener('mouseup', (e) => {
+            if (this.#readOnly) return;
             e.preventDefault();
             const { x, y } = this.#currentCoords(e);
             this.#pressedButtons.delete(e.button);
@@ -152,6 +195,7 @@ export class InputHandler {
         }, opts);
 
         el.addEventListener('wheel', (e) => {
+            if (this.#readOnly) return;
             e.preventDefault();
             const { x, y } = this.#currentCoords(e);
             // Clamp to i16 range.
@@ -166,6 +210,7 @@ export class InputHandler {
         // ---- Keyboard ----
 
         window.addEventListener('keydown', (e) => {
+            if (this.#readOnly) return;
             if (!this.#pointerLocked && document.activeElement !== el) return;
             // Allow browser F12 devtools shortcut through.
             if (e.key === 'F12') return;
@@ -182,6 +227,7 @@ export class InputHandler {
         }, opts);
 
         window.addEventListener('keyup', (e) => {
+            if (this.#readOnly) return;
             if (!this.#pointerLocked && document.activeElement !== el) return;
             if (e.key === 'F12') return;
             if (e.key === 'Escape' && this.#swallowEscapeKeyup) {
@@ -195,12 +241,12 @@ export class InputHandler {
         }, opts);
 
         window.addEventListener('paste', (e) => {
+            if (this.#readOnly) return;
             if (!this.#pointerLocked && document.activeElement !== el) return;
             const text = e.clipboardData?.getData('text/plain') ?? '';
             if (!text) return;
             e.preventDefault();
-            this.#releaseAllInputs();
-            this.#sendPasteText(text);
+            this.pasteText(text);
         }, opts);
     }
 
@@ -284,6 +330,13 @@ export class InputHandler {
         const view = new Uint8Array(buf);
         view[0] = InputHandler.MSG_PASTE_TEXT;
         view.set(encoded, 1);
+        this.#emit(buf);
+    }
+
+    /** @param {number} type */
+    #sendControlMessage(type) {
+        const buf = new ArrayBuffer(1);
+        new DataView(buf).setUint8(0, type);
         this.#emit(buf);
     }
 

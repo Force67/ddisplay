@@ -78,6 +78,11 @@ export class Renderer {
         ctx.save();
         ctx.translate(x, y);
 
+        ctx.beginPath();
+        ctx.arc(6, 8, 12, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(124, 138, 255, 0.18)';
+        ctx.fill();
+
         // White arrow with black outline
         ctx.beginPath();
         ctx.moveTo(0, 0);

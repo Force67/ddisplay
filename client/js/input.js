@@ -218,9 +218,6 @@ export class InputHandler {
                 this.#handleEscapeKey(e);
                 return;
             }
-            if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === 'v') {
-                return;
-            }
             e.preventDefault();
             this.#pressedKeys.add(e.keyCode);
             this.#sendKeyEvent(e.keyCode, true);
@@ -238,15 +235,6 @@ export class InputHandler {
             e.preventDefault();
             this.#pressedKeys.delete(e.keyCode);
             this.#sendKeyEvent(e.keyCode, false);
-        }, opts);
-
-        window.addEventListener('paste', (e) => {
-            if (this.#readOnly) return;
-            if (!this.#pointerLocked && document.activeElement !== el) return;
-            const text = e.clipboardData?.getData('text/plain') ?? '';
-            if (!text) return;
-            e.preventDefault();
-            this.pasteText(text);
         }, opts);
     }
 

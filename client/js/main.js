@@ -37,6 +37,7 @@ const btnReleaseMouse = document.getElementById('btn-release-mouse');
 const btnReleaseAll = document.getElementById('btn-release-all');
 const btnPullClipboard = document.getElementById('btn-pull-clipboard');
 const pasteText = document.getElementById('paste-text');
+const btnPasteHostClipboard = document.getElementById('btn-paste-host-clipboard');
 const btnSendText = document.getElementById('btn-send-text');
 const btnClearText = document.getElementById('btn-clear-text');
 
@@ -337,6 +338,25 @@ btnRestart.addEventListener('click', async () => {
 btnReleaseKeys.addEventListener('click', () => input.releaseRemoteKeys());
 btnReleaseMouse.addEventListener('click', () => input.releaseRemoteMouse());
 btnReleaseAll.addEventListener('click', () => input.releaseRemoteAll());
+btnPasteHostClipboard.addEventListener('click', async () => {
+    if (!navigator.clipboard?.readText) {
+        setWarning('Host clipboard read is not available in this browser context.');
+        return;
+    }
+    try {
+        const text = await navigator.clipboard.readText();
+        if (!text) {
+            setWarning('Host clipboard is empty.');
+            return;
+        }
+        pasteText.value = text;
+        input.pasteText(text);
+        setWarning('Host clipboard sent to remote session.');
+    } catch (err) {
+        console.warn(err);
+        setWarning('Host clipboard read failed. Use the text box if the browser blocks clipboard access.');
+    }
+});
 btnSendText.addEventListener('click', () => input.pasteText(pasteText.value));
 btnClearText.addEventListener('click', () => {
     pasteText.value = '';

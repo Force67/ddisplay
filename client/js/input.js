@@ -28,6 +28,13 @@ export class InputHandler {
     #swallowEscapeKeyup = false;
     /** @type {boolean} */
     #readOnly = false;
+    /** @type {number} */
+    #wheelRemainderX = 0;
+    /** @type {number} */
+    #wheelRemainderY = 0;
+
+    static WHEEL_PIXEL_STEP = 48;
+    static WHEEL_PAGE_STEP = 8;
 
     // Protocol message type constants.
     static MSG_MOUSE_MOVE   = 0x10;
@@ -198,9 +205,10 @@ export class InputHandler {
             if (this.#readOnly) return;
             e.preventDefault();
             const { x, y } = this.#currentCoords(e);
-            // Clamp to i16 range.
-            const dx = Math.max(-32768, Math.min(32767, Math.round(e.deltaX)));
-            const dy = Math.max(-32768, Math.min(32767, Math.round(e.deltaY)));
+            const { dx, dy } = this.#normaliseWheelDelta(e);
+            if (dx === 0 && dy === 0) {
+                return;
+            }
             this.#sendMouseScroll(dx, dy, x, y);
         }, { ...opts, passive: false });
 
@@ -350,6 +358,9 @@ export class InputHandler {
             }
             this.#pressedKeys.clear();
         }
+
+        this.#wheelRemainderX = 0;
+        this.#wheelRemainderY = 0;
     }
 
     /** @param {KeyboardEvent} e */
@@ -366,5 +377,58 @@ export class InputHandler {
         this.#lastEscapeTapAt = now;
         this.#sendKeyEvent(27, true);
         this.#sendKeyEvent(27, false);
+    }
+
+    /**
+     * Browser wheel deltas are typically pixels or lines, while the X11 side
+     * only understands discrete wheel "clicks". Accumulate sub-step input so
+     * trackpads and high-resolution wheels feel closer to the native session.
+     * @param {WheelEvent} e
+     * @returns {{ dx: number, dy: number }}
+     */
+    #normaliseWheelDelta(e) {
+        let scale;
+        switch (e.deltaMode) {
+            case WheelEvent.DOM_DELTA_LINE:
+                scale = 1;
+                break;
+            case WheelEvent.DOM_DELTA_PAGE:
+                scale = InputHandler.WHEEL_PAGE_STEP;
+                break;
+            case WheelEvent.DOM_DELTA_PIXEL:
+            default:
+                scale = 1 / InputHandler.WHEEL_PIXEL_STEP;
+                break;
+        }
+
+        this.#wheelRemainderX += e.deltaX * scale;
+        this.#wheelRemainderY += e.deltaY * scale;
+
+        const dx = this.#extractWheelSteps('x');
+        const dy = this.#extractWheelSteps('y');
+
+        return {
+            dx: Math.max(-32768, Math.min(32767, dx)),
+            dy: Math.max(-32768, Math.min(32767, dy)),
+        };
+    }
+
+    /**
+     * @param {'x'|'y'} axis
+     * @returns {number}
+     */
+    #extractWheelSteps(axis) {
+        const remainder = axis === 'x' ? this.#wheelRemainderX : this.#wheelRemainderY;
+        const steps = remainder > 0 ? Math.floor(remainder) : Math.ceil(remainder);
+
+        if (steps !== 0) {
+            if (axis === 'x') {
+                this.#wheelRemainderX -= steps;
+            } else {
+                this.#wheelRemainderY -= steps;
+            }
+        }
+
+        return steps;
     }
 }

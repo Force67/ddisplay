@@ -8,11 +8,42 @@ use openh264::encoder::{
     Encoder, EncoderConfig, FrameType,
     RateControlMode, SpsPpsStrategy, UsageType,
 };
-use openh264::formats::YUVBuffer;
+use openh264::formats::YUVSource;
 use openh264::Timestamp;
 
 use super::color;
 use super::{EncodedPacket, Encoder as EncoderTrait};
+
+/// Zero-copy YUV420P view over a contiguous [Y|U|V] buffer.
+struct YuvView<'a> {
+    data: &'a [u8],
+    width: usize,
+    height: usize,
+    y_len: usize,
+    u_len: usize,
+}
+
+impl YUVSource for YuvView<'_> {
+    fn dimensions(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
+    fn strides(&self) -> (usize, usize, usize) {
+        (self.width, self.width / 2, self.width / 2)
+    }
+
+    fn y(&self) -> &[u8] {
+        &self.data[..self.y_len]
+    }
+
+    fn u(&self) -> &[u8] {
+        &self.data[self.y_len..self.y_len + self.u_len]
+    }
+
+    fn v(&self) -> &[u8] {
+        &self.data[self.y_len + self.u_len..]
+    }
+}
 
 pub struct OpenH264Encoder {
     encoder: Encoder,
@@ -104,12 +135,18 @@ impl EncoderTrait for OpenH264Encoder {
             v_plane,
         );
 
-        // Clone ~3MB YUV data into YUVBuffer (it takes ownership).
-        let yuv_buf = YUVBuffer::from_vec(self.yuv_data.clone(), w, h);
+        // Zero-copy borrow of our pre-allocated buffer (avoids ~3MB clone per frame).
+        let yuv_view = YuvView {
+            data: &self.yuv_data,
+            width: w,
+            height: h,
+            y_len: self.y_len,
+            u_len: self.u_len,
+        };
 
         let timestamp = Timestamp::from_millis(self.pts_counter * 16);
         let bitstream = self.encoder
-            .encode_at(&yuv_buf, timestamp)
+            .encode_at(&yuv_view, timestamp)
             .context("OpenH264 encode failed")?;
 
         let keyframe = matches!(bitstream.frame_type(), FrameType::IDR | FrameType::I);

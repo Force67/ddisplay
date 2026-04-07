@@ -12,7 +12,7 @@ axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 
 # X11 screen capture and input (pure Rust)
-x11rb = { version = "0.13", default-features = false, features = ["allow-unsafe-code", "shm", "xfixes", "xtest", "randr", "damage"] }
+x11rb = { version = "0.13", default-features = false, features = ["allow-unsafe-code", "composite", "shm", "xfixes", "xtest", "randr", "damage"] }
 
 # H.264 encoder (Cisco OpenH264, built from source)
 openh264 = "0.9"
@@ -31,6 +31,9 @@ anyhow = "1"
 # CLI arguments
 clap = { version = "4", features = ["derive"] }
 
+# Dynamic library loading (for NVENC/CUDA at runtime)
+libloading = "0.8"
+
 # Stream utilities (needed for WebSocket split)
 futures-util = "0.3"
 
@@ -39,3 +42,6 @@ libc = "0.2"
 
 # Shared state
 parking_lot = "0.12"
+
+[build-dependencies]
+cc = "1"

@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -15,6 +15,16 @@ use encoder::Encoder;
 use input::x11::X11InputInjector;
 use protocol::ClientEvent;
 use transport::websocket::{ServerMetadata, ServerRuntimeConfig};
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum EncoderChoice {
+    /// Auto-detect: try NVENC first, fall back to OpenH264.
+    Auto,
+    /// Force NVIDIA NVENC hardware encoder.
+    Nvenc,
+    /// Force OpenH264 software encoder.
+    Openh264,
+}
 
 #[derive(Parser)]
 #[command(name = "ddisplay-server", about = "Remote display server with H.264 streaming")]
@@ -46,6 +56,10 @@ struct Args {
     /// Human-readable session name shown in the client UI.
     #[arg(long, default_value = "session")]
     session_name: String,
+
+    /// Video encoder to use. "auto" tries NVENC first, falls back to OpenH264.
+    #[arg(long, value_enum, default_value_t = EncoderChoice::Auto)]
+    encoder: EncoderChoice,
 }
 
 #[tokio::main]
@@ -80,9 +94,43 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Screen: {}x{}", screen_w, screen_h);
 
     // --- H.264 encoder ---
-    let encoder = encoder::openh264_enc::OpenH264Encoder::new(
-        screen_w, screen_h, args.fps, args.bitrate,
-    )?;
+    let encoder: Box<dyn Encoder + Send> = match args.encoder {
+        EncoderChoice::Nvenc => {
+            tracing::info!("Encoder: NVENC (forced)");
+            Box::new(encoder::nvenc_enc::NvencEncoder::new(
+                screen_w, screen_h, args.fps, args.bitrate,
+            )?)
+        }
+        EncoderChoice::Openh264 => {
+            tracing::info!("Encoder: OpenH264 (forced)");
+            Box::new(encoder::openh264_enc::OpenH264Encoder::new(
+                screen_w, screen_h, args.fps, args.bitrate,
+            )?)
+        }
+        EncoderChoice::Auto => {
+            if encoder::nvenc_enc::is_nvenc_available() {
+                match encoder::nvenc_enc::NvencEncoder::new(
+                    screen_w, screen_h, args.fps, args.bitrate,
+                ) {
+                    Ok(enc) => {
+                        tracing::info!("Encoder: NVENC (auto-detected)");
+                        Box::new(enc)
+                    }
+                    Err(e) => {
+                        tracing::warn!("NVENC init failed, falling back to OpenH264: {}", e);
+                        Box::new(encoder::openh264_enc::OpenH264Encoder::new(
+                            screen_w, screen_h, args.fps, args.bitrate,
+                        )?)
+                    }
+                }
+            } else {
+                tracing::info!("Encoder: OpenH264 (NVENC not available)");
+                Box::new(encoder::openh264_enc::OpenH264Encoder::new(
+                    screen_w, screen_h, args.fps, args.bitrate,
+                )?)
+            }
+        }
+    };
 
     // --- X11 input injector ---
     let injector = X11InputInjector::new()?;
@@ -122,8 +170,7 @@ async fn main() -> anyhow::Result<()> {
     let kf_cache = keyframe_cache;
 
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = capture_encode_loop(capturer, encoder, frame_tx, kf_cache, screen_w, screen_h, fps) {
-            tracing::error!("Capture loop error: {}", e);
+        if let Err(e) = capture_encode_loop(capturer, encoder, frame_tx, kf_cache, screen_w, screen_h, fps) {            tracing::error!("Capture loop error: {}", e);
         }
     }).await?;
 
@@ -157,8 +204,8 @@ fn spawn_input_handler(injector: X11InputInjector, mut input_rx: mpsc::Receiver<
 ///
 /// Avoids per-frame `spawn_blocking` overhead and uses zero-copy SHM reads.
 fn capture_encode_loop(
-    capturer: X11Capturer,
-    mut encoder: encoder::openh264_enc::OpenH264Encoder,
+    mut capturer: X11Capturer,
+    mut encoder: Box<dyn Encoder + Send>,
     frame_tx: transport::websocket::FrameSender,
     keyframe_cache: transport::websocket::KeyframeCache,
     screen_w: u32,
@@ -186,6 +233,26 @@ fn capture_encode_loop(
         }
 
         let force_kf = frame_count == 0 || frame_count % keyframe_interval == 0;
+        let has_damage = capturer.has_damage();
+
+        // Always send cursor updates regardless of screen damage
+        // (cursor is a hardware overlay that doesn't trigger damage events)
+        if let Some(ci) = capturer.get_cursor_info().ok() {
+            let wire = protocol::encode_cursor_update(
+                ci.x.max(0) as u16,
+                ci.y.max(0) as u16,
+                ci.visible,
+            );
+            let _ = frame_tx.send(wire);
+        }
+
+        // Skip capture+encode if nothing changed (saves CPU, GPU, and bandwidth).
+        // Always capture on keyframe intervals (for new client sync).
+        if !force_kf && !has_damage {
+            frame_count += 1;
+            fps_frame_count += 1;
+            continue;
+        }
 
         // Zero-copy capture: borrow SHM buffer directly
         let frame = capturer.capture_frame_ref()?;
@@ -199,10 +266,7 @@ fn capture_encode_loop(
             force_kf,
         )?;
 
-        // Get cursor position (cheap X11 roundtrip, do it every frame)
-        let cursor = capturer.get_cursor_info().ok();
-
-        // Build wire messages
+        // Build wire message
         let wire = protocol::encode_video_frame(
             packet.keyframe,
             packet.pts,
@@ -216,15 +280,6 @@ fn capture_encode_loop(
         }
 
         let _ = frame_tx.send(wire);
-
-        if let Some(ci) = cursor {
-            let wire = protocol::encode_cursor_update(
-                ci.x.max(0) as u16,
-                ci.y.max(0) as u16,
-                ci.visible,
-            );
-            let _ = frame_tx.send(wire);
-        }
 
         frame_count += 1;
         fps_frame_count += 1;

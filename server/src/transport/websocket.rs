@@ -125,7 +125,7 @@ pub async fn start_server(
     metadata: ServerMetadata,
     runtime: ServerRuntimeConfig,
 ) -> anyhow::Result<(FrameSender, InputReceiver, KeyframeCache)> {
-    let (frame_tx, _) = broadcast::channel::<Vec<u8>>(120);
+    let (frame_tx, _) = broadcast::channel::<Vec<u8>>(4);
     let (input_tx, input_rx) = mpsc::channel::<ClientEvent>(1024);
     let keyframe_cache: KeyframeCache = Arc::new(Mutex::new(None));
 

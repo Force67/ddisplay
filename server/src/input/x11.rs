@@ -5,6 +5,7 @@ use x11rb::protocol::Event;
 use x11rb::protocol::xproto::ConnectionExt as _;
 use x11rb::protocol::xtest;
 use x11rb::rust_connection::RustConnection;
+use x11rb::wrapper::ConnectionExt as _;
 
 use crate::protocol::ClientEvent;
 
@@ -56,26 +57,26 @@ impl X11InputInjector {
             8_u32, 9, 13, 16, 17, 18, 20, 27, 32, 33, 34, 35, 36, 37, 38, 39, 40, 45, 46, 91, 92, 93,
             144, 145,
         ] {
-            let _ = self.key_event(keycode, false);
+            let _ = self.send_key(keycode, false);
         }
 
         for keycode in 48_u32..=57 {
-            let _ = self.key_event(keycode, false);
+            let _ = self.send_key(keycode, false);
         }
         for keycode in 65_u32..=90 {
-            let _ = self.key_event(keycode, false);
+            let _ = self.send_key(keycode, false);
         }
         for keycode in 96_u32..=111 {
-            let _ = self.key_event(keycode, false);
+            let _ = self.send_key(keycode, false);
         }
         for keycode in 112_u32..=123 {
-            let _ = self.key_event(keycode, false);
+            let _ = self.send_key(keycode, false);
         }
         for keycode in 186_u32..=192 {
-            let _ = self.key_event(keycode, false);
+            let _ = self.send_key(keycode, false);
         }
         for keycode in 219_u32..=222 {
-            let _ = self.key_event(keycode, false);
+            let _ = self.send_key(keycode, false);
         }
 
         self.conn.flush()?;
@@ -84,7 +85,7 @@ impl X11InputInjector {
 
     pub fn release_all_mouse_buttons(&self) -> anyhow::Result<()> {
         for button in [0_u8, 1, 2, 3, 4] {
-            let _ = self.mouse_button(button, false);
+            let _ = self.send_button(button, false);
         }
 
         self.conn.flush()?;
@@ -92,98 +93,104 @@ impl X11InputInjector {
     }
 
     /// Dispatch a client input event to the appropriate X11 injection method.
+    ///
+    /// Batches all X11 requests and issues a single flush at the end.
     pub fn inject_event(&self, event: &ClientEvent) -> anyhow::Result<()> {
         match event {
-            ClientEvent::MouseMove { x, y } => self.move_mouse(*x, *y),
+            ClientEvent::MouseMove { x, y } => self.send_move(*x, *y)?,
             ClientEvent::MouseButton {
                 button,
                 pressed,
                 x,
                 y,
             } => {
-                // Move to the position first, then press/release.
-                self.move_mouse(*x, *y)?;
-                self.mouse_button(*button, *pressed)
+                self.send_move(*x, *y)?;
+                self.send_button(*button, *pressed)?;
             }
             ClientEvent::MouseScroll { dx, dy, x, y } => {
-                self.move_mouse(*x, *y)?;
-                self.mouse_scroll(*dx, *dy)
+                self.send_move(*x, *y)?;
+                self.send_scroll(*dx, *dy)?;
             }
-            ClientEvent::KeyEvent { keycode, pressed } => self.key_event(*keycode, *pressed),
-            ClientEvent::ClientReady => Ok(()), // informational only
-            ClientEvent::PasteText { text } => self.paste_text(text),
-            ClientEvent::ReleaseKeys => self.release_all_keys(),
-            ClientEvent::ReleaseMouse => self.release_all_mouse_buttons(),
-            ClientEvent::ReleaseAll => self.release_stuck_inputs(),
+            ClientEvent::KeyEvent { keycode, pressed } => self.send_key(*keycode, *pressed)?,
+            ClientEvent::ClientReady => return Ok(()),
+            ClientEvent::PasteText { text } => {
+                self.paste_text(text)?;
+                return Ok(()); // paste_text manages its own flushes
+            }
+            ClientEvent::ReleaseKeys => {
+                self.release_all_keys()?;
+                return Ok(());
+            }
+            ClientEvent::ReleaseMouse => {
+                self.release_all_mouse_buttons()?;
+                return Ok(());
+            }
+            ClientEvent::ReleaseAll => {
+                self.release_stuck_inputs()?;
+                return Ok(());
+            }
         }
+        self.conn.flush()?;
+        Ok(())
     }
 
     // ------------------------------------------------------------------
     // Private helpers
     // ------------------------------------------------------------------
 
-    fn move_mouse(&self, x: u16, y: u16) -> anyhow::Result<()> {
+    /// Send a motion event without flushing.
+    fn send_move(&self, x: u16, y: u16) -> anyhow::Result<()> {
         xtest::fake_input(
             &self.conn,
             MOTION_NOTIFY,
-            0,        // detail (unused for motion)
-            0,        // time = CurrentTime
-            self.root, // root window
+            0,
+            0,
+            self.root,
             x as i16,
             y as i16,
-            0,        // deviceid = default
+            0,
         )?;
-        self.conn.flush()?;
         Ok(())
     }
 
-    fn mouse_button(&self, js_button: u8, pressed: bool) -> anyhow::Result<()> {
-        // Map JS MouseEvent.button to X11 button numbers.
-        // JS: 0=left, 1=middle, 2=right, 3=back, 4=forward
-        // X11: 1=left, 2=middle, 3=right
+    /// Send a button press/release without flushing.
+    fn send_button(&self, js_button: u8, pressed: bool) -> anyhow::Result<()> {
         let x11_button = match js_button {
             0 => 1,
             1 => 2,
             2 => 3,
-            3 => 8, // back
-            4 => 9, // forward
+            3 => 8,
+            4 => 9,
             other => other + 1,
         };
         let event_type = if pressed { BUTTON_PRESS } else { BUTTON_RELEASE };
         xtest::fake_input(&self.conn, event_type, x11_button, 0, self.root, 0, 0, 0)?;
-        self.conn.flush()?;
         Ok(())
     }
 
-    fn mouse_scroll(&self, dx: i16, dy: i16) -> anyhow::Result<()> {
-        // Vertical: button 4 = scroll up, button 5 = scroll down.
-        // Horizontal: button 6 = scroll left, button 7 = scroll right.
-        // Each "click" of the scroll wheel is a press+release pair.
-        // The magnitude indicates how many clicks to synthesize.
-
+    /// Send scroll events without flushing.
+    fn send_scroll(&self, dx: i16, dy: i16) -> anyhow::Result<()> {
         if dy != 0 {
-            let button: u8 = if dy < 0 { 4 } else { 5 }; // negative dy = up
+            let button: u8 = if dy < 0 { 4 } else { 5 };
             let clicks = (dy.unsigned_abs() as u16).max(1);
             for _ in 0..clicks {
                 xtest::fake_input(&self.conn, BUTTON_PRESS, button, 0, self.root, 0, 0, 0)?;
                 xtest::fake_input(&self.conn, BUTTON_RELEASE, button, 0, self.root, 0, 0, 0)?;
             }
         }
-
         if dx != 0 {
-            let button: u8 = if dx < 0 { 6 } else { 7 }; // negative dx = left
+            let button: u8 = if dx < 0 { 6 } else { 7 };
             let clicks = (dx.unsigned_abs() as u16).max(1);
             for _ in 0..clicks {
                 xtest::fake_input(&self.conn, BUTTON_PRESS, button, 0, self.root, 0, 0, 0)?;
                 xtest::fake_input(&self.conn, BUTTON_RELEASE, button, 0, self.root, 0, 0, 0)?;
             }
         }
-
-        self.conn.flush()?;
         Ok(())
     }
 
-    fn key_event(&self, js_keycode: u32, pressed: bool) -> anyhow::Result<()> {
+    /// Send a key press/release without flushing.
+    fn send_key(&self, js_keycode: u32, pressed: bool) -> anyhow::Result<()> {
         let x11_keycode = match self.js_keycode_to_x11_keycode(js_keycode) {
             Some(kc) => kc,
             None => {
@@ -193,40 +200,126 @@ impl X11InputInjector {
         };
         let event_type = if pressed { KEY_PRESS } else { KEY_RELEASE };
         xtest::fake_input(&self.conn, event_type, x11_keycode, 0, self.root, 0, 0, 0)?;
-        self.conn.flush()?;
         Ok(())
     }
 
+    /// Paste text by setting the X11 CLIPBOARD selection and simulating Ctrl+V.
+    ///
+    /// This is keyboard-layout independent — the text goes through the clipboard
+    /// rather than being typed as individual keypresses.
     fn paste_text(&self, text: &str) -> anyhow::Result<()> {
         self.release_stuck_inputs()?;
 
-        for ch in text.chars() {
-            self.type_char(ch)?;
-        }
+        // Open a separate connection for clipboard ownership so we can serve
+        // SelectionRequest events without interfering with the main connection.
+        let text = text.to_string();
+        let display = std::env::var("DISPLAY").ok();
 
-        self.conn.flush()?;
-        Ok(())
-    }
+        // Spawn a thread that owns the clipboard and serves requests for ~5 seconds
+        let handle = std::thread::spawn(move || -> anyhow::Result<()> {
+            let (conn, screen_num) = if let Some(d) = &display {
+                unsafe { std::env::set_var("DISPLAY", d) };
+                x11rb::connect(None)?
+            } else {
+                x11rb::connect(None)?
+            };
+            let screen = &conn.setup().roots[screen_num];
 
-    fn type_char(&self, ch: char) -> anyhow::Result<()> {
-        let (keycode, shift) = match char_to_js_keycode(ch) {
-            Some(mapping) => mapping,
-            None => {
-                tracing::warn!("Paste dropped unsupported character {:?}", ch);
-                return Ok(());
+            let window = conn.generate_id()?;
+            conn.create_window(
+                0, window, screen.root,
+                0, 0, 1, 1, 0,
+                x11rb::protocol::xproto::WindowClass::INPUT_OUTPUT,
+                x11rb::COPY_FROM_PARENT,
+                &x11rb::protocol::xproto::CreateWindowAux::new(),
+            )?.check()?;
+
+            let clipboard = conn.intern_atom(false, b"CLIPBOARD")?.reply()?.atom;
+            let utf8_string = conn.intern_atom(false, b"UTF8_STRING")?.reply()?.atom;
+            let targets_atom = conn.intern_atom(false, b"TARGETS")?.reply()?.atom;
+
+            // Take ownership of CLIPBOARD
+            conn.set_selection_owner(window, clipboard, x11rb::CURRENT_TIME)?.check()?;
+            conn.flush()?;
+
+            // Verify we got ownership
+            let owner = conn.get_selection_owner(clipboard)?.reply()?.owner;
+            if owner != window {
+                anyhow::bail!("Failed to acquire CLIPBOARD ownership");
             }
-        };
 
-        if shift {
-            self.key_event(16, true)?;
-        }
+            let text_bytes = text.as_bytes();
+            let deadline = Instant::now() + Duration::from_secs(5);
 
-        self.key_event(keycode, true)?;
-        self.key_event(keycode, false)?;
+            // Serve SelectionRequest events until timeout
+            while Instant::now() < deadline {
+                let event = conn.poll_for_event()?;
+                match event {
+                    Some(Event::SelectionRequest(req)) => {
+                        let mut notify = x11rb::protocol::xproto::SelectionNotifyEvent {
+                            response_type: 31, // SelectionNotify
+                            sequence: 0,
+                            time: req.time,
+                            requestor: req.requestor,
+                            selection: req.selection,
+                            target: req.target,
+                            property: req.property,
+                        };
 
-        if shift {
-            self.key_event(16, false)?;
-        }
+                        if req.target == targets_atom {
+                            // Respond with supported targets
+                            let targets = [utf8_string, targets_atom];
+                            conn.change_property32(
+                                x11rb::protocol::xproto::PropMode::REPLACE,
+                                req.requestor,
+                                req.property,
+                                x11rb::protocol::xproto::AtomEnum::ATOM,
+                                &targets,
+                            )?;
+                        } else if req.target == utf8_string {
+                            // Respond with the text
+                            conn.change_property8(
+                                x11rb::protocol::xproto::PropMode::REPLACE,
+                                req.requestor,
+                                req.property,
+                                utf8_string,
+                                text_bytes,
+                            )?;
+                        } else {
+                            // Unsupported target
+                            notify.property = x11rb::NONE;
+                        }
+
+                        conn.send_event(false, req.requestor, x11rb::protocol::xproto::EventMask::NO_EVENT, notify)?;
+                        conn.flush()?;
+                    }
+                    Some(Event::SelectionClear(_)) => {
+                        // Another app took clipboard ownership, we're done
+                        break;
+                    }
+                    _ => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+
+            let _ = conn.destroy_window(window);
+            let _ = conn.flush();
+            Ok(())
+        });
+
+        // Give the clipboard thread a moment to acquire ownership
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Simulate Ctrl+V
+        self.send_key(17, true)?;  // Ctrl down
+        self.send_key(86, true)?;  // V down
+        self.send_key(86, false)?; // V up
+        self.send_key(17, false)?; // Ctrl up
+        self.conn.flush()?;
+
+        // Detach the clipboard thread — it'll serve requests for a few seconds then exit
+        drop(handle);
 
         Ok(())
     }

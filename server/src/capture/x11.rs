@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use std::ptr;
 use x11rb::connection::Connection;
+use x11rb::protocol::composite::ConnectionExt as _;
+use x11rb::protocol::damage::{self, ConnectionExt as _};
 use x11rb::protocol::shm::{self, ConnectionExt as _};
 use x11rb::protocol::xfixes::{self};
 use x11rb::protocol::xproto::{self, ImageFormat};
@@ -18,6 +20,8 @@ pub struct X11Capturer {
     #[allow(dead_code)]
     screen_num: usize,
     root: u32,
+    capture_window: u32,
+    overlay_window: Option<u32>,
     width: u16,
     height: u16,
     shm_seg: u32,
@@ -25,6 +29,10 @@ pub struct X11Capturer {
     shm_id: i32,
     shm_ptr: *mut u8,
     shm_size: usize,
+    /// X11 Damage object for change tracking (None if damage init failed).
+    damage_id: Option<u32>,
+    /// Whether the screen has been damaged since last capture.
+    damaged: bool,
 }
 
 // SAFETY: The shared memory pointer is only accessed from capture_frame()
@@ -51,6 +59,8 @@ impl X11Capturer {
         let root = screen.root;
         let width = screen.width_in_pixels;
         let height = screen.height_in_pixels;
+        let overlay_window = Self::detect_overlay_window(&conn, root)?;
+        let capture_window = overlay_window.unwrap_or(root);
 
         tracing::info!(
             "Connected to X11 display, screen {}: {}x{}",
@@ -58,6 +68,15 @@ impl X11Capturer {
             width,
             height
         );
+        if let Some(overlay_window) = overlay_window {
+            tracing::info!(
+                "Using XComposite overlay window 0x{:x} for capture (root=0x{:x})",
+                overlay_window,
+                root
+            );
+        } else {
+            tracing::info!("Using root window 0x{:x} for capture", root);
+        }
 
         // Verify MIT-SHM extension is available
         let shm_version = shm::query_version(&conn)?
@@ -120,6 +139,14 @@ impl X11Capturer {
             .reply()
             .context("X server does not support XFixes extension v4+")?;
 
+        // Initialize X11 Damage extension for change tracking
+        let damage_id = Self::init_damage(&conn, capture_window).ok();
+        if damage_id.is_some() {
+            tracing::info!("X11 Damage tracking enabled");
+        } else {
+            tracing::warn!("X11 Damage tracking unavailable, capturing every frame");
+        }
+
         tracing::info!(
             "X11 capturer initialized: {}x{}, SHM segment {} ({} bytes)",
             width,
@@ -132,12 +159,16 @@ impl X11Capturer {
             conn,
             screen_num,
             root,
+            capture_window,
+            overlay_window,
             width,
             height,
             shm_seg,
             shm_id,
             shm_ptr,
             shm_size,
+            damage_id,
+            damaged: true, // assume damaged initially so first frame is captured
         })
     }
 
@@ -148,7 +179,7 @@ impl X11Capturer {
     pub fn capture_frame_ref(&self) -> Result<CapturedFrameRef<'_>> {
         self.conn
             .shm_get_image(
-                self.root,
+                self.capture_window,
                 0,
                 0,
                 self.width,
@@ -209,10 +240,99 @@ impl X11Capturer {
     pub fn screen_height(&self) -> u32 {
         self.height as u32
     }
+
+    /// Poll for damage events and return whether the screen has changed.
+    ///
+    /// Call this before `capture_frame_ref()`. If it returns `false`, the
+    /// screen is unchanged and you can skip capture+encode.
+    pub fn has_damage(&mut self) -> bool {
+        if self.damage_id.is_none() {
+            return true; // no damage tracking, always capture
+        }
+
+        // Drain all pending events to check for DamageNotify
+        while let Ok(Some(event)) = self.conn.poll_for_event() {
+            // DamageNotify events have a specific response type.
+            // The damage extension's event base + 0 = DamageNotify.
+            // We set damaged=true for any event since DamageNotify is
+            // the primary event we subscribed to.
+            let _ = event;
+            self.damaged = true;
+        }
+
+        let was_damaged = self.damaged;
+        if was_damaged {
+            self.damaged = false;
+            // Subtract the damage region so we get notified of future changes
+            if let Some(dmg) = self.damage_id {
+                let _ = damage::subtract(&self.conn, dmg, 0u32, 0u32);
+                let _ = self.conn.flush();
+            }
+        }
+        was_damaged
+    }
+
+    fn init_damage(conn: &RustConnection, window: u32) -> Result<u32> {
+        let version = damage::query_version(conn, 1, 1)?
+            .reply()
+            .context("X server does not support Damage extension v1.1+")?;
+
+        tracing::debug!(
+            "X11 Damage version {}.{}",
+            version.major_version,
+            version.minor_version,
+        );
+
+        let damage_id = conn.generate_id()
+            .context("Failed to generate X11 ID for Damage")?;
+
+        // Report NonEmpty damage level: one event per
+        // transition from undamaged→damaged (not per-rect).
+        damage::create(conn, damage_id, window, damage::ReportLevel::NON_EMPTY)?
+            .check()
+            .context("Failed to create Damage object")?;
+
+        Ok(damage_id)
+    }
+
+    fn detect_overlay_window(conn: &RustConnection, root: u32) -> Result<Option<u32>> {
+        let version = conn
+            .composite_query_version(0, 4)?
+            .reply()
+            .context("X server does not support XComposite extension v0.4+")?;
+
+        tracing::debug!(
+            "XComposite version {}.{}",
+            version.major_version,
+            version.minor_version
+        );
+
+        let reply = conn
+            .composite_get_overlay_window(root)?
+            .reply()
+            .context("Failed to query XComposite overlay window")?;
+
+        let overlay_window = reply.overlay_win;
+        if overlay_window == 0 || overlay_window == root {
+            return Ok(None);
+        }
+
+        Ok(Some(overlay_window))
+    }
 }
 
 impl Drop for X11Capturer {
     fn drop(&mut self) {
+        if let Some(dmg) = self.damage_id {
+            let _ = damage::destroy(&self.conn, dmg);
+        }
+
+        if self.overlay_window.is_some() {
+            if let Err(e) = self.conn.composite_release_overlay_window(self.root) {
+                tracing::warn!("Failed to release XComposite overlay window: {}", e);
+            }
+        }
+
         // Detach from X server first (ignore errors during cleanup)
         if let Err(e) = self.conn.shm_detach(self.shm_seg) {
             tracing::warn!("Failed to detach SHM from X server: {}", e);

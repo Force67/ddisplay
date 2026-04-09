@@ -32,6 +32,8 @@ export class InputHandler {
     #wheelRemainderX = 0;
     /** @type {number} */
     #wheelRemainderY = 0;
+    /** @type {boolean} */
+    #keyboardLocked = false;
 
     static WHEEL_PIXEL_STEP = 48;
     static WHEEL_PAGE_STEP = 8;
@@ -79,6 +81,7 @@ export class InputHandler {
 
     releaseCapture() {
         this.#releaseAllInputs();
+        this.#releaseKeyboardLock();
         this.#lockInitialised = false;
         this.#lastEscapeTapAt = 0;
         if (document.pointerLockElement === this.#target) {
@@ -121,22 +124,17 @@ export class InputHandler {
         this.#sendPasteText(text);
     }
 
+    sendKeyTap(keycode) {
+        if (this.#readOnly) return;
+        this.#sendKeyEvent(keycode, true);
+        this.#sendKeyEvent(keycode, false);
+    }
+
     // -- internals --
 
     #bind() {
         const opts = { signal: this.#abort.signal };
         const el = this.#target;
-
-        // Request pointer lock on click.
-        el.addEventListener('click', () => {
-            el.focus({ preventScroll: true });
-            if (this.#readOnly) {
-                return;
-            }
-            if (document.pointerLockElement !== el) {
-                el.requestPointerLock();
-            }
-        }, opts);
 
         document.addEventListener('pointerlockchange', () => {
             const wasLocked = this.#pointerLocked;
@@ -144,21 +142,30 @@ export class InputHandler {
             if (wasLocked && !this.#pointerLocked) {
                 this.#lockInitialised = false;
                 this.#releaseAllInputs();
+                this.#releaseKeyboardLock();
             }
         }, opts);
 
-        window.addEventListener('blur', () => this.#releaseAllInputs(), opts);
-        window.addEventListener('pagehide', () => this.#releaseAllInputs(), opts);
+        window.addEventListener('blur', () => {
+            this.#releaseAllInputs();
+            this.#releaseKeyboardLock();
+        }, opts);
+        window.addEventListener('pagehide', () => {
+            this.#releaseAllInputs();
+            this.#releaseKeyboardLock();
+        }, opts);
         document.addEventListener('visibilitychange', () => {
             if (document.visibilityState === 'hidden') {
                 this.#releaseAllInputs();
+                this.#releaseKeyboardLock();
             }
         }, opts);
 
-        // ---- Mouse ----
+        // ---- Pointer / Mouse ----
 
-        el.addEventListener('mousemove', (e) => {
+        el.addEventListener('pointermove', (e) => {
             if (this.#readOnly) return;
+            if (!e.isPrimary) return;
             if (this.#remoteWidth === 0 || this.#remoteHeight === 0) return;
 
             let x, y;
@@ -184,21 +191,55 @@ export class InputHandler {
             this.#sendMouseMove(x, y);
         }, opts);
 
-        el.addEventListener('mousedown', (e) => {
+        el.addEventListener('pointerdown', (e) => {
             if (this.#readOnly) return;
+            if (!e.isPrimary) return;
             e.preventDefault();
             el.focus({ preventScroll: true });
+            this.#requestKeyboardLock();
+            if (typeof el.setPointerCapture === 'function') {
+                try {
+                    el.setPointerCapture(e.pointerId);
+                } catch (_) {
+                    // ignore browsers that reject capture for this pointer
+                }
+            }
+            if (e.pointerType === 'mouse' && document.pointerLockElement !== el) {
+                try {
+                    const maybePromise = el.requestPointerLock();
+                    if (maybePromise && typeof maybePromise.catch === 'function') {
+                        maybePromise.catch(() => {});
+                    }
+                } catch (_) {
+                    // ignore pointer-lock failures and continue with absolute coords
+                }
+            }
             const { x, y } = this.#currentCoords(e);
             this.#pressedButtons.add(e.button);
             this.#sendMouseButton(e.button, true, x, y);
         }, opts);
 
-        el.addEventListener('mouseup', (e) => {
+        el.addEventListener('pointerup', (e) => {
             if (this.#readOnly) return;
+            if (!e.isPrimary) return;
             e.preventDefault();
+            if (typeof el.releasePointerCapture === 'function') {
+                try {
+                    el.releasePointerCapture(e.pointerId);
+                } catch (_) {
+                    // ignore browsers that do not hold capture for this pointer
+                }
+            }
             const { x, y } = this.#currentCoords(e);
             this.#pressedButtons.delete(e.button);
             this.#sendMouseButton(e.button, false, x, y);
+        }, opts);
+
+        el.addEventListener('pointercancel', (e) => {
+            if (this.#readOnly) return;
+            if (!e.isPrimary) return;
+            this.#pressedButtons.delete(e.button);
+            this.#sendControlMessage(InputHandler.MSG_RELEASE_MOUSE);
         }, opts);
 
         el.addEventListener('wheel', (e) => {
@@ -361,6 +402,36 @@ export class InputHandler {
 
         this.#wheelRemainderX = 0;
         this.#wheelRemainderY = 0;
+    }
+
+    async #requestKeyboardLock() {
+        if (this.#keyboardLocked) {
+            return;
+        }
+
+        const keyboard = navigator.keyboard;
+        if (!keyboard || typeof keyboard.lock !== 'function') {
+            return;
+        }
+
+        try {
+            await keyboard.lock(['MetaLeft', 'MetaRight']);
+            this.#keyboardLocked = true;
+        } catch (_) {
+            // Browser or OS rejected keyboard lock. Fall back to normal key handling.
+        }
+    }
+
+    #releaseKeyboardLock() {
+        if (!this.#keyboardLocked) {
+            return;
+        }
+
+        const keyboard = navigator.keyboard;
+        if (keyboard && typeof keyboard.unlock === 'function') {
+            keyboard.unlock();
+        }
+        this.#keyboardLocked = false;
     }
 
     /** @param {KeyboardEvent} e */

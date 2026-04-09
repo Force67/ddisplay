@@ -6,6 +6,8 @@ export class Renderer {
     #canvas;
     /** @type {CanvasRenderingContext2D} */
     #ctx;
+    /** @type {ResizeObserver|null} */
+    #resizeObserver = null;
     #remoteWidth = 0;
     #remoteHeight = 0;
     /** @type {number[]} */
@@ -20,6 +22,13 @@ export class Renderer {
     constructor(canvas) {
         this.#canvas = canvas;
         this.#ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+        const container = this.#canvas.parentElement;
+        if (typeof ResizeObserver !== 'undefined' && container) {
+            this.#resizeObserver = new ResizeObserver(() => this.#syncElementSize());
+            this.#resizeObserver.observe(container);
+        } else {
+            window.addEventListener('resize', () => this.#syncElementSize());
+        }
         setInterval(() => this.#updateFps(), 1000);
     }
 
@@ -54,6 +63,7 @@ export class Renderer {
             this.#remoteHeight = h;
             this.#canvas.width = w;
             this.#canvas.height = h;
+            this.#syncElementSize();
         }
 
         try {
@@ -101,6 +111,34 @@ export class Renderer {
         ctx.stroke();
 
         ctx.restore();
+    }
+
+    #syncElementSize() {
+        if (this.#remoteWidth === 0 || this.#remoteHeight === 0) {
+            return;
+        }
+
+        const container = this.#canvas.parentElement;
+        if (!container) {
+            return;
+        }
+
+        const availableWidth = container.clientWidth;
+        const availableHeight = container.clientHeight;
+        if (availableWidth <= 0 || availableHeight <= 0) {
+            return;
+        }
+
+        const scale = Math.min(
+            availableWidth / this.#remoteWidth,
+            availableHeight / this.#remoteHeight,
+        );
+
+        const width = Math.max(1, Math.floor(this.#remoteWidth * scale));
+        const height = Math.max(1, Math.floor(this.#remoteHeight * scale));
+
+        this.#canvas.style.width = `${width}px`;
+        this.#canvas.style.height = `${height}px`;
     }
 
     #updateFps() {

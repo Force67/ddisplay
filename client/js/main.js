@@ -35,6 +35,7 @@ const btnRestart = document.getElementById('btn-restart');
 const btnReleaseKeys = document.getElementById('btn-release-keys');
 const btnReleaseMouse = document.getElementById('btn-release-mouse');
 const btnReleaseAll = document.getElementById('btn-release-all');
+const btnSendSuper = document.getElementById('btn-send-super');
 const btnPullClipboard = document.getElementById('btn-pull-clipboard');
 const pasteText = document.getElementById('paste-text');
 const btnPasteHostClipboard = document.getElementById('btn-paste-host-clipboard');
@@ -338,6 +339,7 @@ btnRestart.addEventListener('click', async () => {
 btnReleaseKeys.addEventListener('click', () => input.releaseRemoteKeys());
 btnReleaseMouse.addEventListener('click', () => input.releaseRemoteMouse());
 btnReleaseAll.addEventListener('click', () => input.releaseRemoteAll());
+btnSendSuper.addEventListener('click', () => input.sendKeyTap(91));
 btnPasteHostClipboard.addEventListener('click', async () => {
     if (!navigator.clipboard?.readText) {
         setWarning('Host clipboard read is not available in this browser context.');

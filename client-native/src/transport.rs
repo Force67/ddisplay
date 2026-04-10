@@ -1,0 +1,114 @@
+/// WebSocket transport with auto-reconnect.
+
+use anyhow::{Context, Result};
+use futures_util::{SinkExt, StreamExt};
+use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::Message;
+
+/// Messages flowing between the transport and the app.
+pub enum TransportEvent {
+    Connected,
+    Disconnected,
+    Data(Vec<u8>),
+}
+
+/// Handle for sending data to the server.
+#[derive(Clone)]
+pub struct TransportSender {
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+}
+
+impl TransportSender {
+    pub fn send(&self, data: Vec<u8>) {
+        let _ = self.tx.send(data);
+    }
+}
+
+/// Spawn the WebSocket transport as a background task.
+///
+/// Returns a sender for outgoing messages and a receiver for incoming events.
+pub fn spawn(
+    url: String,
+) -> (TransportSender, mpsc::UnboundedReceiver<TransportEvent>) {
+    let (event_tx, event_rx) = mpsc::unbounded_channel();
+    let (send_tx, send_rx) = mpsc::unbounded_channel();
+
+    tokio::spawn(transport_loop(url, event_tx, send_rx));
+
+    (TransportSender { tx: send_tx }, event_rx)
+}
+
+async fn transport_loop(
+    url: String,
+    event_tx: mpsc::UnboundedSender<TransportEvent>,
+    mut send_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+) {
+    let mut backoff = std::time::Duration::from_millis(500);
+    let max_backoff = std::time::Duration::from_secs(10);
+
+    loop {
+        tracing::info!("Connecting to {}", url);
+
+        match connect_once(&url, &event_tx, &mut send_rx).await {
+            Ok(()) => {
+                tracing::info!("Connection closed cleanly");
+            }
+            Err(e) => {
+                tracing::warn!("Connection error: {}", e);
+            }
+        }
+
+        let _ = event_tx.send(TransportEvent::Disconnected);
+
+        tracing::info!("Reconnecting in {:?}", backoff);
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(max_backoff);
+    }
+}
+
+async fn connect_once(
+    url: &str,
+    event_tx: &mpsc::UnboundedSender<TransportEvent>,
+    send_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+) -> Result<()> {
+    let (ws_stream, _) = tokio_tungstenite::connect_async(url)
+        .await
+        .context("WebSocket connect failed")?;
+
+    tracing::info!("Connected");
+    let _ = event_tx.send(TransportEvent::Connected);
+
+    let (mut ws_sink, mut ws_stream_rx) = ws_stream.split();
+
+    loop {
+        tokio::select! {
+            // Incoming from server
+            msg = ws_stream_rx.next() => {
+                match msg {
+                    Some(Ok(Message::Binary(data))) => {
+                        let _ = event_tx.send(TransportEvent::Data(data.to_vec()));
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        return Ok(());
+                    }
+                    Some(Err(e)) => {
+                        return Err(e.into());
+                    }
+                    _ => {} // ignore text, ping, pong
+                }
+            }
+            // Outgoing to server
+            data = send_rx.recv() => {
+                match data {
+                    Some(buf) => {
+                        ws_sink.send(Message::Binary(buf.into())).await?;
+                    }
+                    None => {
+                        // Sender dropped, shutdown
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+}

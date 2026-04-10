@@ -1,0 +1,42 @@
+[package]
+name = "ddisplay-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# WebSocket client (same protocol as web UI, upgrade to raw TCP later)
+tokio-tungstenite = { version = "0.28", features = ["native-tls"] }
+futures-util = "0.3"
+url = "2"
+
+# Windowing + input (cross-platform, but we target Windows)
+winit = "0.30"
+
+# GPU rendering
+wgpu = "24"
+
+# H.264 decoding — ffmpeg via bindings for DXVA2 hardware decode
+# On Windows this auto-detects DXVA2/D3D11VA for zero-copy decode
+openh264 = "0.9"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+
+# CLI arguments
+clap = { version = "4", features = ["derive"] }
+
+# Byte manipulation
+byteorder = "1"
+
+# Blocking async in sync context (for wgpu init)
+pollster = "0.4"
+
+# Safe casting for uniform buffer uploads
+bytemuck = { version = "1", features = ["derive"] }

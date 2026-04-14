@@ -25,6 +25,19 @@ mod input;
 use protocol::ServerMessage;
 use transport::TransportEvent;
 
+/// Parsed session info JSON from server.
+#[derive(serde::Deserialize)]
+struct SessionInfo {
+    #[serde(default)]
+    codec: String,
+    #[serde(default)]
+    width: u32,
+    #[serde(default)]
+    height: u32,
+    #[serde(default)]
+    fps: u32,
+}
+
 #[derive(Parser)]
 #[command(name = "ddisplay-client", about = "Native remote display client")]
 struct Args {
@@ -35,6 +48,11 @@ struct Args {
     /// Window title
     #[arg(long, default_value = "ddisplay")]
     title: String,
+
+    /// Force a codec ("av1" or "h264"), ignoring the server's SessionInfo.
+    /// Useful for diagnosing why AV1 is not working.
+    #[arg(long)]
+    force_codec: Option<String>,
 }
 
 /// Application state.
@@ -42,10 +60,13 @@ struct App {
     args: Args,
     window: Option<Arc<Window>>,
     renderer: Option<renderer::Renderer>,
-    decoder: Option<decoder::H264Decoder>,
+    decoder: Option<decoder::VideoDecoder>,
     input_state: Option<input::InputState>,
     transport_rx: Option<tokio::sync::mpsc::UnboundedReceiver<TransportEvent>>,
     rt: tokio::runtime::Handle,
+    codec: String,
+    /// Frame counter for log throttling (total VideoFrame messages received).
+    frame_count: u64,
 }
 
 impl ApplicationHandler for App {
@@ -74,16 +95,27 @@ impl ApplicationHandler for App {
             }
         };
 
-        eprintln!("[init] Initializing H.264 decoder...");
+        eprintln!("[init] Initializing decoder...");
 
-        let h264_decoder = match decoder::H264Decoder::new() {
+        // Determine startup codec: honour --force-codec if provided.
+        let startup_codec = self.args.force_codec
+            .as_deref()
+            .unwrap_or("h264")
+            .to_lowercase();
+        if let Some(ref fc) = self.args.force_codec {
+            eprintln!("[init] --force-codec={} (server SessionInfo codec will be IGNORED)", fc);
+        }
+
+        // Start with the chosen codec; switch to AV1 when server sends session info
+        let video_decoder = match decoder::VideoDecoder::for_codec(&startup_codec) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("[FATAL] Failed to create decoder: {}", e);
+                eprintln!("[FATAL] Failed to create {} decoder: {}", startup_codec, e);
                 event_loop.exit();
                 return;
             }
         };
+        self.codec = startup_codec;
 
         eprintln!("[init] Connecting to ws://{}...", self.args.server);
 
@@ -95,7 +127,7 @@ impl ApplicationHandler for App {
 
         self.window = Some(window);
         self.renderer = Some(renderer);
-        self.decoder = Some(h264_decoder);
+        self.decoder = Some(video_decoder);
         self.input_state = Some(input_state);
         self.transport_rx = Some(rx);
 
@@ -210,6 +242,17 @@ impl App {
 
         match msg {
             ServerMessage::VideoFrame(frame) => {
+                self.frame_count += 1;
+
+                // Log every frame for AV1 diagnosis; throttle to every 30 after the first 10.
+                let log_this = self.frame_count <= 10 || self.frame_count % 30 == 0;
+                if log_this {
+                    eprintln!("[frame #{}] kf={} pts={} data_bytes={} dim={}x{}  codec={}",
+                        self.frame_count, frame.keyframe, frame.pts,
+                        frame.data.len(), frame.width, frame.height,
+                        self.codec);
+                }
+
                 let decoder = match &mut self.decoder {
                     Some(d) => d,
                     None => return,
@@ -226,14 +269,50 @@ impl App {
                     }
                     Ok(None) => {} // decoder buffering
                     Err(e) => {
-                        tracing::warn!("Decode error: {}", e);
+                        eprintln!("[frame #{}] decode error (codec={}): {}",
+                            self.frame_count, self.codec, e);
                     }
+                }
+            }
+            ServerMessage::SessionInfo(json_bytes) => {
+                let raw = String::from_utf8_lossy(json_bytes);
+                eprintln!("[session] raw JSON: {}", raw);
+
+                if let Ok(info) = serde_json::from_slice::<SessionInfo>(json_bytes) {
+                    eprintln!("[session] parsed: codec={} {}x{} @ {} fps",
+                        info.codec, info.width, info.height, info.fps);
+
+                    // --force-codec wins over server-sent codec.
+                    if self.args.force_codec.is_some() {
+                        eprintln!("[session] --force-codec active — ignoring server codec '{}'", info.codec);
+                        return;
+                    }
+
+                    if !info.codec.is_empty() && info.codec != self.codec {
+                        eprintln!("[session] switching decoder: {} → {}", self.codec, info.codec);
+                        match decoder::VideoDecoder::for_codec(&info.codec) {
+                            Ok(dec) => {
+                                self.decoder = Some(dec);
+                                self.codec = info.codec.clone();
+                                eprintln!("[session] decoder ready: {}", self.codec);
+                            }
+                            Err(e) => {
+                                eprintln!("[session] FAILED to create {} decoder: {}", info.codec, e);
+                            }
+                        }
+                    } else {
+                        eprintln!("[session] codec unchanged ({})", self.codec);
+                    }
+                } else {
+                    eprintln!("[session] WARNING: failed to parse SessionInfo JSON");
                 }
             }
             ServerMessage::CursorUpdate(_cursor) => {
                 // TODO: render remote cursor overlay
             }
-            ServerMessage::Unknown(_) => {}
+            ServerMessage::Unknown(t) => {
+                eprintln!("[proto] unknown message type 0x{:02x}", t);
+            }
         }
     }
 }
@@ -267,6 +346,8 @@ fn main() {
         input_state: None,
         transport_rx: None,
         rt: rt.handle().clone(),
+        codec: "h264".to_string(),
+        frame_count: 0,
     };
 
     if let Err(e) = event_loop.run_app(&mut app) {

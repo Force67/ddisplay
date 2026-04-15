@@ -175,18 +175,20 @@ impl Av1Decoder {
 
     pub fn decode(&mut self, data: &[u8]) -> Result<Option<DecodedFrame>> {
         self.frames_in += 1;
+        // Verbose per-frame logging only for the first 5 frames; after that errors only.
+        let verbose = self.frames_in <= 5;
 
         if data.is_empty() {
             eprintln!("[av1] WARNING frame #{}: empty packet!", self.frames_in);
             return Ok(None);
         }
 
-        // Log first 16 bytes as hex + OBU type for diagnosis.
-        let n = data.len().min(16);
-        let hex: Vec<String> = data[..n].iter().map(|b| format!("{:02x}", b)).collect();
-        let obu = obu_type_name(data[0]);
-        eprintln!("[av1] >> frame #{}: {} bytes  first_obu={} hdr=[{}]",
-            self.frames_in, data.len(), obu, hex.join(" "));
+        if verbose {
+            let n = data.len().min(16);
+            let hex: Vec<String> = data[..n].iter().map(|b| format!("{:02x}", b)).collect();
+            eprintln!("[av1] >> frame #{}: {} bytes  first_obu={} hdr=[{}]",
+                self.frames_in, data.len(), obu_type_name(data[0]), hex.join(" "));
+        }
 
         unsafe {
             let mut dav1d_data: Dav1dData = std::mem::zeroed();
@@ -197,20 +199,17 @@ impl Av1Decoder {
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
 
             let send_rc = dav1d_send_data(self.ctx, &mut dav1d_data);
-
-            // Always safe to unref: no-op if data was consumed (rc=0, dav1d sets ptr→NULL),
-            // frees the buffer if it was not (EAGAIN or error).
             dav1d_data_unref(&mut dav1d_data);
 
             match send_rc {
                 0 => {
-                    eprintln!("[av1]   send_data OK");
+                    if verbose { eprintln!("[av1]   send_data OK"); }
                 }
                 DAV1D_EAGAIN => {
                     self.send_eagain += 1;
-                    eprintln!("[av1]   send_data EAGAIN #{} (decoder saturated — draining)",
-                        self.send_eagain);
-                    // Fall through to get_picture to drain; this input frame is dropped.
+                    if verbose || self.send_eagain <= 3 {
+                        eprintln!("[av1]   send_data EAGAIN #{} (draining)", self.send_eagain);
+                    }
                 }
                 rc => {
                     self.decode_errors += 1;
@@ -226,8 +225,10 @@ impl Av1Decoder {
                 0 => {
                     let w = pic.p.w as usize;
                     let h = pic.p.h as usize;
-                    eprintln!("[av1]   get_picture OK → {}x{}  (out #{} / in #{})",
-                        w, h, self.frames_out + 1, self.frames_in);
+                    if verbose {
+                        eprintln!("[av1]   get_picture OK → {}x{}  strides Y={} UV={}",
+                            w, h, pic.stride[0], pic.stride[1]);
+                    }
 
                     if w == 0 || h == 0 {
                         eprintln!("[av1]   WARNING: zero-size picture {}x{}", w, h);
@@ -237,7 +238,6 @@ impl Av1Decoder {
 
                     let y_stride = pic.stride[0] as usize;
                     let uv_stride = pic.stride[1] as usize;
-                    eprintln!("[av1]   strides: Y={} UV={}", y_stride, uv_stride);
 
                     let y_ptr = pic.data[0].map(|p| p.as_ptr() as *const u8);
                     let u_ptr = pic.data[1].map(|p| p.as_ptr() as *const u8);
@@ -260,7 +260,8 @@ impl Av1Decoder {
                     dav1d_picture_unref(&mut pic);
                     self.frames_out += 1;
 
-                    if self.frames_out % 50 == 0 {
+                    // Stats every 300 frames (~5 s at 60 fps).
+                    if self.frames_out % 300 == 0 {
                         eprintln!("[av1] stats: in={} out={} send_eagain={} get_eagain={} errors={}",
                             self.frames_in, self.frames_out,
                             self.send_eagain, self.get_eagain, self.decode_errors);
@@ -270,7 +271,9 @@ impl Av1Decoder {
                 }
                 DAV1D_EAGAIN => {
                     self.get_eagain += 1;
-                    eprintln!("[av1]   get_picture EAGAIN #{} (need more input)", self.get_eagain);
+                    if verbose || self.get_eagain <= 3 {
+                        eprintln!("[av1]   get_picture EAGAIN #{} (need more input)", self.get_eagain);
+                    }
                     Ok(None)
                 }
                 rc => {

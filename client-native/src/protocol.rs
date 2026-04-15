@@ -48,10 +48,13 @@ pub struct CursorUpdate {
     pub visible: bool,
 }
 
+pub const MSG_SESSION_INFO: u8 = 0x03;
+
 /// Parse a server message.
 pub enum ServerMessage<'a> {
     VideoFrame(VideoFrame<'a>),
     CursorUpdate(CursorUpdate),
+    SessionInfo(&'a [u8]),
     Unknown(u8),
 }
 
@@ -78,6 +81,9 @@ pub fn parse_server_message(data: &[u8]) -> Option<ServerMessage<'_>> {
             let y = u16::from_le_bytes(data[3..5].try_into().ok()?);
             let visible = data[5] != 0;
             Some(ServerMessage::CursorUpdate(CursorUpdate { x, y, visible }))
+        }
+        MSG_SESSION_INFO if data.len() >= 2 => {
+            Some(ServerMessage::SessionInfo(&data[1..]))
         }
         other => Some(ServerMessage::Unknown(other)),
     }

@@ -71,11 +71,23 @@ async fn connect_once(
     event_tx: &mpsc::UnboundedSender<TransportEvent>,
     send_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
 ) -> Result<()> {
-    let (ws_stream, _) = tokio_tungstenite::connect_async(url)
-        .await
-        .context("WebSocket connect failed")?;
+    // Manual TCP connect so we can set TCP_NODELAY before the WebSocket handshake.
+    // Without it, Nagle's algorithm can silently buffer mouse/keyboard sends for up to 40ms.
+    let parsed = url::Url::parse(url).context("invalid WebSocket URL")?;
+    let host = parsed.host_str().unwrap_or("localhost");
+    let port = parsed.port_or_known_default().unwrap_or(80);
+    let addr = format!("{}:{}", host, port);
 
-    tracing::info!("Connected");
+    let tcp = tokio::net::TcpStream::connect(&addr)
+        .await
+        .with_context(|| format!("TCP connect to {} failed", addr))?;
+    tcp.set_nodelay(true).context("TCP_NODELAY failed")?;
+
+    let (ws_stream, _) = tokio_tungstenite::client_async(url, tcp)
+        .await
+        .context("WebSocket handshake failed")?;
+
+    tracing::info!("Connected (TCP_NODELAY=true)");
     let _ = event_tx.send(TransportEvent::Connected);
 
     let (mut ws_sink, mut ws_stream_rx) = ws_stream.split();

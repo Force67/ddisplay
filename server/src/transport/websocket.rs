@@ -1,4 +1,5 @@
 use axum::{
+    serve::ListenerExt,
     Router,
     Json,
     extract::Query,
@@ -125,7 +126,7 @@ pub async fn start_server(
     metadata: ServerMetadata,
     runtime: ServerRuntimeConfig,
 ) -> anyhow::Result<(FrameSender, InputReceiver, KeyframeCache)> {
-    let (frame_tx, _) = broadcast::channel::<Vec<u8>>(4);
+    let (frame_tx, _) = broadcast::channel::<Vec<u8>>(2);
     let (input_tx, input_rx) = mpsc::channel::<ClientEvent>(1024);
     let keyframe_cache: KeyframeCache = Arc::new(Mutex::new(None));
 
@@ -151,7 +152,7 @@ pub async fn start_server(
     tracing::info!("WebSocket server listening on {}", bind_addr);
 
     tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
+        if let Err(e) = axum::serve(listener.tap_io(|s| { let _ = s.set_nodelay(true); }), app).await {
             tracing::error!("Server error: {}", e);
         }
     });
@@ -177,6 +178,17 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let input_state = Arc::new(Mutex::new(ConnectionInputState::default()));
+
+    // Send session info (codec, resolution, etc.) so client can configure decoder.
+    let session_info = protocol::encode_session_info(&protocol::SessionInfo {
+        width: state.metadata.width,
+        height: state.metadata.height,
+        fps: state.metadata.fps,
+        codec: state.metadata.codec.clone(),
+    });
+    if ws_sender.send(Message::Binary(session_info.into())).await.is_err() {
+        return;
+    }
 
     // Send cached keyframe immediately so the client can start decoding.
     let cached_kf = state.keyframe_cache.lock().clone();

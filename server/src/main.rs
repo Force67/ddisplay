@@ -26,6 +26,16 @@ enum EncoderChoice {
     Openh264,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum CodecChoice {
+    /// H.264 / AVC (universal browser support)
+    H264,
+    /// AV1 (~50% better compression, needs modern browser/client)
+    Av1,
+    /// Auto: use AV1 if NVENC supports it, else H.264
+    Auto,
+}
+
 #[derive(Parser)]
 #[command(name = "ddisplay-server", about = "Remote display server with H.264 streaming")]
 struct Args {
@@ -34,7 +44,7 @@ struct Args {
     bind: String,
 
     /// Target frames per second.
-    #[arg(short, long, default_value_t = 30)]
+    #[arg(short, long, default_value_t = 60)]
     fps: u32,
 
     /// Video bitrate in bits per second.
@@ -60,6 +70,10 @@ struct Args {
     /// Video encoder to use. "auto" tries NVENC first, falls back to OpenH264.
     #[arg(long, value_enum, default_value_t = EncoderChoice::Auto)]
     encoder: EncoderChoice,
+
+    /// Video codec. "auto" prefers AV1 when NVENC supports it, else H.264.
+    #[arg(long, value_enum, default_value_t = CodecChoice::Auto)]
+    codec: CodecChoice,
 }
 
 #[tokio::main]
@@ -93,41 +107,64 @@ async fn main() -> anyhow::Result<()> {
     let screen_h = capturer.screen_height();
     tracing::info!("Screen: {}x{}", screen_w, screen_h);
 
-    // --- H.264 encoder ---
-    let encoder: Box<dyn Encoder + Send> = match args.encoder {
-        EncoderChoice::Nvenc => {
-            tracing::info!("Encoder: NVENC (forced)");
-            Box::new(encoder::nvenc_enc::NvencEncoder::new(
-                screen_w, screen_h, args.fps, args.bitrate,
-            )?)
-        }
+    // --- Encoder + codec selection ---
+    let (encoder, codec_name): (Box<dyn Encoder + Send>, &str) = match args.encoder {
         EncoderChoice::Openh264 => {
-            tracing::info!("Encoder: OpenH264 (forced)");
-            Box::new(encoder::openh264_enc::OpenH264Encoder::new(
+            tracing::info!("Encoder: OpenH264 H.264 (forced)");
+            let enc = encoder::openh264_enc::OpenH264Encoder::new(
                 screen_w, screen_h, args.fps, args.bitrate,
-            )?)
+            )?;
+            (Box::new(enc), "h264")
         }
-        EncoderChoice::Auto => {
-            if encoder::nvenc_enc::is_nvenc_available() {
+        _ => {
+            // NVENC path (auto or forced)
+            let (has_h264, has_av1) = encoder::nvenc_enc::probe_codecs();
+            let forced_nvenc = matches!(args.encoder, EncoderChoice::Nvenc);
+
+            // Resolve codec
+            let nvenc_codec = match args.codec {
+                CodecChoice::Av1 if has_av1 => encoder::nvenc_enc::CODEC_AV1,
+                CodecChoice::Av1 => {
+                    if forced_nvenc {
+                        anyhow::bail!("AV1 requested but NVENC does not support it on this GPU");
+                    }
+                    tracing::warn!("AV1 requested but not available, falling back to H.264");
+                    encoder::nvenc_enc::CODEC_H264
+                }
+                CodecChoice::Auto => {
+                    if has_av1 { encoder::nvenc_enc::CODEC_AV1 }
+                    else { encoder::nvenc_enc::CODEC_H264 }
+                }
+                CodecChoice::H264 => encoder::nvenc_enc::CODEC_H264,
+            };
+
+            if has_h264 || has_av1 {
                 match encoder::nvenc_enc::NvencEncoder::new(
-                    screen_w, screen_h, args.fps, args.bitrate,
+                    screen_w, screen_h, args.fps, args.bitrate, nvenc_codec,
                 ) {
                     Ok(enc) => {
-                        tracing::info!("Encoder: NVENC (auto-detected)");
-                        Box::new(enc)
+                        let name = enc.codec_name();
+                        tracing::info!("Encoder: NVENC {} ({})", name,
+                            if forced_nvenc { "forced" } else { "auto-detected" });
+                        (Box::new(enc), if nvenc_codec == encoder::nvenc_enc::CODEC_AV1 { "av1" } else { "h264" })
                     }
-                    Err(e) => {
+                    Err(e) if !forced_nvenc => {
                         tracing::warn!("NVENC init failed, falling back to OpenH264: {}", e);
-                        Box::new(encoder::openh264_enc::OpenH264Encoder::new(
+                        let enc = encoder::openh264_enc::OpenH264Encoder::new(
                             screen_w, screen_h, args.fps, args.bitrate,
-                        )?)
+                        )?;
+                        (Box::new(enc), "h264")
                     }
+                    Err(e) => return Err(e),
                 }
-            } else {
-                tracing::info!("Encoder: OpenH264 (NVENC not available)");
-                Box::new(encoder::openh264_enc::OpenH264Encoder::new(
+            } else if !forced_nvenc {
+                tracing::info!("Encoder: OpenH264 H.264 (NVENC not available)");
+                let enc = encoder::openh264_enc::OpenH264Encoder::new(
                     screen_w, screen_h, args.fps, args.bitrate,
-                )?)
+                )?;
+                (Box::new(enc), "h264")
+            } else {
+                anyhow::bail!("NVENC forced but not available on this system");
             }
         }
     };
@@ -146,7 +183,7 @@ async fn main() -> anyhow::Result<()> {
         height: screen_h,
         fps: args.fps,
         bitrate: args.bitrate,
-        codec: "h264".to_string(),
+        codec: codec_name.to_string(),
     };
     let runtime = ServerRuntimeConfig {
         bind_addr: args.bind.clone(),

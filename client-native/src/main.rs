@@ -60,7 +60,10 @@ struct App {
     args: Args,
     window: Option<Arc<Window>>,
     renderer: Option<renderer::Renderer>,
-    decoder: Option<decoder::VideoDecoder>,
+    /// Sends raw frame bytes to the background decode thread.
+    decode_tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    /// Latest frame decoded by the background thread; render loop takes it each tick.
+    frame_slot: Arc<std::sync::Mutex<Option<decoder::DecodedFrame>>>,
     input_state: Option<input::InputState>,
     transport_rx: Option<tokio::sync::mpsc::UnboundedReceiver<TransportEvent>>,
     rt: tokio::runtime::Handle,
@@ -106,15 +109,7 @@ impl ApplicationHandler for App {
             eprintln!("[init] --force-codec={} (server SessionInfo codec will be IGNORED)", fc);
         }
 
-        // Start with the chosen codec; switch to AV1 when server sends session info
-        let video_decoder = match decoder::VideoDecoder::for_codec(&startup_codec) {
-            Ok(d) => d,
-            Err(e) => {
-                eprintln!("[FATAL] Failed to create {} decoder: {}", startup_codec, e);
-                event_loop.exit();
-                return;
-            }
-        };
+        self.start_decode_thread(&startup_codec);
         self.codec = startup_codec;
 
         eprintln!("[init] Connecting to ws://{}...", self.args.server);
@@ -127,7 +122,6 @@ impl ApplicationHandler for App {
 
         self.window = Some(window);
         self.renderer = Some(renderer);
-        self.decoder = Some(video_decoder);
         self.input_state = Some(input_state);
         self.transport_rx = Some(rx);
 
@@ -178,6 +172,16 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 self.process_transport_events();
+
+                // Upload latest frame decoded by the background thread.
+                if let Some(frame) = self.frame_slot.lock().unwrap().take() {
+                    if let Some(input) = &mut self.input_state {
+                        input.set_remote_size(frame.width, frame.height);
+                    }
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.upload_frame(&frame.rgba, frame.width, frame.height);
+                    }
+                }
 
                 if let Some(renderer) = &self.renderer {
                     if let Err(e) = renderer.render() {
@@ -244,33 +248,21 @@ impl App {
             ServerMessage::VideoFrame(frame) => {
                 self.frame_count += 1;
 
-                // Log every frame for AV1 diagnosis; throttle to every 30 after the first 10.
-                let log_this = self.frame_count <= 10 || self.frame_count % 30 == 0;
-                if log_this {
+                // Log first 5 frames + occasional status; suppress per-frame spam after priming.
+                if self.frame_count <= 5 || self.frame_count % 300 == 0 {
                     eprintln!("[frame #{}] kf={} pts={} data_bytes={} dim={}x{}  codec={}",
                         self.frame_count, frame.keyframe, frame.pts,
                         frame.data.len(), frame.width, frame.height,
                         self.codec);
                 }
 
-                let decoder = match &mut self.decoder {
-                    Some(d) => d,
-                    None => return,
-                };
-
-                match decoder.decode(frame.data) {
-                    Ok(Some(decoded)) => {
-                        if let Some(input) = &mut self.input_state {
-                            input.set_remote_size(decoded.width, decoded.height);
+                // Push raw bytes to the background decode thread (non-blocking).
+                if let Some(tx) = &self.decode_tx {
+                    if tx.try_send(frame.data.to_vec()).is_err() {
+                        // Decode thread is behind — drop this frame.
+                        if self.frame_count <= 10 {
+                            eprintln!("[frame #{}] decode channel full, dropped", self.frame_count);
                         }
-                        if let Some(renderer) = &mut self.renderer {
-                            renderer.upload_frame(&decoded.rgba, decoded.width, decoded.height);
-                        }
-                    }
-                    Ok(None) => {} // decoder buffering
-                    Err(e) => {
-                        eprintln!("[frame #{}] decode error (codec={}): {}",
-                            self.frame_count, self.codec, e);
                     }
                 }
             }
@@ -290,16 +282,8 @@ impl App {
 
                     if !info.codec.is_empty() && info.codec != self.codec {
                         eprintln!("[session] switching decoder: {} → {}", self.codec, info.codec);
-                        match decoder::VideoDecoder::for_codec(&info.codec) {
-                            Ok(dec) => {
-                                self.decoder = Some(dec);
-                                self.codec = info.codec.clone();
-                                eprintln!("[session] decoder ready: {}", self.codec);
-                            }
-                            Err(e) => {
-                                eprintln!("[session] FAILED to create {} decoder: {}", info.codec, e);
-                            }
-                        }
+                        self.start_decode_thread(&info.codec);
+                        self.codec = info.codec.clone();
                     } else {
                         eprintln!("[session] codec unchanged ({})", self.codec);
                     }
@@ -314,6 +298,43 @@ impl App {
                 eprintln!("[proto] unknown message type 0x{:02x}", t);
             }
         }
+    }
+
+    /// Spawn a background decode thread for `codec`, replacing any previous one.
+    /// The old thread exits automatically when its channel sender is dropped.
+    fn start_decode_thread(&mut self, codec: &str) {
+        // Dropping the old sender closes the channel → old thread exits cleanly.
+        self.decode_tx = None;
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
+        self.decode_tx = Some(tx);
+
+        let slot = self.frame_slot.clone();
+        let codec_str = codec.to_string();
+
+        std::thread::Builder::new()
+            .name(format!("decode-{}", codec_str))
+            .spawn(move || {
+                eprintln!("[decode] thread started, codec={}", codec_str);
+                let mut dec = match decoder::VideoDecoder::for_codec(&codec_str) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        eprintln!("[decode] FATAL: {} decoder init failed: {}", codec_str, e);
+                        return;
+                    }
+                };
+                while let Ok(data) = rx.recv() {
+                    match dec.decode(&data) {
+                        Ok(Some(frame)) => {
+                            *slot.lock().unwrap() = Some(frame);
+                        }
+                        Ok(None) => {} // decoder buffering (EAGAIN)
+                        Err(e) => eprintln!("[decode] error: {}", e),
+                    }
+                }
+                eprintln!("[decode] thread exiting");
+            })
+            .expect("failed to spawn decode thread");
     }
 }
 
@@ -342,7 +363,8 @@ fn main() {
         args,
         window: None,
         renderer: None,
-        decoder: None,
+        decode_tx: None,
+        frame_slot: Arc::new(std::sync::Mutex::new(None)),
         input_state: None,
         transport_rx: None,
         rt: rt.handle().clone(),

@@ -18,9 +18,11 @@ winit = "0.30"
 # GPU rendering
 wgpu = "24"
 
-# H.264 decoding — ffmpeg via bindings for DXVA2 hardware decode
-# On Windows this auto-detects DXVA2/D3D11VA for zero-copy decode
+# H.264 decoding (software, cross-platform)
 openh264 = "0.9"
+
+# AV1 decoding via rav1d (pure Rust dav1d port, no nasm asm for cross-compile)
+rav1d = { version = "1", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 
 # Logging
 tracing = "0.1"
@@ -28,6 +30,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Error handling
 anyhow = "1"
+
+# JSON parsing (for session info)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # CLI arguments
 clap = { version = "4", features = ["derive"] }

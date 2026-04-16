@@ -1,8 +1,8 @@
 /**
  * Thin C wrapper around the NVENC API for use from Rust via FFI.
  *
- * Compiled via build.rs using the cc crate. Links dynamically against
- * libcuda.so.1 and libnvidia-encode.so.1 at runtime via dlopen.
+ * Supports both H.264 and AV1 codecs. Compiled via build.rs using the cc crate.
+ * Links dynamically against libcuda.so.1 and libnvidia-encode.so.1 at runtime.
  */
 
 #include <stdio.h>
@@ -25,6 +25,10 @@ typedef CUresult (*PFN_cuCtxDestroy)(CUcontext);
 typedef NVENCSTATUS (NVENCAPI *PFN_NvEncodeAPIGetMaxSupportedVersion)(uint32_t*);
 typedef NVENCSTATUS (NVENCAPI *PFN_NvEncodeAPICreateInstance)(NV_ENCODE_API_FUNCTION_LIST*);
 
+/* ---- Codec identifiers (passed from Rust) ---- */
+#define DDISPLAY_CODEC_H264 0
+#define DDISPLAY_CODEC_AV1  1
+
 /* ---- Encoder context ---- */
 typedef struct {
     void *cuda_lib;
@@ -37,6 +41,7 @@ typedef struct {
     NV_ENC_OUTPUT_PTR output_buf;
     uint32_t width;
     uint32_t height;
+    uint32_t codec;
     uint64_t pts;
 } nvenc_ctx_t;
 
@@ -48,21 +53,14 @@ typedef struct {
     uint64_t pts;
 } nvenc_frame_t;
 
-/* ---- Locked input buffer info passed to Rust ---- */
-typedef struct {
-    uint8_t *ptr;       /* pointer to start of NV12 data */
-    uint32_t pitch;     /* row stride in bytes */
-    uint32_t width;
-    uint32_t height;
-} nvenc_input_lock_t;
-
 /* ---- Public API ---- */
 
-nvenc_ctx_t* nvenc_create(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate) {
+nvenc_ctx_t* nvenc_create(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate, uint32_t codec) {
     nvenc_ctx_t *ctx = calloc(1, sizeof(nvenc_ctx_t));
     if (!ctx) return NULL;
     ctx->width = width;
     ctx->height = height;
+    ctx->codec = codec;
 
     /* Load libraries */
     ctx->cuda_lib = dlopen("libcuda.so.1", RTLD_LAZY);
@@ -103,12 +101,15 @@ nvenc_ctx_t* nvenc_create(uint32_t width, uint32_t height, uint32_t fps, uint32_
     openParams.apiVersion = NVENCAPI_VERSION;
     if (ctx->funcs.nvEncOpenEncodeSessionEx(&openParams, &ctx->encoder) != NV_ENC_SUCCESS) goto fail_cuda;
 
+    /* Select codec GUID */
+    GUID codec_guid = (codec == DDISPLAY_CODEC_AV1) ? NV_ENC_CODEC_AV1_GUID : NV_ENC_CODEC_H264_GUID;
+
     /* Get preset config */
     NV_ENC_PRESET_CONFIG presetConfig = {0};
     presetConfig.version = NV_ENC_PRESET_CONFIG_VER;
     presetConfig.presetCfg.version = NV_ENC_CONFIG_VER;
     if (ctx->funcs.nvEncGetEncodePresetConfigEx(ctx->encoder,
-            NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P1_GUID,
+            codec_guid, NV_ENC_PRESET_P1_GUID,
             NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY, &presetConfig) != NV_ENC_SUCCESS)
         goto fail_session;
 
@@ -120,15 +121,22 @@ nvenc_ctx_t* nvenc_create(uint32_t width, uint32_t height, uint32_t fps, uint32_
     cfg->rcParams.averageBitRate = bitrate;
     cfg->rcParams.maxBitRate = bitrate;
     cfg->rcParams.zeroReorderDelay = 1;
-    cfg->encodeCodecConfig.h264Config.idrPeriod = NVENC_INFINITE_GOPLENGTH;
-    cfg->encodeCodecConfig.h264Config.repeatSPSPPS = 1;
-    cfg->encodeCodecConfig.h264Config.sliceMode = 0;
-    cfg->encodeCodecConfig.h264Config.sliceModeData = 0;
+
+    if (codec == DDISPLAY_CODEC_AV1) {
+        cfg->encodeCodecConfig.av1Config.idrPeriod = NVENC_INFINITE_GOPLENGTH;
+        cfg->encodeCodecConfig.av1Config.repeatSeqHdr = 1;
+        cfg->encodeCodecConfig.av1Config.chromaFormatIDC = 1; /* YUV420 */
+    } else {
+        cfg->encodeCodecConfig.h264Config.idrPeriod = NVENC_INFINITE_GOPLENGTH;
+        cfg->encodeCodecConfig.h264Config.repeatSPSPPS = 1;
+        cfg->encodeCodecConfig.h264Config.sliceMode = 0;
+        cfg->encodeCodecConfig.h264Config.sliceModeData = 0;
+    }
 
     /* Initialize encoder */
     NV_ENC_INITIALIZE_PARAMS initParams = {0};
     initParams.version = NV_ENC_INITIALIZE_PARAMS_VER;
-    initParams.encodeGUID = NV_ENC_CODEC_H264_GUID;
+    initParams.encodeGUID = codec_guid;
     initParams.presetGUID = NV_ENC_PRESET_P1_GUID;
     initParams.encodeWidth = width;
     initParams.encodeHeight = height;
@@ -262,68 +270,22 @@ void nvenc_destroy(nvenc_ctx_t *ctx) {
     free(ctx);
 }
 
-/* Lock the NVENC input buffer so Rust can write NV12 directly into it. */
-int nvenc_lock_input(nvenc_ctx_t *ctx, nvenc_input_lock_t *out) {
-    if (!ctx || !out) return -1;
+/* Probe: returns bitmask of supported codecs. bit 0 = H.264, bit 1 = AV1 */
+int nvenc_probe_codecs(void) {
+    int result = 0;
 
-    NV_ENC_LOCK_INPUT_BUFFER lockIn = {0};
-    lockIn.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
-    lockIn.inputBuffer = ctx->input_buf;
-    if (ctx->funcs.nvEncLockInputBuffer(ctx->encoder, &lockIn) != NV_ENC_SUCCESS)
-        return -2;
+    /* Try H.264 */
+    nvenc_ctx_t *ctx = nvenc_create(256, 256, 30, 2000000, DDISPLAY_CODEC_H264);
+    if (ctx) { result |= 1; nvenc_destroy(ctx); }
 
-    out->ptr = (uint8_t*)lockIn.bufferDataPtr;
-    out->pitch = lockIn.pitch;
-    out->width = ctx->width;
-    out->height = ctx->height;
-    return 0;
+    /* Try AV1 */
+    ctx = nvenc_create(256, 256, 30, 2000000, DDISPLAY_CODEC_AV1);
+    if (ctx) { result |= 2; nvenc_destroy(ctx); }
+
+    return result;
 }
 
-/* Unlock the input buffer, encode the frame, and return the bitstream. */
-int nvenc_encode_locked(nvenc_ctx_t *ctx, int force_keyframe, nvenc_frame_t *out) {
-    if (!ctx || !out) return -1;
-
-    /* Unlock input first */
-    ctx->funcs.nvEncUnlockInputBuffer(ctx->encoder, ctx->input_buf);
-
-    /* Encode */
-    NV_ENC_PIC_PARAMS picParams = {0};
-    picParams.version = NV_ENC_PIC_PARAMS_VER;
-    picParams.inputWidth = ctx->width;
-    picParams.inputHeight = ctx->height;
-    /* pitch is cached internally by NVENC from the last lock */
-    picParams.inputPitch = 0; /* NVENC uses the pitch from the buffer */
-    picParams.inputBuffer = ctx->input_buf;
-    picParams.outputBitstream = ctx->output_buf;
-    picParams.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
-    picParams.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
-    picParams.inputTimeStamp = ctx->pts;
-    if (force_keyframe)
-        picParams.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
-
-    if (ctx->funcs.nvEncEncodePicture(ctx->encoder, &picParams) != NV_ENC_SUCCESS)
-        return -3;
-
-    /* Lock bitstream */
-    NV_ENC_LOCK_BITSTREAM lockBs = {0};
-    lockBs.version = NV_ENC_LOCK_BITSTREAM_VER;
-    lockBs.outputBitstream = ctx->output_buf;
-    if (ctx->funcs.nvEncLockBitstream(ctx->encoder, &lockBs) != NV_ENC_SUCCESS)
-        return -4;
-
-    out->data = (const uint8_t*)lockBs.bitstreamBufferPtr;
-    out->size = lockBs.bitstreamSizeInBytes;
-    out->is_keyframe = (lockBs.pictureType == NV_ENC_PIC_TYPE_IDR ||
-                        lockBs.pictureType == NV_ENC_PIC_TYPE_I);
-    out->pts = ctx->pts;
-    ctx->pts++;
-    return 0;
-}
-
-/* Probe: returns 1 if NVENC H.264 encoding is functional */
+/* Legacy probe for backward compat */
 int nvenc_probe(void) {
-    nvenc_ctx_t *ctx = nvenc_create(256, 256, 30, 2000000);
-    if (!ctx) return 0;
-    nvenc_destroy(ctx);
-    return 1;
+    return nvenc_probe_codecs() != 0;
 }

@@ -1,5 +1,5 @@
 import { Transport } from './transport.js';
-import { H264Decoder } from './decoder.js';
+import { H264Decoder, AV1Decoder, isAV1Supported } from './decoder.js';
 import { Renderer } from './renderer.js';
 import { InputHandler } from './input.js';
 
@@ -53,7 +53,8 @@ let serverStatus = null;
 let sidebarCollapsed = false;
 
 const transport = new Transport();
-const decoder = new H264Decoder(videoEl, 30);
+let decoder = new H264Decoder(videoEl, 30);
+let serverCodec = 'h264';
 const renderer = new Renderer(canvas);
 const input = new InputHandler(canvas);
 
@@ -119,11 +120,36 @@ function handleCursorUpdate(view) {
     renderer.setCursor(x, y, visible);
 }
 
-function handleSessionInfo(data) {
+async function handleSessionInfo(data) {
     const jsonBytes = new Uint8Array(data, 1);
     const text = new TextDecoder().decode(jsonBytes);
     try {
-        console.log('[session]', JSON.parse(text));
+        const info = JSON.parse(text);
+        console.log('[session]', info);
+
+        // Switch decoder if codec changed
+        if (info.codec && info.codec !== serverCodec) {
+            serverCodec = info.codec;
+            decoder.destroy();
+
+            if (info.codec === 'av1' && await isAV1Supported()) {
+                console.log('[session] Switching to AV1 WebCodecs decoder');
+                decoder = new AV1Decoder(videoEl, info.fps || 30);
+            } else {
+                if (info.codec === 'av1') {
+                    console.warn('[session] Server uses AV1 but browser lacks WebCodecs support, falling back to H.264');
+                }
+                console.log('[session] Using H.264 jMuxer decoder');
+                decoder = new H264Decoder(videoEl, info.fps || 30);
+            }
+
+            decoder.onFrame = (video) => {
+                renderer.drawVideoFrame(video);
+                if (renderer.remoteWidth > 0 && renderer.remoteHeight > 0) {
+                    input.setRemoteSize(renderer.remoteWidth, renderer.remoteHeight);
+                }
+            };
+        }
     } catch (e) {
         console.warn('[session] invalid JSON:', e);
     }

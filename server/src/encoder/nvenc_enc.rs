@@ -1,4 +1,4 @@
-//! NVENC hardware H.264 encoder using a C wrapper for correct struct layouts.
+//! NVENC hardware H.264/AV1 encoder using a C wrapper for correct struct layouts.
 
 use anyhow::{bail, Result};
 use std::ffi::c_void;
@@ -6,6 +6,9 @@ use std::ptr;
 
 use super::color;
 use super::{EncodedPacket, Encoder as EncoderTrait};
+
+pub const CODEC_H264: u32 = 0;
+pub const CODEC_AV1: u32 = 1;
 
 #[repr(C)]
 struct NvencFrame {
@@ -16,8 +19,8 @@ struct NvencFrame {
 }
 
 unsafe extern "C" {
-    fn nvenc_probe() -> i32;
-    fn nvenc_create(width: u32, height: u32, fps: u32, bitrate: u32) -> *mut c_void;
+    fn nvenc_probe_codecs() -> i32;
+    fn nvenc_create(width: u32, height: u32, fps: u32, bitrate: u32, codec: u32) -> *mut c_void;
     fn nvenc_encode(
         ctx: *mut c_void,
         nv12_data: *const u8,
@@ -28,24 +31,33 @@ unsafe extern "C" {
     fn nvenc_destroy(ctx: *mut c_void);
 }
 
-/// Check whether NVENC hardware encoding is available on this system.
-pub fn is_nvenc_available() -> bool {
-    let ok = unsafe { nvenc_probe() };
-    if ok != 0 {
-        tracing::info!("NVENC probe: hardware encoding available");
+/// Probe which codecs NVENC supports. Returns (h264, av1).
+pub fn probe_codecs() -> (bool, bool) {
+    let bits = unsafe { nvenc_probe_codecs() };
+    let h264 = bits & 1 != 0;
+    let av1 = bits & 2 != 0;
+    if h264 || av1 {
+        tracing::info!(
+            "NVENC probe: H.264={}, AV1={}",
+            if h264 { "yes" } else { "no" },
+            if av1 { "yes" } else { "no" },
+        );
     } else {
-        tracing::debug!("NVENC probe: not available on this system");
+        tracing::debug!("NVENC probe: not available");
     }
-    ok != 0
+    (h264, av1)
+}
+
+pub fn is_nvenc_available() -> bool {
+    let (h264, av1) = probe_codecs();
+    h264 || av1
 }
 
 pub struct NvencEncoder {
     ctx: *mut c_void,
     width: u32,
     height: u32,
-    /// NV12 buffer: [Y plane | UV plane]. Color conversion writes here
-    /// (cache-friendly heap memory), then the C wrapper does a fast memcpy
-    /// into NVENC's locked buffer.
+    codec: u32,
     nv12_buf: Vec<u8>,
     y_len: usize,
 }
@@ -53,10 +65,12 @@ pub struct NvencEncoder {
 unsafe impl Send for NvencEncoder {}
 
 impl NvencEncoder {
-    pub fn new(width: u32, height: u32, fps: u32, bitrate: u32) -> Result<Self> {
-        let ctx = unsafe { nvenc_create(width, height, fps, bitrate) };
+    pub fn new(width: u32, height: u32, fps: u32, bitrate: u32, codec: u32) -> Result<Self> {
+        let codec_name = if codec == CODEC_AV1 { "AV1" } else { "H.264" };
+
+        let ctx = unsafe { nvenc_create(width, height, fps, bitrate, codec) };
         if ctx.is_null() {
-            bail!("NVENC encoder creation failed (nvenc_create returned NULL)");
+            bail!("NVENC {} encoder creation failed", codec_name);
         }
 
         let y_len = (width as usize) * (height as usize);
@@ -64,17 +78,15 @@ impl NvencEncoder {
         let nv12_buf = vec![0u8; y_len + uv_len];
 
         tracing::info!(
-            "NVENC encoder initialized: {}x{} @ {} fps, {} bps (H.264 P1 ultra-low-latency)",
-            width, height, fps, bitrate,
+            "NVENC encoder initialized: {}x{} @ {} fps, {} bps ({} P1 ultra-low-latency)",
+            width, height, fps, bitrate, codec_name,
         );
 
-        Ok(Self {
-            ctx,
-            width,
-            height,
-            nv12_buf,
-            y_len,
-        })
+        Ok(Self { ctx, width, height, codec, nv12_buf, y_len })
+    }
+
+    pub fn codec_name(&self) -> &'static str {
+        if self.codec == CODEC_AV1 { "av1" } else { "h264" }
     }
 }
 
@@ -97,11 +109,9 @@ impl EncoderTrait for NvencEncoder {
         let w = width as usize;
         let h = height as usize;
 
-        // Convert BGRA → NV12 into cache-friendly heap buffer
         let (y_plane, uv_plane) = self.nv12_buf.split_at_mut(self.y_len);
         color::bgra_to_nv12_pitched(frame_data, w, h, stride as usize, w, y_plane, uv_plane);
 
-        // Pass to C wrapper which does a fast sequential memcpy into NVENC's buffer
         let mut frame = NvencFrame {
             data: ptr::null(),
             size: 0,
@@ -110,12 +120,7 @@ impl EncoderTrait for NvencEncoder {
         };
 
         let rc = unsafe {
-            nvenc_encode(
-                self.ctx,
-                self.nv12_buf.as_ptr(),
-                force_keyframe as i32,
-                &mut frame,
-            )
+            nvenc_encode(self.ctx, self.nv12_buf.as_ptr(), force_keyframe as i32, &mut frame)
         };
 
         if rc != 0 {
@@ -128,11 +133,7 @@ impl EncoderTrait for NvencEncoder {
 
         unsafe { nvenc_unlock_bitstream(self.ctx) };
 
-        Ok(EncodedPacket {
-            data,
-            keyframe,
-            pts,
-        })
+        Ok(EncodedPacket { data, keyframe, pts })
     }
 
     fn flush(&mut self) -> Result<Vec<EncodedPacket>> {

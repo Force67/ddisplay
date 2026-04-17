@@ -94,7 +94,25 @@ async fn connect_once(
 
     loop {
         tokio::select! {
-            // Incoming from server
+            // biased: outgoing sends are checked first every iteration.
+            // Without this, 60fps incoming video can starve mouse/keyboard
+            // sends by winning the random poll, adding visible click latency.
+            biased;
+
+            // Outgoing to server (mouse / keyboard — latency-sensitive)
+            data = send_rx.recv() => {
+                match data {
+                    Some(buf) => {
+                        ws_sink.send(Message::Binary(buf.into())).await?;
+                    }
+                    None => {
+                        // Sender dropped, shutdown
+                        return Ok(());
+                    }
+                }
+            }
+
+            // Incoming from server (video frames)
             msg = ws_stream_rx.next() => {
                 match msg {
                     Some(Ok(Message::Binary(data))) => {
@@ -107,18 +125,6 @@ async fn connect_once(
                         return Err(e.into());
                     }
                     _ => {} // ignore text, ping, pong
-                }
-            }
-            // Outgoing to server
-            data = send_rx.recv() => {
-                match data {
-                    Some(buf) => {
-                        ws_sink.send(Message::Binary(buf.into())).await?;
-                    }
-                    None => {
-                        // Sender dropped, shutdown
-                        return Ok(());
-                    }
                 }
             }
         }

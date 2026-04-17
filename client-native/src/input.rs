@@ -76,9 +76,12 @@ impl InputState {
         }
 
         let (dx, dy) = match delta {
-            MouseScrollDelta::LineDelta(x, y) => (x as i16, y as i16),
+            // winit: +y = scroll up (wheel away from user).
+            // Server X11 convention: dy < 0 → button 4 (up), dy > 0 → button 5 (down).
+            // Negate y to match.
+            MouseScrollDelta::LineDelta(x, y) => (x as i16, -(y as i16)),
             MouseScrollDelta::PixelDelta(pos) => {
-                ((pos.x / 48.0) as i16, (pos.y / 48.0) as i16)
+                ((pos.x / 48.0) as i16, -(pos.y / 48.0) as i16)
             }
         };
 
@@ -110,10 +113,21 @@ impl InputState {
     }
 
     fn scale_coords(&self, x: f64, y: f64) -> (u16, u16) {
-        let sx = x / self.window_width as f64;
-        let sy = y / self.window_height as f64;
-        let rx = (sx * self.remote_width as f64).clamp(0.0, (self.remote_width - 1) as f64) as u16;
-        let ry = (sy * self.remote_height as f64).clamp(0.0, (self.remote_height - 1) as f64) as u16;
+        let ww = self.window_width as f64;
+        let wh = self.window_height as f64;
+        let rw = self.remote_width as f64;
+        let rh = self.remote_height as f64;
+
+        // Mirror the letterbox math in renderer.rs:
+        //   scale = min(ww/rw, wh/rh)
+        //   rendered area = rw*scale × rh*scale, centred in the window
+        // Clicks inside the black bars clamp to the nearest edge.
+        let scale = (ww / rw).min(wh / rh);
+        let offset_x = (ww - rw * scale) * 0.5;
+        let offset_y = (wh - rh * scale) * 0.5;
+
+        let rx = ((x - offset_x) / scale).clamp(0.0, rw - 1.0) as u16;
+        let ry = ((y - offset_y) / scale).clamp(0.0, rh - 1.0) as u16;
         (rx, ry)
     }
 }

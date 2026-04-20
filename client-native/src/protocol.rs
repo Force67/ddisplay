@@ -5,6 +5,7 @@
 /// Server -> Client:
 ///   0x01 VideoFrame: [keyframe: u8] [pts: u64 LE] [width: u16 LE] [height: u16 LE] [data...]
 ///   0x02 CursorUpdate: [x: u16 LE] [y: u16 LE] [visible: u8]
+///   0x20 ClipboardData: [utf8 text...]   (bidirectional)
 ///
 /// Client -> Server:
 ///   0x10 MouseMove: [x: u16 LE] [y: u16 LE]
@@ -16,6 +17,7 @@
 ///   0x16 ReleaseKeys
 ///   0x17 ReleaseMouse
 ///   0x18 ReleaseAll
+///   0x20 ClipboardData: [utf8 text...]   (bidirectional)
 
 // Server message types
 pub const MSG_VIDEO_FRAME: u8 = 0x01;
@@ -31,6 +33,7 @@ pub const MSG_PASTE_TEXT: u8 = 0x15;
 pub const MSG_RELEASE_KEYS: u8 = 0x16;
 pub const MSG_RELEASE_MOUSE: u8 = 0x17;
 pub const MSG_RELEASE_ALL: u8 = 0x18;
+pub const MSG_CLIPBOARD_DATA: u8 = 0x20;
 
 /// Parsed video frame from the server.
 pub struct VideoFrame<'a> {
@@ -55,6 +58,7 @@ pub enum ServerMessage<'a> {
     VideoFrame(VideoFrame<'a>),
     CursorUpdate(CursorUpdate),
     SessionInfo(&'a [u8]),
+    ClipboardData(String),
     Unknown(u8),
 }
 
@@ -84,6 +88,10 @@ pub fn parse_server_message(data: &[u8]) -> Option<ServerMessage<'_>> {
         }
         MSG_SESSION_INFO if data.len() >= 2 => {
             Some(ServerMessage::SessionInfo(&data[1..]))
+        }
+        MSG_CLIPBOARD_DATA => {
+            let text = String::from_utf8_lossy(data.get(1..).unwrap_or_default()).into_owned();
+            Some(ServerMessage::ClipboardData(text))
         }
         other => Some(ServerMessage::Unknown(other)),
     }
@@ -140,4 +148,11 @@ pub fn encode_paste_text(text: &str) -> Vec<u8> {
 
 pub fn encode_release_all() -> Vec<u8> {
     vec![MSG_RELEASE_ALL]
+}
+
+pub fn encode_clipboard_data(text: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + text.len());
+    buf.push(MSG_CLIPBOARD_DATA);
+    buf.extend_from_slice(text.as_bytes());
+    buf
 }

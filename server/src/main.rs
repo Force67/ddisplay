@@ -9,6 +9,8 @@ mod capture;
 mod encoder;
 mod transport;
 mod input;
+mod clipboard;
+mod files;
 
 use capture::x11::X11Capturer;
 use encoder::Encoder;
@@ -74,6 +76,11 @@ struct Args {
     /// Video codec. "auto" prefers AV1 when NVENC supports it, else H.264.
     #[arg(long, value_enum, default_value_t = CodecChoice::Auto)]
     codec: CodecChoice,
+
+    /// Directory to share over HTTP for easy file transfer.
+    /// If omitted, the /files endpoint is not served.
+    #[arg(long)]
+    shared_dir: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -175,6 +182,13 @@ async fn main() -> anyhow::Result<()> {
 
     // --- WebSocket transport ---
     let client_dir = PathBuf::from(&args.client_dir);
+    let shared_dir = if let Some(ref dir) = args.shared_dir {
+        std::fs::create_dir_all(dir)?;
+        tracing::info!("Shared folder: {}", dir.display());
+        Some(dir.clone())
+    } else {
+        None
+    };
     let metadata = ServerMetadata {
         session_name: args.session_name.clone(),
         display: std::env::var("DISPLAY").unwrap_or_else(|_| "<unset>".to_string()),
@@ -195,7 +209,7 @@ async fn main() -> anyhow::Result<()> {
         bitrate: args.bitrate,
     };
     let (frame_tx, input_rx, keyframe_cache) =
-        transport::websocket::start_server(args.bind.clone(), client_dir, metadata, runtime).await?;
+        transport::websocket::start_server(args.bind.clone(), client_dir, metadata, runtime, shared_dir).await?;
 
     tracing::info!("Listening on http://{}", args.bind);
 

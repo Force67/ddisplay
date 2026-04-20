@@ -7,6 +7,7 @@
 ///   0x01 VideoFrame: [keyframe: u8] [pts: u64 LE] [width: u16 LE] [height: u16 LE] [data...]
 ///   0x02 CursorUpdate: [x: u16 LE] [y: u16 LE] [visible: u8]
 ///   0x03 SessionInfo: JSON payload
+///   0x20 ClipboardData: [utf8 text...]   (bidirectional)
 ///
 /// Client -> Server:
 ///   0x10 MouseMove: [x: u16 LE] [y: u16 LE]
@@ -18,6 +19,7 @@
 ///   0x16 ReleaseKeys: (no payload)
 ///   0x17 ReleaseMouse: (no payload)
 ///   0x18 ReleaseAll: (no payload)
+///   0x20 ClipboardData: [utf8 text...]   (bidirectional)
 
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +37,14 @@ pub const MSG_PASTE_TEXT: u8 = 0x15;
 pub const MSG_RELEASE_KEYS: u8 = 0x16;
 pub const MSG_RELEASE_MOUSE: u8 = 0x17;
 pub const MSG_RELEASE_ALL: u8 = 0x18;
+pub const MSG_CLIPBOARD_DATA: u8 = 0x20;
+
+pub fn encode_clipboard_data(text: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + text.len());
+    buf.push(MSG_CLIPBOARD_DATA);
+    buf.extend_from_slice(text.as_bytes());
+    buf
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
@@ -93,6 +103,7 @@ pub enum ClientEvent {
     ReleaseKeys,
     ReleaseMouse,
     ReleaseAll,
+    ClipboardData { text: String },
 }
 
 /// Parse a binary message from the client.
@@ -133,6 +144,10 @@ pub fn parse_client_message(data: &[u8]) -> Option<ClientEvent> {
         MSG_RELEASE_KEYS => Some(ClientEvent::ReleaseKeys),
         MSG_RELEASE_MOUSE => Some(ClientEvent::ReleaseMouse),
         MSG_RELEASE_ALL => Some(ClientEvent::ReleaseAll),
+        MSG_CLIPBOARD_DATA => {
+            let text = String::from_utf8_lossy(data.get(1..).unwrap_or_default()).into_owned();
+            Some(ClientEvent::ClipboardData { text })
+        }
         _ => None,
     }
 }

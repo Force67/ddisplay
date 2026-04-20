@@ -129,6 +129,10 @@ impl X11InputInjector {
                 self.release_stuck_inputs()?;
                 return Ok(());
             }
+            ClientEvent::ClipboardData { .. } => {
+                // Handled by the WebSocket layer; never forwarded to the input injector.
+                return Ok(());
+            }
         }
         self.conn.flush()?;
         Ok(())

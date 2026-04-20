@@ -46,3 +46,11 @@ pollster = "0.4"
 
 # Safe casting for uniform buffer uploads
 bytemuck = { version = "1", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+] }

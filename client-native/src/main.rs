@@ -21,6 +21,7 @@ mod transport;
 mod decoder;
 mod renderer;
 mod input;
+mod clipboard;
 
 use protocol::ServerMessage;
 use transport::TransportEvent;
@@ -70,6 +71,8 @@ struct App {
     codec: String,
     /// Frame counter for log throttling (total VideoFrame messages received).
     frame_count: u64,
+    /// Tracks last clipboard text set from server (echo prevention for poll thread).
+    clipboard_last_set: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl ApplicationHandler for App {
@@ -117,6 +120,9 @@ impl ApplicationHandler for App {
         // Start transport on the tokio runtime
         let ws_url = format!("ws://{}/ws", self.args.server);
         let (sender, rx) = self.rt.block_on(async { transport::spawn(ws_url) });
+
+        let clipboard_last_set = clipboard::spawn_monitor(sender.clone());
+        self.clipboard_last_set = clipboard_last_set;
 
         let input_state = input::InputState::new(sender);
 
@@ -294,6 +300,9 @@ impl App {
             ServerMessage::CursorUpdate(_cursor) => {
                 // TODO: render remote cursor overlay
             }
+            ServerMessage::ClipboardData(text) => {
+                clipboard::set_clipboard(&text, &self.clipboard_last_set);
+            }
             ServerMessage::Unknown(t) => {
                 eprintln!("[proto] unknown message type 0x{:02x}", t);
             }
@@ -370,6 +379,7 @@ fn main() {
         rt: rt.handle().clone(),
         codec: "h264".to_string(),
         frame_count: 0,
+        clipboard_last_set: Arc::new(std::sync::Mutex::new(None)),
     };
 
     if let Err(e) = event_loop.run_app(&mut app) {

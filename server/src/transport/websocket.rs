@@ -29,13 +29,15 @@ pub type InputReceiver = mpsc::Receiver<protocol::ClientEvent>;
 /// Shared cache for the latest keyframe.
 pub type KeyframeCache = Arc<Mutex<Option<Vec<u8>>>>;
 
-struct AppState {
-    frame_tx: FrameSender,
+pub struct AppState {
+    pub frame_tx: FrameSender,
     input_tx: mpsc::Sender<ClientEvent>,
     keyframe_cache: KeyframeCache,
     metadata: ServerMetadata,
     status: Mutex<ServerStatusState>,
     runtime: ServerRuntimeConfig,
+    clipboard_set_tx: Option<std::sync::mpsc::SyncSender<String>>,
+    pub shared_dir: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -125,10 +127,23 @@ pub async fn start_server(
     client_dir: PathBuf,
     metadata: ServerMetadata,
     runtime: ServerRuntimeConfig,
+    shared_dir: Option<PathBuf>,
 ) -> anyhow::Result<(FrameSender, InputReceiver, KeyframeCache)> {
     let (frame_tx, _) = broadcast::channel::<Vec<u8>>(2);
     let (input_tx, input_rx) = mpsc::channel::<ClientEvent>(1024);
     let keyframe_cache: KeyframeCache = Arc::new(Mutex::new(None));
+
+    // Start clipboard monitor (best-effort; server still runs if it fails).
+    let clipboard_set_tx = match crate::clipboard::start(frame_tx.clone()) {
+        Ok(tx) => {
+            tracing::info!("[clipboard] monitor started");
+            Some(tx)
+        }
+        Err(e) => {
+            tracing::warn!("[clipboard] failed to start monitor: {}", e);
+            None
+        }
+    };
 
     let state = Arc::new(AppState {
         frame_tx: frame_tx.clone(),
@@ -137,14 +152,26 @@ pub async fn start_server(
         metadata,
         status: Mutex::new(ServerStatusState::default()),
         runtime,
+        clipboard_set_tx,
+        shared_dir: shared_dir.clone(),
     });
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/ws", get(ws_upgrade_handler))
         .route("/api/status", get(status_handler))
         .route("/api/clipboard/{selection}", get(clipboard_handler))
         .route("/api/control/restart", post(restart_handler))
-        .route("/health", get(health_handler))
+        .route("/health", get(health_handler));
+
+    if shared_dir.is_some() {
+        app = app
+            .route("/files", get(crate::files::list_handler))
+            .route("/files/", get(crate::files::list_handler))
+            .route("/files/{name}", get(crate::files::download_handler))
+            .route("/files/upload", post(crate::files::upload_handler));
+    }
+
+    let app = app
         .with_state(state)
         .fallback_service(ServeDir::new(client_dir));
 
@@ -204,6 +231,7 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
     let input_tx = state.input_tx.clone();
     let recv_input_tx = input_tx.clone();
     let recv_input_state = input_state.clone();
+    let clipboard_set_tx = state.clipboard_set_tx.clone();
 
     // Task: broadcast frames -> this WebSocket client
     let mut send_task = tokio::spawn(async move {
@@ -236,6 +264,13 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
                         continue;
                     }
                     if let Some(event) = protocol::parse_client_message(&data) {
+                        // Clipboard data is handled locally; never forwarded to the input injector.
+                        if let ClientEvent::ClipboardData { text } = event {
+                            if let Some(ref tx) = clipboard_set_tx {
+                                let _ = tx.try_send(text);
+                            }
+                            continue;
+                        }
                         let forwarded_events = normalize_input_events(&recv_input_state, event);
                         for forwarded_event in forwarded_events {
                             tracing::debug!("Input event: {:?}", forwarded_event);
@@ -464,6 +499,10 @@ fn normalize_input_events(
             state.pressed_keys.clear();
             state.pressed_buttons.clear();
             vec![ClientEvent::ReleaseAll]
+        }
+        ClientEvent::ClipboardData { .. } => {
+            // Intercepted in the recv_task before reaching normalization.
+            vec![]
         }
     }
 }

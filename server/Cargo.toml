@@ -8,8 +8,9 @@ edition = "2024"
 tokio = { version = "1", features = ["full"] }
 
 # Web server + WebSocket
-axum = { version = "0.8", features = ["ws"] }
+axum = { version = "0.8", features = ["ws", "multipart"] }
 tower-http = { version = "0.6", features = ["cors", "fs"] }
+tokio-util = { version = "0.7", features = ["io"] }
 
 # X11 screen capture and input (pure Rust)
 x11rb = { version = "0.13", default-features = false, features = ["allow-unsafe-code", "composite", "shm", "xfixes", "xtest", "randr", "damage"] }

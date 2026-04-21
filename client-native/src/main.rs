@@ -189,7 +189,7 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                if let Some(renderer) = &self.renderer {
+                if let Some(renderer) = &mut self.renderer {
                     if let Err(e) = renderer.render() {
                         tracing::warn!("Render error: {}", e);
                     }

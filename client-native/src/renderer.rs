@@ -285,14 +285,23 @@ impl Renderer {
     }
 
     /// Render the current frame to the window.
-    pub fn render(&self) -> Result<()> {
+    pub fn render(&mut self) -> Result<()> {
         let bind_group = match &self.current_bind_group {
             Some(bg) => bg,
             None => return Ok(()),
         };
 
-        let output = self.surface.get_current_texture()
-            .context("Failed to get surface texture")?;
+        let output = match self.surface.get_current_texture() {
+            Ok(o) => o,
+            // Transient timeout — just skip this frame silently.
+            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
+            // Surface lost or outdated (minimize, resize race, etc.) — reconfigure and skip.
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                self.surface.configure(&self.device, &self.surface_config);
+                return Ok(());
+            }
+            Err(e) => return Err(anyhow::anyhow!("Surface error: {}", e)),
+        };
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {

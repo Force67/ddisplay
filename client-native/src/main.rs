@@ -73,6 +73,8 @@ struct App {
     frame_count: u64,
     /// Tracks last clipboard text set from server (echo prevention for poll thread).
     clipboard_last_set: Arc<std::sync::Mutex<Option<String>>>,
+    /// False when window is minimized or fully occluded — skip decode and render.
+    window_visible: bool,
 }
 
 impl ApplicationHandler for App {
@@ -176,8 +178,15 @@ impl ApplicationHandler for App {
                     input.release_all();
                 }
             }
+            WindowEvent::Occluded(occluded) => {
+                self.window_visible = !occluded;
+            }
             WindowEvent::RedrawRequested => {
                 self.process_transport_events();
+
+                if !self.window_visible {
+                    return;
+                }
 
                 // Upload latest frame decoded by the background thread.
                 if let Some(frame) = self.frame_slot.lock().unwrap().take() {
@@ -200,9 +209,11 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Request continuous redraws for low-latency frame display
-        if let Some(window) = &self.window {
-            window.request_redraw();
+        // Only request redraws when the window is actually visible.
+        if self.window_visible {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
         }
     }
 
@@ -263,11 +274,14 @@ impl App {
                 }
 
                 // Push raw bytes to the background decode thread (non-blocking).
-                if let Some(tx) = &self.decode_tx {
-                    if tx.try_send(frame.data.to_vec()).is_err() {
-                        // Decode thread is behind — drop this frame.
-                        if self.frame_count <= 10 {
-                            eprintln!("[frame #{}] decode channel full, dropped", self.frame_count);
+                // Skip when the window is hidden — no point decoding frames nobody sees.
+                if self.window_visible {
+                    if let Some(tx) = &self.decode_tx {
+                        if tx.try_send(frame.data.to_vec()).is_err() {
+                            // Decode thread is behind — drop this frame.
+                            if self.frame_count <= 10 {
+                                eprintln!("[frame #{}] decode channel full, dropped", self.frame_count);
+                            }
                         }
                     }
                 }
@@ -380,6 +394,7 @@ fn main() {
         codec: "h264".to_string(),
         frame_count: 0,
         clipboard_last_set: Arc::new(std::sync::Mutex::new(None)),
+        window_visible: true,
     };
 
     if let Err(e) = event_loop.run_app(&mut app) {

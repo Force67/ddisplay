@@ -6,6 +6,8 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
+use crate::overlay::DisplayMode;
+
 pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -14,22 +16,23 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    // Persistent frame texture (reused across frames, only recreated on resolution change)
     frame_texture: Option<wgpu::Texture>,
     current_bind_group: Option<wgpu::BindGroup>,
     texture_size: (u32, u32),
-    // Aspect ratio uniform
     scale_buffer: wgpu::Buffer,
     scale_bind_group: wgpu::BindGroup,
     window_size: (u32, u32),
     remote_size: (u32, u32),
+    display_mode: DisplayMode,
+    egui_renderer: egui_wgpu::Renderer,
+    surface_format: wgpu::TextureFormat,
 }
 
 impl Renderer {
     pub async fn new(window: Arc<winit::window::Window>) -> Result<Self> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
         let surface = instance.create_surface(window.clone())
@@ -51,7 +54,7 @@ impl Renderer {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("ddisplay"),
                 ..Default::default()
-            }, None)
+            })
             .await
             .context("Failed to create wgpu device")?;
 
@@ -131,8 +134,8 @@ impl Renderer {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pipeline_layout"),
-            bind_group_layouts: &[&bind_group_layout, &scale_bg_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout), Some(&scale_bg_layout)],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -160,7 +163,7 @@ impl Renderer {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -192,6 +195,12 @@ impl Renderer {
 
         let ws = (size.width.max(1), size.height.max(1));
 
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            surface_format,
+            egui_wgpu::RendererOptions::default(),
+        );
+
         Ok(Self {
             device,
             queue,
@@ -207,6 +216,9 @@ impl Renderer {
             scale_bind_group,
             window_size: ws,
             remote_size: (0, 0),
+            display_mode: DisplayMode::default(),
+            egui_renderer,
+            surface_format,
         })
     }
 
@@ -284,23 +296,31 @@ impl Renderer {
         }
     }
 
-    /// Render the current frame to the window.
-    pub fn render(&mut self) -> Result<()> {
+    /// Set the display mode (Letterbox or Stretch).
+    pub fn set_display_mode(&mut self, mode: DisplayMode) {
+        if self.display_mode != mode {
+            self.display_mode = mode;
+            self.update_scale();
+        }
+    }
+
+    /// Render the current frame + optional egui overlay to the window.
+    pub fn render(&mut self, egui_output: Option<egui::FullOutput>, pixels_per_point: f32) -> Result<()> {
         let bind_group = match &self.current_bind_group {
             Some(bg) => bg,
             None => return Ok(()),
         };
 
         let output = match self.surface.get_current_texture() {
-            Ok(o) => o,
-            // Transient timeout — just skip this frame silently.
-            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
-            // Surface lost or outdated (minimize, resize race, etc.) — reconfigure and skip.
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.surface_config);
                 return Ok(());
             }
-            Err(e) => return Err(anyhow::anyhow!("Surface error: {}", e)),
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(anyhow::anyhow!("wgpu validation error on surface"));
+            }
         };
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -308,12 +328,14 @@ impl Renderer {
             label: Some("render_encoder"),
         });
 
+        // Video frame pass
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("render_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
@@ -322,6 +344,7 @@ impl Renderer {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             render_pass.set_pipeline(&self.pipeline);
@@ -330,26 +353,76 @@ impl Renderer {
             render_pass.draw(0..6, 0..1);
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        // egui overlay pass (drawn on top of video)
+        if let Some(full_output) = egui_output {
+            // Tessellate into paint jobs
+            let clipped = {
+                let ctx = egui::Context::default();
+                ctx.tessellate(full_output.shapes, full_output.pixels_per_point)
+            };
+            let screen_descriptor = egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [self.window_size.0, self.window_size.1],
+                pixels_per_point,
+            };
+            for (id, delta) in &full_output.textures_delta.set {
+                self.egui_renderer.update_texture(&self.device, &self.queue, *id, delta);
+            }
+            for id in &full_output.textures_delta.free {
+                self.egui_renderer.free_texture(id);
+            }
+            let extra_cmds = self.egui_renderer.update_buffers(
+                &self.device,
+                &self.queue,
+                &mut encoder,
+                &clipped,
+                &screen_descriptor,
+            );
+            {
+                let mut egui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("egui_pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                }).forget_lifetime();
+                self.egui_renderer.render(&mut egui_pass, &clipped, &screen_descriptor);
+            }
+            self.queue.submit(extra_cmds.into_iter().chain(std::iter::once(encoder.finish())));
+        } else {
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
         output.present();
 
         Ok(())
     }
 
-    /// Recompute the letterbox scale factors.
+    /// Recompute the scale factors based on current display mode.
     fn update_scale(&mut self) {
         if self.remote_size.0 == 0 || self.remote_size.1 == 0 {
             return;
         }
 
-        let (ww, wh) = (self.window_size.0 as f32, self.window_size.1 as f32);
-        let (rw, rh) = (self.remote_size.0 as f32, self.remote_size.1 as f32);
+        let data = match self.display_mode {
+            DisplayMode::Stretch => [1.0f32, 1.0, 0.0, 0.0],
+            DisplayMode::Letterbox => {
+                let (ww, wh) = (self.window_size.0 as f32, self.window_size.1 as f32);
+                let (rw, rh) = (self.remote_size.0 as f32, self.remote_size.1 as f32);
 
-        let scale = (ww / rw).min(wh / rh);
-        let sx = (rw * scale) / ww;
-        let sy = (rh * scale) / wh;
-
-        let data = [sx, sy, 0.0f32, 0.0];
+                let scale = (ww / rw).min(wh / rh);
+                let sx = (rw * scale) / ww;
+                let sy = (rh * scale) / wh;
+                [sx, sy, 0.0f32, 0.0]
+            }
+        };
         self.queue.write_buffer(&self.scale_buffer, 0, bytemuck::cast_slice(&data));
     }
 }

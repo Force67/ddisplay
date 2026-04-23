@@ -22,6 +22,9 @@ mod decoder;
 mod renderer;
 mod input;
 mod clipboard;
+mod overlay;
+
+use overlay::OverlayState;
 
 use protocol::ServerMessage;
 use transport::TransportEvent;
@@ -69,12 +72,15 @@ struct App {
     transport_rx: Option<tokio::sync::mpsc::UnboundedReceiver<TransportEvent>>,
     rt: tokio::runtime::Handle,
     codec: String,
+    session_fps: u32,
     /// Frame counter for log throttling (total VideoFrame messages received).
     frame_count: u64,
     /// Tracks last clipboard text set from server (echo prevention for poll thread).
     clipboard_last_set: Arc<std::sync::Mutex<Option<String>>>,
     /// False when window is minimized or fully occluded — skip decode and render.
     window_visible: bool,
+    /// Egui overlay state.
+    overlay: Option<OverlayState>,
 }
 
 impl ApplicationHandler for App {
@@ -128,16 +134,25 @@ impl ApplicationHandler for App {
 
         let input_state = input::InputState::new(sender);
 
-        self.window = Some(window);
+        self.window = Some(window.clone());
         self.renderer = Some(renderer);
         self.input_state = Some(input_state);
         self.transport_rx = Some(rx);
+        self.overlay = Some(OverlayState::new(&window));
 
         eprintln!("[init] Ready.");
         tracing::info!("Window created, connecting to server...");
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // Pass ALL events to egui before our own handling
+        if let (Some(overlay), Some(window)) = (&mut self.overlay, &self.window) {
+            let resp = overlay.winit_state.on_window_event(window, &event);
+            if resp.consumed {
+                return;
+            }
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 if let Some(input) = &self.input_state {
@@ -155,22 +170,40 @@ impl ApplicationHandler for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(input) = &mut self.input_state {
-                    input.on_cursor_moved(position.x, position.y);
+                    // Only forward mouse to server when overlay is hidden
+                    if self.overlay.as_ref().map_or(true, |o| !o.visible) {
+                        input.on_cursor_moved(position.x, position.y);
+                    }
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if let Some(input) = &mut self.input_state {
-                    input.on_mouse_button(button, state);
+                    if self.overlay.as_ref().map_or(true, |o| !o.visible) {
+                        input.on_mouse_button(button, state);
+                    }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 if let Some(input) = &mut self.input_state {
-                    input.on_scroll(delta);
+                    if self.overlay.as_ref().map_or(true, |o| !o.visible) {
+                        input.on_scroll(delta);
+                    }
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } => {
-                if let Some(input) = &mut self.input_state {
-                    input.on_key(event.physical_key, event.state);
+            WindowEvent::KeyboardInput { event: ref key_event, .. } => {
+                // F2 toggles overlay (not forwarded to server)
+                if key_event.state == winit::event::ElementState::Pressed {
+                    if let winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::F2) = key_event.physical_key {
+                        if let Some(overlay) = &mut self.overlay {
+                            overlay.visible = !overlay.visible;
+                            return;
+                        }
+                    }
+                }
+                if self.overlay.as_ref().map_or(true, |o| !o.visible) {
+                    if let Some(input) = &mut self.input_state {
+                        input.on_key(key_event.physical_key, key_event.state);
+                    }
                 }
             }
             WindowEvent::Focused(false) => {
@@ -198,8 +231,31 @@ impl ApplicationHandler for App {
                     }
                 }
 
+                // Run egui UI and produce paint output (None when overlay hidden)
+                let (egui_output, pixels_per_point) = if let (Some(overlay), Some(window)) =
+                    (&mut self.overlay, &self.window)
+                {
+                    let server = &self.args.server;
+                    let codec = &self.codec;
+                    let fps = self.session_fps;
+                    let mode = overlay.run_ui(server, codec, fps, window);
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.set_display_mode(mode);
+                    }
+                    let ppp = overlay.ctx.pixels_per_point();
+                    let full_out = overlay.ctx.end_pass();
+                    if overlay.visible {
+                        (Some(full_out), ppp)
+                    } else {
+                        // Still need to end_pass but don't render it
+                        (None, ppp)
+                    }
+                } else {
+                    (None, 1.0)
+                };
+
                 if let Some(renderer) = &mut self.renderer {
-                    if let Err(e) = renderer.render() {
+                    if let Err(e) = renderer.render(egui_output, pixels_per_point) {
                         tracing::warn!("Render error: {}", e);
                     }
                 }
@@ -293,6 +349,8 @@ impl App {
                 if let Ok(info) = serde_json::from_slice::<SessionInfo>(json_bytes) {
                     eprintln!("[session] parsed: codec={} {}x{} @ {} fps",
                         info.codec, info.width, info.height, info.fps);
+
+                    self.session_fps = info.fps;
 
                     // --force-codec wins over server-sent codec.
                     if self.args.force_codec.is_some() {
@@ -392,9 +450,11 @@ fn main() {
         transport_rx: None,
         rt: rt.handle().clone(),
         codec: "h264".to_string(),
+        session_fps: 60,
         frame_count: 0,
         clipboard_last_set: Arc::new(std::sync::Mutex::new(None)),
         window_visible: true,
+        overlay: None,
     };
 
     if let Err(e) = event_loop.run_app(&mut app) {

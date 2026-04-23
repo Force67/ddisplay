@@ -16,7 +16,7 @@ url = "2"
 winit = "0.30"
 
 # GPU rendering
-wgpu = "24"
+wgpu = { version = "29", default-features = false, features = ["std", "parking_lot", "vulkan", "gles", "wgsl"] }
 
 # H.264 decoding (software, cross-platform)
 openh264 = "0.9"
@@ -46,6 +46,9 @@ pollster = "0.4"
 
 # Safe casting for uniform buffer uploads
 bytemuck = { version = "1", features = ["derive"] }
+egui = "0.34.1"
+egui-wgpu = "0.34.1"
+egui-winit = { version = "0.34.1", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

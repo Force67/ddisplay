@@ -1,5 +1,7 @@
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
@@ -214,14 +216,15 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Listening on http://{}", args.bind);
 
     // --- Input handler (dedicated blocking thread) ---
-    spawn_input_handler(injector, input_rx);
+    let input_pending = Arc::new(AtomicBool::new(false));
+    spawn_input_handler(injector, input_rx, Arc::clone(&input_pending));
 
     // --- Capture+encode loop (dedicated thread, zero-copy) ---
     let fps = args.fps;
     let kf_cache = keyframe_cache;
 
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = capture_encode_loop(capturer, encoder, frame_tx, kf_cache, screen_w, screen_h, fps) {            tracing::error!("Capture loop error: {}", e);
+        if let Err(e) = capture_encode_loop(capturer, encoder, frame_tx, kf_cache, screen_w, screen_h, fps, input_pending) {            tracing::error!("Capture loop error: {}", e);
         }
     }).await?;
 
@@ -230,7 +233,11 @@ async fn main() -> anyhow::Result<()> {
 
 /// Spawn a dedicated blocking task that reads client input events and
 /// injects them into the X11 server.
-fn spawn_input_handler(injector: X11InputInjector, mut input_rx: mpsc::Receiver<ClientEvent>) {
+fn spawn_input_handler(
+    injector: X11InputInjector,
+    mut input_rx: mpsc::Receiver<ClientEvent>,
+    input_pending: Arc<AtomicBool>,
+) {
     let (sync_tx, sync_rx) = std::sync::mpsc::channel::<ClientEvent>();
 
     tokio::spawn(async move {
@@ -246,6 +253,10 @@ fn spawn_input_handler(injector: X11InputInjector, mut input_rx: mpsc::Receiver<
             if let Err(e) = injector.inject_event(&event) {
                 tracing::error!("Failed to inject input event: {}", e);
             }
+            // Signal the capture loop to grab a frame ASAP instead of waiting
+            // for the next timer tick (reduces worst-case key-to-display lag by
+            // up to one full frame interval, e.g. 16 ms at 60 fps).
+            input_pending.store(true, Ordering::Release);
         }
         tracing::info!("Input handler shutting down");
     });
@@ -262,6 +273,7 @@ fn capture_encode_loop(
     screen_w: u32,
     screen_h: u32,
     fps: u32,
+    input_pending: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let frame_interval = Duration::from_secs_f64(1.0 / fps as f64);
     let keyframe_interval = fps as u64 * 2; // IDR every 2 seconds
@@ -274,7 +286,10 @@ fn capture_encode_loop(
     loop {
         // Sleep until next frame time
         let now = Instant::now();
-        if next_frame_time > now {
+        // Skip the timer sleep if input just arrived — capture immediately
+        // to minimise keyboard/mouse-to-screen latency.
+        let input_arrived = input_pending.swap(false, Ordering::AcqRel);
+        if !input_arrived && next_frame_time > now {
             std::thread::sleep(next_frame_time - now);
         }
         next_frame_time += frame_interval;
@@ -287,7 +302,6 @@ fn capture_encode_loop(
         let has_damage = capturer.has_damage();
 
         // Always send cursor updates regardless of screen damage
-        // (cursor is a hardware overlay that doesn't trigger damage events)
         if let Some(ci) = capturer.get_cursor_info().ok() {
             let wire = protocol::encode_cursor_update(
                 ci.x.max(0) as u16,
@@ -299,7 +313,8 @@ fn capture_encode_loop(
 
         // Skip capture+encode if nothing changed (saves CPU, GPU, and bandwidth).
         // Always capture on keyframe intervals (for new client sync).
-        if !force_kf && !has_damage {
+        // Also always capture on the frame after input (app may have just responded).
+        if !force_kf && !has_damage && !input_arrived {
             frame_count += 1;
             fps_frame_count += 1;
             continue;

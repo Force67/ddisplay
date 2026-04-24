@@ -427,6 +427,14 @@ impl Renderer {
     }
 }
 
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        // Flush all pending GPU/presentation work before the Vulkan swapchain is torn down.
+        // wgpu 29 panics if a SwapchainAcquireSemaphore is still in-flight when Surface drops.
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+    }
+}
+
 const FULLSCREEN_QUAD_WGSL: &str = r#"
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,

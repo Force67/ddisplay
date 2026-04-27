@@ -231,25 +231,20 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                // Run egui UI and produce paint output (None when overlay hidden)
+                // Run egui UI — only produces output when overlay is visible.
+                // When hidden, run_ui() still drains the winit event queue.
                 let (egui_output, pixels_per_point) = if let (Some(overlay), Some(window)) =
                     (&mut self.overlay, &self.window)
                 {
                     let server = &self.args.server;
                     let codec = &self.codec;
                     let fps = self.session_fps;
-                    let mode = overlay.run_ui(server, codec, fps, window);
+                    let full_out = overlay.run_ui(server, codec, fps, window);
                     if let Some(renderer) = &mut self.renderer {
-                        renderer.set_display_mode(mode);
+                        renderer.set_display_mode(overlay.display_mode);
                     }
                     let ppp = overlay.ctx.pixels_per_point();
-                    let full_out = overlay.ctx.end_pass();
-                    if overlay.visible {
-                        (Some(full_out), ppp)
-                    } else {
-                        // Still need to end_pass but don't render it
-                        (None, ppp)
-                    }
+                    (full_out, ppp)
                 } else {
                     (None, 1.0)
                 };

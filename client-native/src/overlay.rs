@@ -56,62 +56,64 @@ impl OverlayState {
         codec: &str,
         fps: u32,
         window: &winit::window::Window,
-    ) -> DisplayMode {
+    ) -> Option<egui::FullOutput> {
+        // Always drain accumulated winit input so it doesn't pile up while hidden.
         let raw_input = self.winit_state.take_egui_input(window);
-        let _ = self.ctx.begin_pass(raw_input);
 
-        if self.visible {
-            let screen = self.ctx.screen_rect();
-            let panel_w = 320.0f32;
-            let panel_h = 220.0f32;
-            let panel_x = (screen.width() - panel_w) * 0.5;
-            let panel_y = (screen.height() - panel_h) * 0.5;
-
-            egui::Area::new(egui::Id::new("overlay_panel"))
-                .fixed_pos(egui::pos2(panel_x, panel_y))
-                .order(egui::Order::Foreground)
-                .show(&self.ctx, |ui| {
-                    egui::Frame::new()
-                        .fill(egui::Color32::from_rgba_premultiplied(20, 20, 28, 220))
-                        .corner_radius(12.0)
-                        .inner_margin(egui::Margin::same(20))
-                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(70)))
-                        .show(ui, |ui| {
-                            ui.set_min_width(panel_w - 40.0);
-
-                            ui.heading("ddisplay settings");
-                            ui.add_space(8.0);
-                            ui.separator();
-                            ui.add_space(8.0);
-
-                            // Connection info
-                            ui.label(format!("Server: {server}"));
-                            ui.label(format!("Codec: {codec}  |  FPS: {fps}"));
-                            ui.add_space(12.0);
-
-                            // Display mode selector
-                            ui.label("Display mode:");
-                            ui.horizontal(|ui| {
-                                ui.selectable_value(
-                                    &mut self.display_mode,
-                                    DisplayMode::Letterbox,
-                                    "⬛ Letterbox",
-                                );
-                                ui.selectable_value(
-                                    &mut self.display_mode,
-                                    DisplayMode::Stretch,
-                                    "⤢ Stretch",
-                                );
-                            });
-                            ui.add_space(12.0);
-                            ui.separator();
-                            ui.add_space(8.0);
-
-                            ui.weak("Press F2 to close");
-                        });
-                });
+        if !self.visible {
+            return None;
         }
 
-        self.display_mode
+        self.ctx.begin_pass(raw_input);
+
+        let screen = self.ctx.screen_rect();
+        let panel_w = 320.0f32;
+        let panel_h = 220.0f32;
+        let panel_x = (screen.width() - panel_w) * 0.5;
+        let panel_y = (screen.height() - panel_h) * 0.5;
+
+        egui::Area::new(egui::Id::new("overlay_panel"))
+            .fixed_pos(egui::pos2(panel_x, panel_y))
+            .order(egui::Order::Foreground)
+            .show(&self.ctx, |ui| {
+                egui::Frame::new()
+                    .fill(egui::Color32::from_rgba_premultiplied(20, 20, 28, 220))
+                    .corner_radius(12.0)
+                    .inner_margin(egui::Margin::same(20))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(70)))
+                    .show(ui, |ui| {
+                        ui.set_min_width(panel_w - 40.0);
+
+                        ui.heading("ddisplay settings");
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+
+                        ui.label(format!("Server: {server}"));
+                        ui.label(format!("Codec: {codec}  |  FPS: {fps}"));
+                        ui.add_space(12.0);
+
+                        ui.label("Display mode:");
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(
+                                &mut self.display_mode,
+                                DisplayMode::Letterbox,
+                                "⬛ Letterbox",
+                            );
+                            ui.selectable_value(
+                                &mut self.display_mode,
+                                DisplayMode::Stretch,
+                                "⤢ Stretch",
+                            );
+                        });
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+
+                        ui.weak("Press F2 to close");
+                    });
+            });
+
+        Some(self.ctx.end_pass())
     }
 }

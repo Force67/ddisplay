@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
-use crate::overlay::DisplayMode;
+use crate::overlay::{DisplayMode, EguiRenderData};
 
 pub struct Renderer {
     device: wgpu::Device,
@@ -305,7 +305,7 @@ impl Renderer {
     }
 
     /// Render the current frame + optional egui overlay to the window.
-    pub fn render(&mut self, egui_output: Option<egui::FullOutput>, pixels_per_point: f32) -> Result<()> {
+    pub fn render(&mut self, egui_output: Option<EguiRenderData>) -> Result<()> {
         let bind_group = match &self.current_bind_group {
             Some(bg) => bg,
             None => return Ok(()),
@@ -354,27 +354,22 @@ impl Renderer {
         }
 
         // egui overlay pass (drawn on top of video)
-        if let Some(full_output) = egui_output {
-            // Tessellate into paint jobs
-            let clipped = {
-                let ctx = egui::Context::default();
-                ctx.tessellate(full_output.shapes, full_output.pixels_per_point)
-            };
+        if let Some(egui_data) = egui_output {
             let screen_descriptor = egui_wgpu::ScreenDescriptor {
                 size_in_pixels: [self.window_size.0, self.window_size.1],
-                pixels_per_point,
+                pixels_per_point: egui_data.pixels_per_point,
             };
-            for (id, delta) in &full_output.textures_delta.set {
+            for (id, delta) in &egui_data.textures_delta.set {
                 self.egui_renderer.update_texture(&self.device, &self.queue, *id, delta);
             }
-            for id in &full_output.textures_delta.free {
+            for id in &egui_data.textures_delta.free {
                 self.egui_renderer.free_texture(id);
             }
             let extra_cmds = self.egui_renderer.update_buffers(
                 &self.device,
                 &self.queue,
                 &mut encoder,
-                &clipped,
+                &egui_data.clipped,
                 &screen_descriptor,
             );
             {
@@ -394,7 +389,7 @@ impl Renderer {
                     occlusion_query_set: None,
                     multiview_mask: None,
                 }).forget_lifetime();
-                self.egui_renderer.render(&mut egui_pass, &clipped, &screen_descriptor);
+                self.egui_renderer.render(&mut egui_pass, &egui_data.clipped, &screen_descriptor);
             }
             self.queue.submit(extra_cmds.into_iter().chain(std::iter::once(encoder.finish())));
         } else {

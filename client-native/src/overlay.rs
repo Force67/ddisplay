@@ -4,6 +4,15 @@
 
 use egui_winit::winit;
 
+/// Pre-tessellated egui frame ready for GPU upload and rendering.
+/// Produced by [`OverlayState::run_ui`] so the renderer never needs to
+/// call `tessellate()` on its own context.
+pub struct EguiRenderData {
+    pub textures_delta: egui::TexturesDelta,
+    pub clipped: Vec<egui::ClippedPrimitive>,
+    pub pixels_per_point: f32,
+}
+
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub enum DisplayMode {
     #[default]
@@ -49,14 +58,17 @@ impl OverlayState {
         }
     }
 
-    /// Returns the display mode (possibly changed by UI this frame).
+    /// Returns pre-tessellated egui render data, or `None` when the overlay is hidden.
+    ///
+    /// Tessellation is done here using `self.ctx` so the renderer never needs to
+    /// create its own context (which would panic — "No fonts loaded").
     pub fn run_ui(
         &mut self,
         server: &str,
         codec: &str,
         fps: u32,
         window: &winit::window::Window,
-    ) -> Option<egui::FullOutput> {
+    ) -> Option<EguiRenderData> {
         // Always drain accumulated winit input so it doesn't pile up while hidden.
         let raw_input = self.winit_state.take_egui_input(window);
 
@@ -114,6 +126,13 @@ impl OverlayState {
                     });
             });
 
-        Some(self.ctx.end_pass())
+        let full_output = self.ctx.end_pass();
+        let pixels_per_point = full_output.pixels_per_point;
+        let clipped = self.ctx.tessellate(full_output.shapes, pixels_per_point);
+        Some(EguiRenderData {
+            textures_delta: full_output.textures_delta,
+            clipped,
+            pixels_per_point,
+        })
     }
 }

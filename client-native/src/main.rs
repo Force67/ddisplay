@@ -233,24 +233,23 @@ impl ApplicationHandler for App {
 
                 // Run egui UI — only produces output when overlay is visible.
                 // When hidden, run_ui() still drains the winit event queue.
-                let (egui_output, pixels_per_point) = if let (Some(overlay), Some(window)) =
+                let egui_output = if let (Some(overlay), Some(window)) =
                     (&mut self.overlay, &self.window)
                 {
                     let server = &self.args.server;
                     let codec = &self.codec;
                     let fps = self.session_fps;
-                    let full_out = overlay.run_ui(server, codec, fps, window);
+                    let egui_data = overlay.run_ui(server, codec, fps, window);
                     if let Some(renderer) = &mut self.renderer {
                         renderer.set_display_mode(overlay.display_mode);
                     }
-                    let ppp = overlay.ctx.pixels_per_point();
-                    (full_out, ppp)
+                    egui_data
                 } else {
-                    (None, 1.0)
+                    None
                 };
 
                 if let Some(renderer) = &mut self.renderer {
-                    if let Err(e) = renderer.render(egui_output, pixels_per_point) {
+                    if let Err(e) = renderer.render(egui_output) {
                         tracing::warn!("Render error: {}", e);
                     }
                 }

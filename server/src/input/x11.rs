@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::protocol::Event;
@@ -19,28 +18,17 @@ const MOTION_NOTIFY: u8 = 6;
 pub struct X11InputInjector {
     conn: RustConnection,
     root: u32,
-    /// JS keyCode -> X11 hardware keycode.
-    keymap: HashMap<u32, u8>,
 }
 
 impl X11InputInjector {
-    /// Connect to the X11 server and build the key mapping table.
+    /// Connect to the X11 server.
     pub fn new() -> anyhow::Result<Self> {
         let (conn, screen_num) = RustConnection::connect(None)?;
         let root = conn.setup().roots[screen_num].root;
 
-        // Build a mapping from JS keyCodes to X11 keycodes by reading the
-        // server's full keyboard mapping and associating each keysym with
-        // the corresponding hardware keycode.
-        let keymap = build_keymap(&conn)?;
+        tracing::info!("X11 input injector ready (root=0x{:x})", root);
 
-        tracing::info!(
-            "X11 input injector ready (root=0x{:x}, {} key mappings)",
-            root,
-            keymap.len()
-        );
-
-        Ok(Self { conn, root, keymap })
+        Ok(Self { conn, root })
     }
 
     /// Best-effort reset of common modifiers/buttons that may have been left
@@ -329,123 +317,144 @@ impl X11InputInjector {
     }
 
     fn js_keycode_to_x11_keycode(&self, js_key: u32) -> Option<u8> {
-        // Convert the JS keyCode to an X11 keysym, then look it up in our
-        // pre-built keymap.
-        let keysym = js_keycode_to_keysym(js_key)?;
-        self.keymap.get(&keysym).copied()
+        // Map JS keycodes (physical/position-based) directly to X11 hardware
+        // keycodes (evdev + 8).  This is layout-independent: the same physical
+        // key always maps to the same X11 keycode regardless of whether the
+        // server uses a US, German, French, or any other layout.  The server's
+        // X11 layout then translates the hardware keycode to the correct
+        // character for the user.
+        js_keycode_to_x11_hw(js_key)
     }
 }
 
-/// Convert a JavaScript `KeyboardEvent.keyCode` value to an X11 keysym.
-fn js_keycode_to_keysym(js_key: u32) -> Option<u32> {
-    Some(match js_key {
-        // Letters A-Z: JS 65-90, X11 keysyms for lowercase a-z: 0x61-0x7a
-        65..=90 => js_key + 32, // 'A'(65) -> 'a'(97 = 0x61)
+/// Map a JS keyCode (position-based, layout-independent) directly to an
+/// X11 hardware keycode (= Linux evdev scancode + 8).
+///
+/// This table is keyed on physical key position, not character value.
+/// Pressing the Minus key on a German keyboard sends JS keycode 189 and
+/// produces X11 keycode 20 — the server's German layout then translates
+/// keycode 20 to 'ß', which is what the user expects.
+fn js_keycode_to_x11_hw(js: u32) -> Option<u8> {
+    Some(match js {
+        // ── Editing / control ─────────────────────────────────────────
+        8  => 22,  // Backspace
+        9  => 23,  // Tab
+        13 => 36,  // Enter
+        16 => 50,  // LShift
+        17 => 37,  // LCtrl
+        18 => 64,  // LAlt
+        19 => 127, // Pause  (evdev 119 → X11 127)
+        20 => 66,  // CapsLock
+        27 => 9,   // Escape
+        32 => 65,  // Space
+        45 => 118, // Insert
+        46 => 119, // Delete
 
-        // Digits 0-9: JS 48-57, keysyms match ASCII
-        48..=57 => js_key,
+        // ── Navigation ────────────────────────────────────────────────
+        33 => 112, // PageUp
+        34 => 117, // PageDown
+        35 => 115, // End
+        36 => 110, // Home
+        37 => 113, // ArrowLeft
+        38 => 111, // ArrowUp
+        39 => 114, // ArrowRight
+        40 => 116, // ArrowDown
 
-        // Numpad 0-9: JS 96-105 -> keysyms 0xFFB0-0xFFB9
-        96..=105 => 0xFFB0 + (js_key - 96),
+        // ── Digit row (48–57) ─────────────────────────────────────────
+        48 => 19,  // 0
+        49 => 10,  // 1
+        50 => 11,  // 2
+        51 => 12,  // 3
+        52 => 13,  // 4
+        53 => 14,  // 5
+        54 => 15,  // 6
+        55 => 16,  // 7
+        56 => 17,  // 8
+        57 => 18,  // 9
 
-        // F1-F12: JS 112-123 -> keysyms 0xFFBE-0xFFC9
-        112..=123 => 0xFFBE + (js_key - 112),
+        // ── Letters A–Z (QWERTY physical positions) ───────────────────
+        65 => 38,  // A
+        66 => 56,  // B
+        67 => 54,  // C
+        68 => 40,  // D
+        69 => 26,  // E
+        70 => 41,  // F
+        71 => 42,  // G
+        72 => 43,  // H
+        73 => 31,  // I
+        74 => 44,  // J
+        75 => 45,  // K
+        76 => 46,  // L
+        77 => 58,  // M
+        78 => 57,  // N
+        79 => 32,  // O
+        80 => 33,  // P
+        81 => 24,  // Q
+        82 => 27,  // R
+        83 => 39,  // S
+        84 => 28,  // T
+        85 => 30,  // U
+        86 => 55,  // V
+        87 => 25,  // W
+        88 => 53,  // X
+        89 => 29,  // Y
+        90 => 52,  // Z
 
-        // Common editing / navigation keys
-        8 => 0xFF08,   // Backspace
-        9 => 0xFF09,   // Tab
-        13 => 0xFF0D,  // Enter / Return
-        16 => 0xFFE1,  // Shift (left)
-        17 => 0xFFE3,  // Control (left)
-        18 => 0xFFE9,  // Alt (left)
-        19 => 0xFF13,  // Pause
-        20 => 0xFFE5,  // Caps Lock
-        27 => 0xFF1B,  // Escape
-        32 => 0x0020,  // Space
-        33 => 0xFF55,  // Page Up
-        34 => 0xFF56,  // Page Down
-        35 => 0xFF57,  // End
-        36 => 0xFF50,  // Home
-        37 => 0xFF51,  // Arrow Left
-        38 => 0xFF52,  // Arrow Up
-        39 => 0xFF53,  // Arrow Right
-        40 => 0xFF54,  // Arrow Down
-        45 => 0xFF63,  // Insert
-        46 => 0xFFFF,  // Delete
+        // ── Meta / context ────────────────────────────────────────────
+        91 => 133, // LMeta/LSuper
+        92 => 134, // RMeta/RSuper
+        93 => 135, // ContextMenu
 
-        // Punctuation / symbols (US layout)
-        186 => 0x003b, // ; semicolon
-        187 => 0x003d, // = equals
-        188 => 0x002c, // , comma
-        189 => 0x002d, // - minus/hyphen
-        190 => 0x002e, // . period
-        191 => 0x002f, // / slash
-        192 => 0x0060, // ` grave accent
-        219 => 0x005b, // [ left bracket
-        220 => 0x005c, // \ backslash
-        221 => 0x005d, // ] right bracket
-        222 => 0x0027, // ' apostrophe
+        // ── Numpad 0–9 ────────────────────────────────────────────────
+        96  => 90,  // KP_0
+        97  => 87,  // KP_1
+        98  => 88,  // KP_2
+        99  => 89,  // KP_3
+        100 => 83,  // KP_4
+        101 => 84,  // KP_5
+        102 => 85,  // KP_6
+        103 => 79,  // KP_7
+        104 => 80,  // KP_8
+        105 => 81,  // KP_9
 
-        // Numpad operators
-        106 => 0xFFAA, // numpad *
-        107 => 0xFFAB, // numpad +
-        109 => 0xFFAD, // numpad -
-        110 => 0xFFAE, // numpad .
-        111 => 0xFFAF, // numpad /
+        // ── Numpad operators ──────────────────────────────────────────
+        106 => 63,  // KP_Multiply
+        107 => 86,  // KP_Add
+        109 => 82,  // KP_Subtract
+        110 => 91,  // KP_Decimal
+        111 => 106, // KP_Divide
 
-        // Meta / OS keys
-        91 => 0xFFEB,  // Left Meta / Windows
-        92 => 0xFFEC,  // Right Meta / Windows
-        93 => 0xFF67,  // Context Menu
+        // ── F1–F12 ────────────────────────────────────────────────────
+        112 => 67,  // F1
+        113 => 68,  // F2
+        114 => 69,  // F3
+        115 => 70,  // F4
+        116 => 71,  // F5
+        117 => 72,  // F6
+        118 => 73,  // F7
+        119 => 74,  // F8
+        120 => 75,  // F9
+        121 => 76,  // F10
+        122 => 95,  // F11  (evdev 87 → X11 95)
+        123 => 96,  // F12  (evdev 88 → X11 96)
 
-        // Scroll / Num / Print
-        144 => 0xFF7F, // Num Lock
-        145 => 0xFF14, // Scroll Lock
+        // ── Lock keys ─────────────────────────────────────────────────
+        144 => 77,  // NumLock
+        145 => 78,  // ScrollLock
 
-        _ => return None,
-    })
-}
+        // ── Punctuation (layout-sensitive — position-based) ───────────
+        186 => 47,  // Semicolon / ;
+        187 => 21,  // Equals / =
+        188 => 59,  // Comma / ,
+        189 => 20,  // Minus / -
+        190 => 60,  // Period / .
+        191 => 61,  // Slash / /
+        192 => 49,  // Backtick / `
+        219 => 34,  // BracketLeft / [
+        220 => 51,  // Backslash / \
+        221 => 35,  // BracketRight / ]
+        222 => 48,  // Quote / '
 
-fn char_to_js_keycode(ch: char) -> Option<(u32, bool)> {
-    Some(match ch {
-        'a'..='z' => (ch.to_ascii_uppercase() as u32, false),
-        'A'..='Z' => (ch as u32, true),
-        '0'..='9' => (ch as u32, false),
-        ' ' => (32, false),
-        '\n' | '\r' => (13, false),
-        '\t' => (9, false),
-        '!' => (49, true),
-        '@' => (50, true),
-        '#' => (51, true),
-        '$' => (52, true),
-        '%' => (53, true),
-        '^' => (54, true),
-        '&' => (55, true),
-        '*' => (56, true),
-        '(' => (57, true),
-        ')' => (48, true),
-        '-' => (189, false),
-        '_' => (189, true),
-        '=' => (187, false),
-        '+' => (187, true),
-        '[' => (219, false),
-        '{' => (219, true),
-        ']' => (221, false),
-        '}' => (221, true),
-        '\\' => (220, false),
-        '|' => (220, true),
-        ';' => (186, false),
-        ':' => (186, true),
-        '\'' => (222, false),
-        '"' => (222, true),
-        ',' => (188, false),
-        '<' => (188, true),
-        '.' => (190, false),
-        '>' => (190, true),
-        '/' => (191, false),
-        '?' => (191, true),
-        '`' => (192, false),
-        '~' => (192, true),
         _ => return None,
     })
 }
@@ -523,43 +532,4 @@ fn read_selection_with_target(
     }
 
     Ok(None)
-}
-
-/// Read the X server keyboard mapping and build a reverse lookup table
-/// from keysym -> hardware keycode.  When multiple keycodes map to the
-/// same keysym we keep the first (lowest keycode), which is the
-/// primary/unshifted mapping.
-fn build_keymap(conn: &RustConnection) -> anyhow::Result<HashMap<u32, u8>> {
-    let setup = conn.setup();
-    let min_keycode = setup.min_keycode;
-    let max_keycode = setup.max_keycode;
-    let count = (max_keycode - min_keycode) as u8 + 1;
-
-    let reply = conn
-        .get_keyboard_mapping(min_keycode, count)?
-        .reply()?;
-
-    let keysyms_per_keycode = reply.keysyms_per_keycode as usize;
-    let keysyms = &reply.keysyms;
-
-    let mut map: HashMap<u32, u8> = HashMap::new();
-
-    for i in 0..count as usize {
-        let keycode = (min_keycode as usize + i) as u8;
-        let base = i * keysyms_per_keycode;
-        // Look at all columns, but prefer the first (unshifted) binding.
-        for col in 0..keysyms_per_keycode {
-            if base + col >= keysyms.len() {
-                break;
-            }
-            let sym = keysyms[base + col];
-            if sym != 0 {
-                // Only insert if we haven't already recorded a mapping for
-                // this keysym (prefer lower keycode / earlier column).
-                map.entry(sym).or_insert(keycode);
-            }
-        }
-    }
-
-    Ok(map)
 }

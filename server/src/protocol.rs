@@ -38,6 +38,7 @@ pub const MSG_RELEASE_KEYS: u8 = 0x16;
 pub const MSG_RELEASE_MOUSE: u8 = 0x17;
 pub const MSG_RELEASE_ALL: u8 = 0x18;
 pub const MSG_CLIPBOARD_DATA: u8 = 0x20;
+pub const MSG_REQUEST_KEYFRAME: u8 = 0x21;
 
 pub fn encode_clipboard_data(text: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(1 + text.len());
@@ -104,6 +105,7 @@ pub enum ClientEvent {
     ReleaseMouse,
     ReleaseAll,
     ClipboardData { text: String },
+    RequestKeyframe,
 }
 
 /// Parse a binary message from the client.
@@ -148,6 +150,7 @@ pub fn parse_client_message(data: &[u8]) -> Option<ClientEvent> {
             let text = String::from_utf8_lossy(data.get(1..).unwrap_or_default()).into_owned();
             Some(ClientEvent::ClipboardData { text })
         }
+        MSG_REQUEST_KEYFRAME => Some(ClientEvent::RequestKeyframe),
         _ => None,
     }
 }

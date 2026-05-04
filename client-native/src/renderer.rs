@@ -65,13 +65,14 @@ impl Renderer {
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
-        // Use Immediate (no vsync) for lowest latency. Fall back to Mailbox, then Fifo.
-        let present_mode = if surface_caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
-            eprintln!("[gpu] Present mode: Immediate (no vsync, lowest latency)");
-            wgpu::PresentMode::Immediate
-        } else if surface_caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
-            eprintln!("[gpu] Present mode: Mailbox (low latency)");
+        // Prefer Mailbox (triple-buffered, low latency, GPU-paced by display) over
+        // Immediate (uncapped, spins GPU at 100%). Fall back through FifoRelaxed to Fifo.
+        let present_mode = if surface_caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+            eprintln!("[gpu] Present mode: Mailbox (low latency, GPU-paced)");
             wgpu::PresentMode::Mailbox
+        } else if surface_caps.present_modes.contains(&wgpu::PresentMode::FifoRelaxed) {
+            eprintln!("[gpu] Present mode: FifoRelaxed");
+            wgpu::PresentMode::FifoRelaxed
         } else {
             eprintln!("[gpu] Present mode: Fifo (vsync)");
             wgpu::PresentMode::Fifo

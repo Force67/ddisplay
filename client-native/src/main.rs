@@ -23,8 +23,9 @@ mod renderer;
 mod input;
 mod clipboard;
 mod overlay;
+mod files;
 
-use overlay::OverlayState;
+use overlay::{OverlayAction, OverlayState};
 
 use protocol::ServerMessage;
 use transport::TransportEvent;
@@ -57,6 +58,17 @@ struct Args {
     /// Useful for diagnosing why AV1 is not working.
     #[arg(long)]
     force_codec: Option<String>,
+
+    /// Local folder to share with the server on connect.
+    /// All files in this directory are uploaded to the server's shared folder.
+    #[arg(long)]
+    share_dir: Option<std::path::PathBuf>,
+}
+
+/// Payload sent through the decode channel: raw frame bytes + keyframe flag.
+struct DecodeJob {
+    data: Vec<u8>,
+    keyframe: bool,
 }
 
 /// Application state.
@@ -65,7 +77,7 @@ struct App {
     window: Option<Arc<Window>>,
     renderer: Option<renderer::Renderer>,
     /// Sends raw frame bytes to the background decode thread.
-    decode_tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    decode_tx: Option<std::sync::mpsc::SyncSender<DecodeJob>>,
     /// Latest frame decoded by the background thread; render loop takes it each tick.
     frame_slot: Arc<std::sync::Mutex<Option<decoder::DecodedFrame>>>,
     input_state: Option<input::InputState>,
@@ -79,12 +91,23 @@ struct App {
     clipboard_last_set: Arc<std::sync::Mutex<Option<String>>>,
     /// False when window is minimized or fully occluded — skip decode and render.
     window_visible: bool,
+    /// Set to true by the decode thread when a new frame is stored in frame_slot.
+    /// Cleared by about_to_wait after requesting a redraw.
+    frame_ready: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the decode thread when the AV1 decoder self-reset and needs a keyframe.
+    needs_keyframe: Arc<std::sync::atomic::AtomicBool>,
     /// Egui overlay state.
     overlay: Option<OverlayState>,
+    /// File transfer state (HTTP, talks to server's /files/* endpoints).
+    files_state: Option<files::FileTransferState>,
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // Continuously poll so about_to_wait fires every iteration.
+        // GPU stays idle because we only request_redraw when frame_ready is set.
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+
         if self.window.is_some() {
             return;
         }
@@ -139,6 +162,10 @@ impl ApplicationHandler for App {
         self.input_state = Some(input_state);
         self.transport_rx = Some(rx);
         self.overlay = Some(OverlayState::new(&window));
+        self.files_state = Some(files::FileTransferState::new(
+            &self.args.server,
+            self.rt.clone(),
+        ));
 
         eprintln!("[init] Ready.");
         tracing::info!("Window created, connecting to server...");
@@ -215,7 +242,10 @@ impl ApplicationHandler for App {
                 self.window_visible = !occluded;
             }
             WindowEvent::RedrawRequested => {
-                self.process_transport_events();
+                // Drain async file-transfer results.
+                if let Some(files) = &mut self.files_state {
+                    files.poll();
+                }
 
                 if !self.window_visible {
                     return;
@@ -233,20 +263,53 @@ impl ApplicationHandler for App {
 
                 // Run egui UI — only produces output when overlay is visible.
                 // When hidden, run_ui() still drains the winit event queue.
-                let egui_output = if let (Some(overlay), Some(window)) =
-                    (&mut self.overlay, &self.window)
+                let (egui_output, action) = if let (Some(overlay), Some(window), Some(files)) =
+                    (&mut self.overlay, &self.window, &mut self.files_state)
                 {
                     let server = &self.args.server;
                     let codec = &self.codec;
                     let fps = self.session_fps;
-                    let egui_data = overlay.run_ui(server, codec, fps, window);
+                    let (egui_data, act) = overlay.run_ui(server, codec, fps, window, Some(files));
                     if let Some(renderer) = &mut self.renderer {
                         renderer.set_display_mode(overlay.display_mode);
                     }
-                    egui_data
+                    (egui_data, act)
+                } else if let (Some(overlay), Some(window)) = (&mut self.overlay, &self.window) {
+                    let server = &self.args.server;
+                    let codec = &self.codec;
+                    let fps = self.session_fps;
+                    let (egui_data, act) = overlay.run_ui(server, codec, fps, window, None);
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.set_display_mode(overlay.display_mode);
+                    }
+                    (egui_data, act)
                 } else {
-                    None
+                    (None, OverlayAction::None)
                 };
+
+                // Handle file-transfer actions triggered from the overlay UI.
+                match action {
+                    OverlayAction::RefreshFiles => {
+                        if let Some(files) = &mut self.files_state {
+                            files.refresh();
+                        }
+                    }
+                    OverlayAction::Download(name) => {
+                        if let Some(files) = &mut self.files_state {
+                            files.download(name);
+                        }
+                    }
+                    OverlayAction::RequestUpload => {
+                        if let Some(paths) = rfd::FileDialog::new().pick_files() {
+                            if let Some(files) = &mut self.files_state {
+                                for p in paths {
+                                    files.upload(p);
+                                }
+                            }
+                        }
+                    }
+                    OverlayAction::None => {}
+                }
 
                 if let Some(renderer) = &mut self.renderer {
                     if let Err(e) = renderer.render(egui_output) {
@@ -259,8 +322,23 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Only request redraws when the window is actually visible.
-        if self.window_visible {
+        // Always drain transport events — this must not depend on rendering.
+        self.process_transport_events();
+
+        // If the decoder reset itself, ask the server for a fresh keyframe immediately.
+        if self.needs_keyframe.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            if let Some(input) = &self.input_state {
+                input.send_keyframe_request();
+            }
+        }
+
+        if !self.window_visible {
+            return;
+        }
+        let overlay_open = self.overlay.as_ref().map_or(false, |o| o.visible);
+        let has_frame = self.frame_ready.load(std::sync::atomic::Ordering::Relaxed);
+        if has_frame || overlay_open {
+            self.frame_ready.store(false, std::sync::atomic::Ordering::Relaxed);
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
@@ -294,6 +372,12 @@ impl App {
                     if let Some(input) = &self.input_state {
                         input.send_client_ready();
                     }
+                    // Auto-upload --share-dir contents to the server's shared folder.
+                    if let (Some(dir), Some(files)) =
+                        (&self.args.share_dir, &mut self.files_state)
+                    {
+                        files.upload_dir(dir.clone());
+                    }
                 }
                 TransportEvent::Disconnected => {
                     tracing::warn!("Disconnected from server");
@@ -323,11 +407,15 @@ impl App {
                         self.codec);
                 }
 
-                // Push raw bytes to the background decode thread (non-blocking).
+                // Push to the background decode thread (non-blocking).
                 // Skip when the window is hidden — no point decoding frames nobody sees.
                 if self.window_visible {
                     if let Some(tx) = &self.decode_tx {
-                        if tx.try_send(frame.data.to_vec()).is_err() {
+                        let job = DecodeJob {
+                            data: frame.data.to_vec(),
+                            keyframe: frame.keyframe,
+                        };
+                        if tx.try_send(job).is_err() {
                             // Decode thread is behind — drop this frame.
                             if self.frame_count <= 10 {
                                 eprintln!("[frame #{}] decode channel full, dropped", self.frame_count);
@@ -381,10 +469,12 @@ impl App {
         // Dropping the old sender closes the channel → old thread exits cleanly.
         self.decode_tx = None;
 
-        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<DecodeJob>(16);
         self.decode_tx = Some(tx);
 
         let slot = self.frame_slot.clone();
+        let frame_ready = self.frame_ready.clone();
+        let needs_keyframe = self.needs_keyframe.clone();
         let codec_str = codec.to_string();
 
         std::thread::Builder::new()
@@ -398,13 +488,31 @@ impl App {
                         return;
                     }
                 };
-                while let Ok(data) = rx.recv() {
-                    match dec.decode(&data) {
+                // After a decoder reset we must skip non-keyframes — a fresh
+                // dav1d context cannot parse inter-frames without a prior
+                // sequence header + keyframe.
+                let mut awaiting_keyframe = false;
+
+                while let Ok(job) = rx.recv() {
+                    if awaiting_keyframe && !job.keyframe {
+                        continue; // discard until a keyframe arrives
+                    }
+                    if awaiting_keyframe && job.keyframe {
+                        eprintln!("[decode] got keyframe after reset — resuming");
+                        awaiting_keyframe = false;
+                    }
+
+                    match dec.decode(&job.data) {
                         Ok(Some(frame)) => {
                             *slot.lock().unwrap() = Some(frame);
+                            frame_ready.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
-                        Ok(None) => {} // decoder buffering (EAGAIN)
+                        Ok(None) => {}
                         Err(e) => eprintln!("[decode] error: {}", e),
+                    }
+                    if dec.take_needs_keyframe() {
+                        awaiting_keyframe = true;
+                        needs_keyframe.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
                 eprintln!("[decode] thread exiting");
@@ -448,7 +556,10 @@ fn main() {
         frame_count: 0,
         clipboard_last_set: Arc::new(std::sync::Mutex::new(None)),
         window_visible: true,
+        frame_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        needs_keyframe: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         overlay: None,
+        files_state: None,
     };
 
     if let Err(e) = event_loop.run_app(&mut app) {

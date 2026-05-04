@@ -62,6 +62,18 @@ impl VideoDecoder {
             Self::Av1(d) => d.decode(data),
         }
     }
+
+    /// True if the AV1 decoder just reset itself and needs a keyframe from the server.
+    pub fn take_needs_keyframe(&mut self) -> bool {
+        match self {
+            Self::Av1(d) => {
+                let v = d.needs_keyframe;
+                d.needs_keyframe = false;
+                v
+            }
+            Self::H264(_) => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +153,10 @@ pub struct Av1Decoder {
     get_eagain: u64,
     /// Hard decode errors (not EAGAIN).
     decode_errors: u64,
+    /// Consecutive get_picture errors — used to detect a stuck decoder.
+    consecutive_errors: u32,
+    /// Set to true after a self-reset so the caller can request a keyframe.
+    pub needs_keyframe: bool,
 }
 
 // Safety: dav1d context is not shared; we call it from one thread at a time.
@@ -169,6 +185,8 @@ impl Av1Decoder {
                 send_eagain: 0,
                 get_eagain: 0,
                 decode_errors: 0,
+                consecutive_errors: 0,
+                needs_keyframe: false,
             })
         }
     }
@@ -259,6 +277,7 @@ impl Av1Decoder {
 
                     dav1d_picture_unref(&mut pic);
                     self.frames_out += 1;
+                    self.consecutive_errors = 0;
 
                     // Stats every 300 frames (~5 s at 60 fps).
                     if self.frames_out % 300 == 0 {
@@ -271,6 +290,7 @@ impl Av1Decoder {
                 }
                 DAV1D_EAGAIN => {
                     self.get_eagain += 1;
+                    self.consecutive_errors = 0;
                     if verbose || self.get_eagain <= 3 {
                         eprintln!("[av1]   get_picture EAGAIN #{} (need more input)", self.get_eagain);
                     }
@@ -278,8 +298,31 @@ impl Av1Decoder {
                 }
                 rc => {
                     self.decode_errors += 1;
+                    self.consecutive_errors += 1;
                     eprintln!("[av1]   get_picture ERROR {} ({}) on frame #{}",
                         rc, dav1d_strerror(rc), self.frames_in);
+
+                    // After 3 consecutive errors the decoder is stuck (lost reference
+                    // frames). Tear down and reopen the context, then signal the caller
+                    // to request a keyframe from the server so recovery is immediate.
+                    if self.consecutive_errors >= 3 {
+                        eprintln!("[av1] decoder stuck after {} consecutive errors — reinitialising", self.consecutive_errors);
+                        dav1d_close(&mut self.ctx);
+
+                        let mut settings: Dav1dSettings = std::mem::zeroed();
+                        dav1d_default_settings(&mut settings);
+                        settings.n_threads = 4;
+                        let mut new_ctx: *mut c_void = std::ptr::null_mut();
+                        let rc2 = dav1d_open(&mut new_ctx, &settings);
+                        if rc2 == 0 && !new_ctx.is_null() {
+                            self.ctx = new_ctx;
+                            self.consecutive_errors = 0;
+                            self.needs_keyframe = true;
+                            eprintln!("[av1] decoder reinitialised — requesting keyframe from server");
+                        } else {
+                            eprintln!("[av1] FATAL: failed to reopen dav1d after reset: {}", rc2);
+                        }
+                    }
                     Ok(None)
                 }
             }

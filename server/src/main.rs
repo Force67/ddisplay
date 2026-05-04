@@ -83,6 +83,11 @@ struct Args {
     /// If omitted, the /files endpoint is not served.
     #[arg(long)]
     shared_dir: Option<PathBuf>,
+
+    /// Path to the Windows client binary to serve at /download/client.
+    /// The file will be wrapped in a zip and offered as a download.
+    #[arg(long)]
+    client_bin: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -210,21 +215,33 @@ async fn main() -> anyhow::Result<()> {
         fps: args.fps,
         bitrate: args.bitrate,
     };
+    let client_bin = if let Some(ref p) = args.client_bin {
+        if !p.exists() {
+            tracing::warn!("--client-bin path not found: {}", p.display());
+            None
+        } else {
+            tracing::info!("Client binary: {}", p.display());
+            Some(p.clone())
+        }
+    } else {
+        None
+    };
     let (frame_tx, input_rx, keyframe_cache) =
-        transport::websocket::start_server(args.bind.clone(), client_dir, metadata, runtime, shared_dir).await?;
+        transport::websocket::start_server(args.bind.clone(), client_dir, metadata, runtime, shared_dir, client_bin).await?;
 
     tracing::info!("Listening on http://{}", args.bind);
 
     // --- Input handler (dedicated blocking thread) ---
     let input_pending = Arc::new(AtomicBool::new(false));
-    spawn_input_handler(injector, input_rx, Arc::clone(&input_pending));
+    let force_keyframe = Arc::new(AtomicBool::new(false));
+    spawn_input_handler(injector, input_rx, Arc::clone(&input_pending), Arc::clone(&force_keyframe));
 
     // --- Capture+encode loop (dedicated thread, zero-copy) ---
     let fps = args.fps;
     let kf_cache = keyframe_cache;
 
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = capture_encode_loop(capturer, encoder, frame_tx, kf_cache, screen_w, screen_h, fps, input_pending) {            tracing::error!("Capture loop error: {}", e);
+        if let Err(e) = capture_encode_loop(capturer, encoder, frame_tx, kf_cache, screen_w, screen_h, fps, input_pending, force_keyframe) {            tracing::error!("Capture loop error: {}", e);
         }
     }).await?;
 
@@ -237,6 +254,7 @@ fn spawn_input_handler(
     injector: X11InputInjector,
     mut input_rx: mpsc::Receiver<ClientEvent>,
     input_pending: Arc<AtomicBool>,
+    force_keyframe: Arc<AtomicBool>,
 ) {
     let (sync_tx, sync_rx) = std::sync::mpsc::channel::<ClientEvent>();
 
@@ -250,12 +268,18 @@ fn spawn_input_handler(
 
     tokio::task::spawn_blocking(move || {
         for event in sync_rx {
+            match &event {
+                ClientEvent::RequestKeyframe => {
+                    tracing::debug!("[keyframe] client requested keyframe");
+                    force_keyframe.store(true, Ordering::Release);
+                    input_pending.store(true, Ordering::Release);
+                    continue;
+                }
+                _ => {}
+            }
             if let Err(e) = injector.inject_event(&event) {
                 tracing::error!("Failed to inject input event: {}", e);
             }
-            // Signal the capture loop to grab a frame ASAP instead of waiting
-            // for the next timer tick (reduces worst-case key-to-display lag by
-            // up to one full frame interval, e.g. 16 ms at 60 fps).
             input_pending.store(true, Ordering::Release);
         }
         tracing::info!("Input handler shutting down");
@@ -274,32 +298,50 @@ fn capture_encode_loop(
     screen_h: u32,
     fps: u32,
     input_pending: Arc<AtomicBool>,
+    force_keyframe: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
-    let frame_interval = Duration::from_secs_f64(1.0 / fps as f64);
+    let active_interval = Duration::from_secs_f64(1.0 / fps as f64);
+    let idle_interval = Duration::from_secs_f64(1.0 / 10.0); // 10 fps when idle
+    // After this much silence we drop to idle FPS.
+    let idle_timeout = Duration::from_millis(500);
     let keyframe_interval = fps as u64 * 2; // IDR every 2 seconds
 
     let mut frame_count: u64 = 0;
     let mut next_frame_time = Instant::now();
     let mut fps_timer = Instant::now();
     let mut fps_frame_count: u64 = 0;
+    let mut last_activity = Instant::now();
 
     loop {
-        // Sleep until next frame time
         let now = Instant::now();
-        // Skip the timer sleep if input just arrived — capture immediately
-        // to minimise keyboard/mouse-to-screen latency.
         let input_arrived = input_pending.swap(false, Ordering::AcqRel);
+        if input_arrived {
+            last_activity = now;
+        }
+
+        // Pick frame interval based on recent activity.
+        let active = now.duration_since(last_activity) < idle_timeout;
+        let frame_interval = if active { active_interval } else { idle_interval };
+
         if !input_arrived && next_frame_time > now {
             std::thread::sleep(next_frame_time - now);
         }
         next_frame_time += frame_interval;
-        // If we fell behind, skip to now instead of trying to catch up
         if next_frame_time < Instant::now() {
             next_frame_time = Instant::now() + frame_interval;
         }
 
-        let force_kf = frame_count == 0 || frame_count % keyframe_interval == 0;
+        let client_requested_kf = force_keyframe.swap(false, Ordering::AcqRel);
+        let force_kf = frame_count == 0 || frame_count % keyframe_interval == 0 || client_requested_kf;
+        if client_requested_kf {
+            tracing::debug!("[keyframe] forcing IDR frame on client request");
+        }
         let has_damage = capturer.has_damage();
+
+        // Damage counts as activity too (animations, video playback, etc.)
+        if has_damage {
+            last_activity = Instant::now();
+        }
 
         // Always send cursor updates regardless of screen damage
         if let Some(ci) = capturer.get_cursor_info().ok() {

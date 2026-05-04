@@ -108,6 +108,10 @@ impl InputState {
         self.sender.send(protocol::encode_client_ready());
     }
 
+    pub fn send_keyframe_request(&self) {
+        self.sender.send(protocol::encode_request_keyframe());
+    }
+
     pub fn release_all(&self) {
         self.sender.send(protocol::encode_release_all());
     }

@@ -34,6 +34,7 @@ pub const MSG_RELEASE_KEYS: u8 = 0x16;
 pub const MSG_RELEASE_MOUSE: u8 = 0x17;
 pub const MSG_RELEASE_ALL: u8 = 0x18;
 pub const MSG_CLIPBOARD_DATA: u8 = 0x20;
+pub const MSG_REQUEST_KEYFRAME: u8 = 0x21;
 
 /// Parsed video frame from the server.
 pub struct VideoFrame<'a> {
@@ -155,4 +156,8 @@ pub fn encode_clipboard_data(text: &str) -> Vec<u8> {
     buf.push(MSG_CLIPBOARD_DATA);
     buf.extend_from_slice(text.as_bytes());
     buf
+}
+
+pub fn encode_request_keyframe() -> Vec<u8> {
+    vec![MSG_REQUEST_KEYFRAME]
 }

@@ -44,5 +44,8 @@ libc = "0.2"
 # Shared state
 parking_lot = "0.12"
 
+# Zip archive creation (for /download/client endpoint)
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
 [build-dependencies]
 cc = "1"

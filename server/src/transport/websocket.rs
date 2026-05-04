@@ -38,6 +38,8 @@ pub struct AppState {
     runtime: ServerRuntimeConfig,
     clipboard_set_tx: Option<std::sync::mpsc::SyncSender<String>>,
     pub shared_dir: Option<PathBuf>,
+    /// Path to the Windows client binary served at /download/client.
+    pub client_bin: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -128,6 +130,7 @@ pub async fn start_server(
     metadata: ServerMetadata,
     runtime: ServerRuntimeConfig,
     shared_dir: Option<PathBuf>,
+    client_bin: Option<PathBuf>,
 ) -> anyhow::Result<(FrameSender, InputReceiver, KeyframeCache)> {
     let (frame_tx, _) = broadcast::channel::<Vec<u8>>(2);
     let (input_tx, input_rx) = mpsc::channel::<ClientEvent>(1024);
@@ -154,6 +157,7 @@ pub async fn start_server(
         runtime,
         clipboard_set_tx,
         shared_dir: shared_dir.clone(),
+        client_bin,
     });
 
     let mut app = Router::new()
@@ -167,9 +171,12 @@ pub async fn start_server(
         app = app
             .route("/files", get(crate::files::list_handler))
             .route("/files/", get(crate::files::list_handler))
-            .route("/files/{name}", get(crate::files::download_handler))
-            .route("/files/upload", post(crate::files::upload_handler));
+            .route("/files/list", get(crate::files::list_json_handler))
+            .route("/files/upload", post(crate::files::upload_handler))
+            .route("/files/{name}", get(crate::files::download_handler));
     }
+
+    app = app.route("/download/client", get(crate::files::client_download_handler));
 
     let app = app
         .with_state(state)
@@ -503,6 +510,10 @@ fn normalize_input_events(
         ClientEvent::ClipboardData { .. } => {
             // Intercepted in the recv_task before reaching normalization.
             vec![]
+        }
+        ClientEvent::RequestKeyframe => {
+            // Passed through directly to the input handler which sets the force_keyframe flag.
+            vec![ClientEvent::RequestKeyframe]
         }
     }
 }

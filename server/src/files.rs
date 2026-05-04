@@ -1,6 +1,7 @@
 //! HTTP file manager: list, download, and upload files from --shared-dir.
 
 use axum::{
+    Json,
     body::Body,
     extract::{Multipart, Path, State},
     http::{header, StatusCode},
@@ -135,6 +136,87 @@ pub async fn upload_handler(
         tracing::info!("[files] uploaded: {} ({} bytes)", name, data.len());
     }
     (StatusCode::OK, "OK")
+}
+
+/// JSON-serialisable file entry returned by `/files/list`.
+#[derive(serde::Serialize)]
+struct FileInfo {
+    name: String,
+    size: u64,
+}
+
+pub async fn list_json_handler(State(state): State<AppStateRef>) -> Response {
+    let dir = match &state.shared_dir {
+        Some(d) => d.clone(),
+        None => {
+            return (StatusCode::NOT_FOUND, Json(Vec::<FileInfo>::new())).into_response();
+        }
+    };
+
+    let mut entries = match tokio::fs::read_dir(&dir).await {
+        Ok(r) => r,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(Vec::<FileInfo>::new()),
+            )
+                .into_response();
+        }
+    };
+
+    let mut files: Vec<FileInfo> = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let meta = entry.metadata().await.ok();
+        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        files.push(FileInfo { name, size });
+    }
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+
+    (StatusCode::OK, Json(files)).into_response()
+}
+
+/// Serve the Windows client binary as a zip download at `/download/client`.
+pub async fn client_download_handler(State(state): State<AppStateRef>) -> Response {
+    let bin_path = match &state.client_bin {
+        Some(p) => p.clone(),
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    let exe_name = bin_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "ddisplay-client.exe".into());
+
+    let bytes = match tokio::fs::read(&bin_path).await {
+        Ok(b) => b,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    // Wrap the binary in a zip archive in memory.
+    let zip_bytes = tokio::task::spawn_blocking(move || {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        let opts = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file(&exe_name, opts)?;
+        std::io::Write::write_all(&mut zip, &bytes)?;
+        zip.finish()?;
+        Ok::<_, anyhow::Error>(buf.into_inner())
+    })
+    .await;
+
+    match zip_bytes {
+        Ok(Ok(data)) => Response::builder()
+            .header(header::CONTENT_TYPE, "application/zip")
+            .header(
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"ddisplay-client.zip\"",
+            )
+            .body(Body::from(data))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 fn human_bytes(b: u64) -> String {

@@ -1,3 +1,6 @@
 /target
 .claude/
 nvenc_test
+*.zip
+*.exe
+ddisplay-server

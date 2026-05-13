@@ -143,6 +143,8 @@ pub struct Av1Decoder {
     /// Opaque dav1d context pointer (never null after successful init).
     ctx: *mut c_void,
     rgba_buf: Vec<u8>,
+    /// Latest decoded frame from drain_pictures (returned by decode()).
+    last_frame: Option<DecodedFrame>,
     /// Total packets handed to dav1d_send_data.
     frames_in: u64,
     /// Total pictures pulled from dav1d_get_picture.
@@ -180,6 +182,7 @@ impl Av1Decoder {
             Ok(Self {
                 ctx,
                 rgba_buf: Vec::new(),
+                last_frame: None,
                 frames_in: 0,
                 frames_out: 0,
                 send_eagain: 0,
@@ -193,7 +196,6 @@ impl Av1Decoder {
 
     pub fn decode(&mut self, data: &[u8]) -> Result<Option<DecodedFrame>> {
         self.frames_in += 1;
-        // Verbose per-frame logging only for the first 5 frames; after that errors only.
         let verbose = self.frames_in <= 5;
 
         if data.is_empty() {
@@ -216,30 +218,49 @@ impl Av1Decoder {
             }
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
 
-            let send_rc = dav1d_send_data(self.ctx, &mut dav1d_data);
-            dav1d_data_unref(&mut dav1d_data);
-
-            match send_rc {
-                0 => {
-                    if verbose { eprintln!("[av1]   send_data OK"); }
-                }
-                DAV1D_EAGAIN => {
-                    self.send_eagain += 1;
-                    if verbose || self.send_eagain <= 3 {
-                        eprintln!("[av1]   send_data EAGAIN #{} (draining)", self.send_eagain);
+            // Feed data to dav1d. On EAGAIN the data was NOT consumed — we must
+            // drain pictures and retry until the data is fully consumed (sz == 0).
+            loop {
+                let send_rc = dav1d_send_data(self.ctx, &mut dav1d_data);
+                match send_rc {
+                    0 => {
+                        if verbose { eprintln!("[av1]   send_data OK"); }
+                        break;
                     }
-                }
-                rc => {
-                    self.decode_errors += 1;
-                    anyhow::bail!("dav1d_send_data error {} ({}) on frame #{}",
-                        rc, dav1d_strerror(rc), self.frames_in);
+                    DAV1D_EAGAIN => {
+                        self.send_eagain += 1;
+                        if verbose || self.send_eagain <= 3 {
+                            eprintln!("[av1]   send_data EAGAIN #{} (draining before retry)", self.send_eagain);
+                        }
+                        // Drain all available pictures so dav1d frees internal buffers.
+                        self.drain_pictures(verbose);
+                        // dav1d consumed part of the data; if sz == 0 we're done.
+                        if dav1d_data.sz == 0 { break; }
+                    }
+                    rc => {
+                        dav1d_data_unref(&mut dav1d_data);
+                        self.decode_errors += 1;
+                        anyhow::bail!("dav1d_send_data error {} ({}) on frame #{}",
+                            rc, dav1d_strerror(rc), self.frames_in);
+                    }
                 }
             }
 
-            let mut pic: Dav1dPicture = std::mem::zeroed();
-            let get_rc = dav1d_get_picture(self.ctx, &mut pic);
+            // Drain all available pictures after the send completes.
+            self.drain_pictures(verbose);
 
-            match get_rc {
+            // Return the latest decoded frame (we always keep the newest one).
+            let result = self.last_frame.take();
+            Ok(result)
+        }
+    }
+
+    /// Pull all available pictures from dav1d, keeping only the latest one.
+    unsafe fn drain_pictures(&mut self, verbose: bool) {
+        loop {
+            let mut pic: Dav1dPicture = std::mem::zeroed();
+            let rc = dav1d_get_picture(self.ctx, &mut pic);
+            match rc {
                 0 => {
                     let w = pic.p.w as usize;
                     let h = pic.p.h as usize;
@@ -251,7 +272,7 @@ impl Av1Decoder {
                     if w == 0 || h == 0 {
                         eprintln!("[av1]   WARNING: zero-size picture {}x{}", w, h);
                         dav1d_picture_unref(&mut pic);
-                        return Ok(None);
+                        continue;
                     }
 
                     let y_stride = pic.stride[0] as usize;
@@ -262,10 +283,9 @@ impl Av1Decoder {
                     let v_ptr = pic.data[2].map(|p| p.as_ptr() as *const u8);
 
                     if y_ptr.is_none() || u_ptr.is_none() || v_ptr.is_none() {
-                        eprintln!("[av1]   ERROR: null plane pointers Y={} U={} V={}",
-                            y_ptr.is_some(), u_ptr.is_some(), v_ptr.is_some());
+                        eprintln!("[av1]   ERROR: null plane pointers");
                         dav1d_picture_unref(&mut pic);
-                        return Ok(None);
+                        continue;
                     }
 
                     let y_data = std::slice::from_raw_parts(y_ptr.unwrap(), y_stride * h);
@@ -279,34 +299,32 @@ impl Av1Decoder {
                     self.frames_out += 1;
                     self.consecutive_errors = 0;
 
-                    // Stats every 300 frames (~5 s at 60 fps).
                     if self.frames_out % 300 == 0 {
                         eprintln!("[av1] stats: in={} out={} send_eagain={} get_eagain={} errors={}",
                             self.frames_in, self.frames_out,
                             self.send_eagain, self.get_eagain, self.decode_errors);
                     }
 
-                    Ok(Some(DecodedFrame { rgba: self.rgba_buf.clone(), width: w as u32, height: h as u32 }))
+                    self.last_frame = Some(DecodedFrame {
+                        rgba: self.rgba_buf.clone(),
+                        width: w as u32,
+                        height: h as u32,
+                    });
                 }
                 DAV1D_EAGAIN => {
                     self.get_eagain += 1;
                     self.consecutive_errors = 0;
-                    if verbose || self.get_eagain <= 3 {
-                        eprintln!("[av1]   get_picture EAGAIN #{} (need more input)", self.get_eagain);
-                    }
-                    Ok(None)
+                    break; // no more pictures available
                 }
-                rc => {
+                _ => {
                     self.decode_errors += 1;
                     self.consecutive_errors += 1;
                     eprintln!("[av1]   get_picture ERROR {} ({}) on frame #{}",
                         rc, dav1d_strerror(rc), self.frames_in);
 
-                    // After 3 consecutive errors the decoder is stuck (lost reference
-                    // frames). Tear down and reopen the context, then signal the caller
-                    // to request a keyframe from the server so recovery is immediate.
                     if self.consecutive_errors >= 3 {
-                        eprintln!("[av1] decoder stuck after {} consecutive errors — reinitialising", self.consecutive_errors);
+                        eprintln!("[av1] decoder stuck after {} consecutive errors — reinitialising",
+                            self.consecutive_errors);
                         dav1d_close(&mut self.ctx);
 
                         let mut settings: Dav1dSettings = std::mem::zeroed();
@@ -323,7 +341,7 @@ impl Av1Decoder {
                             eprintln!("[av1] FATAL: failed to reopen dav1d after reset: {}", rc2);
                         }
                     }
-                    Ok(None)
+                    break; // stop draining on error
                 }
             }
         }

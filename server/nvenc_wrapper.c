@@ -10,7 +10,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <dlfcn.h>
-#include "/tmp/nv-codec-headers/include/ffnvcodec/nvEncodeAPI.h"
+#include "nvEncodeAPI.h"
 
 /* ---- CUDA driver API types (loaded via dlopen) ---- */
 typedef int CUresult;
@@ -270,17 +270,44 @@ void nvenc_destroy(nvenc_ctx_t *ctx) {
     free(ctx);
 }
 
-/* Probe: returns bitmask of supported codecs. bit 0 = H.264, bit 1 = AV1 */
+/* Probe: returns bitmask of supported codecs. bit 0 = H.264, bit 1 = AV1.
+ * For each codec, creates an encoder AND test-encodes a blank frame to
+ * verify the hardware can actually produce valid output (some drivers
+ * accept AV1 session creation on GPUs without a hardware AV1 encoder). */
 int nvenc_probe_codecs(void) {
     int result = 0;
 
-    /* Try H.264 */
+    /* Try H.264 — create + test encode */
     nvenc_ctx_t *ctx = nvenc_create(256, 256, 30, 2000000, DDISPLAY_CODEC_H264);
-    if (ctx) { result |= 1; nvenc_destroy(ctx); }
+    if (ctx) {
+        uint32_t nv12_sz = 256 * 256 + 256 * 128; /* Y + UV */
+        uint8_t *nv12 = (uint8_t*)calloc(1, nv12_sz);
+        if (nv12) {
+            nvenc_frame_t out = {0};
+            if (nvenc_encode(ctx, nv12, 1, &out) == 0 && out.size > 0) {
+                nvenc_unlock_bitstream(ctx);
+                result |= 1;
+            }
+            free(nv12);
+        }
+        nvenc_destroy(ctx);
+    }
 
-    /* Try AV1 */
+    /* Try AV1 — create + test encode */
     ctx = nvenc_create(256, 256, 30, 2000000, DDISPLAY_CODEC_AV1);
-    if (ctx) { result |= 2; nvenc_destroy(ctx); }
+    if (ctx) {
+        uint32_t nv12_sz = 256 * 256 + 256 * 128;
+        uint8_t *nv12 = (uint8_t*)calloc(1, nv12_sz);
+        if (nv12) {
+            nvenc_frame_t out = {0};
+            if (nvenc_encode(ctx, nv12, 1, &out) == 0 && out.size > 0) {
+                nvenc_unlock_bitstream(ctx);
+                result |= 2;
+            }
+            free(nv12);
+        }
+        nvenc_destroy(ctx);
+    }
 
     return result;
 }

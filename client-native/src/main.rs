@@ -172,11 +172,14 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        // Pass ALL events to egui before our own handling
+        // Only let egui consume events while the overlay is actually visible.
+        // Otherwise stale egui focus/capture state can swallow remote input.
         if let (Some(overlay), Some(window)) = (&mut self.overlay, &self.window) {
-            let resp = overlay.winit_state.on_window_event(window, &event);
-            if resp.consumed {
-                return;
+            if overlay.visible {
+                let resp = overlay.winit_state.on_window_event(window, &event);
+                if resp.consumed {
+                    return;
+                }
             }
         }
 

@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# BGRA -> YUV/NV12 color conversion (scalar/NEON/AVX2), split out so it can
+# be cross-compiled and tested standalone (e.g. x86_64 under qemu)
+ddisplay-color = { path = "color" }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
@@ -43,6 +47,13 @@ libc = "0.2"
 
 # Shared state
 parking_lot = "0.12"
+
+# Wayland backend: Mutter ScreenCast/RemoteDesktop D-Bus session
+zbus = "5"
+
+# Wayland backend: PipeWire video stream consumption
+# (build deps provisioned via nix — see .nix-deps/ and .cargo/config.toml [env])
+pipewire = "0.8"
 
 # Zip archive creation (for /download/client endpoint)
 zip = { version = "2", default-features = false, features = ["deflate"] }

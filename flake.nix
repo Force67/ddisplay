@@ -39,6 +39,12 @@
 
           # C compiler for nvenc_wrapper.c (cc crate)
           gcc
+
+          # Wayland backend: PipeWire capture (pipewire-rs)
+          pipewire
+
+          # bindgen (used by pipewire-sys) needs libclang
+          llvmPackages.libclang
         ];
 
         # ---- Client-native dependencies ----
@@ -92,6 +98,9 @@
 
             # Tell the server's build.rs where NVENC headers live
             export NVENC_HEADER_PATH="${pkgs.nv-codec-headers-12}/include/ffnvcodec"
+
+            # bindgen (pipewire-sys) needs libclang
+            export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
           '';
         };
       }

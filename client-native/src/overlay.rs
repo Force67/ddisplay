@@ -83,6 +83,7 @@ impl OverlayState {
         server: &str,
         codec: &str,
         fps: u32,
+        rtt_ms: f32,
         window: &winit::window::Window,
         files: Option<&mut FileTransferState>,
     ) -> (Option<EguiRenderData>, OverlayAction) {
@@ -120,7 +121,11 @@ impl OverlayState {
                         ui.add_space(8.0);
 
                         ui.label(format!("Server: {server}"));
-                        ui.label(format!("Codec: {codec}  |  FPS: {fps}"));
+                        if rtt_ms > 0.0 {
+                            ui.label(format!("Codec: {codec}  |  FPS: {fps}  |  RTT: {rtt_ms:.0} ms"));
+                        } else {
+                            ui.label(format!("Codec: {codec}  |  FPS: {fps}"));
+                        }
                         ui.add_space(12.0);
 
                         ui.label("Display mode:");

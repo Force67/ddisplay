@@ -5,7 +5,10 @@
 /// Server -> Client:
 ///   0x01 VideoFrame: [keyframe: u8] [pts: u64 LE] [width: u16 LE] [height: u16 LE] [data...]
 ///   0x02 CursorUpdate: [x: u16 LE] [y: u16 LE] [visible: u8]
+///   0x03 SessionInfo: JSON {codec, width, height, fps, bitrate}
+///        (sent on connect AND mid-stream whenever codec/resolution changes)
 ///   0x20 ClipboardData: [utf8 text...]   (bidirectional)
+///   0x24 Ping echo: [u64 LE timestamp]   (server echoes our ping verbatim)
 ///
 /// Client -> Server:
 ///   0x10 MouseMove: [x: u16 LE] [y: u16 LE]
@@ -18,6 +21,10 @@
 ///   0x17 ReleaseMouse
 ///   0x18 ReleaseAll
 ///   0x20 ClipboardData: [utf8 text...]   (bidirectional)
+///   0x21 RequestKeyframe: (no payload)
+///   0x22 ClientCaps: JSON {codecs, width, height}
+///   0x23 ClientStats: JSON {received, dropped, decode_ms, rtt_ms}
+///   0x24 Ping: [u64 LE timestamp]
 
 // Server message types
 pub const MSG_VIDEO_FRAME: u8 = 0x01;
@@ -35,6 +42,12 @@ pub const MSG_RELEASE_MOUSE: u8 = 0x17;
 pub const MSG_RELEASE_ALL: u8 = 0x18;
 pub const MSG_CLIPBOARD_DATA: u8 = 0x20;
 pub const MSG_REQUEST_KEYFRAME: u8 = 0x21;
+/// JSON {codecs, width, height} — decoder capabilities + native resolution.
+pub const MSG_CLIENT_CAPS: u8 = 0x22;
+/// JSON {received, dropped, decode_ms, rtt_ms} — periodic feedback for ABR.
+pub const MSG_CLIENT_STATS: u8 = 0x23;
+/// [u64 LE timestamp] — echoed back verbatim by the server (RTT probe).
+pub const MSG_PING: u8 = 0x24;
 
 /// Parsed video frame from the server.
 pub struct VideoFrame<'a> {
@@ -60,6 +73,8 @@ pub enum ServerMessage<'a> {
     CursorUpdate(CursorUpdate),
     SessionInfo(&'a [u8]),
     ClipboardData(String),
+    /// Echo of our MSG_PING — payload is the timestamp we sent.
+    Pong(u64),
     Unknown(u8),
 }
 
@@ -93,6 +108,10 @@ pub fn parse_server_message(data: &[u8]) -> Option<ServerMessage<'_>> {
         MSG_CLIPBOARD_DATA => {
             let text = String::from_utf8_lossy(data.get(1..).unwrap_or_default()).into_owned();
             Some(ServerMessage::ClipboardData(text))
+        }
+        MSG_PING if data.len() >= 9 => {
+            let ts = u64::from_le_bytes(data[1..9].try_into().ok()?);
+            Some(ServerMessage::Pong(ts))
         }
         other => Some(ServerMessage::Unknown(other)),
     }
@@ -160,4 +179,41 @@ pub fn encode_clipboard_data(text: &str) -> Vec<u8> {
 
 pub fn encode_request_keyframe() -> Vec<u8> {
     vec![MSG_REQUEST_KEYFRAME]
+}
+
+/// Capabilities + native resolution, sent once per connection.
+pub fn encode_client_caps(codecs: &[&str], width: u32, height: u32) -> Vec<u8> {
+    let json = serde_json::json!({
+        "codecs": codecs,
+        "width": width,
+        "height": height,
+    });
+    let payload = serde_json::to_vec(&json).unwrap();
+    let mut buf = Vec::with_capacity(1 + payload.len());
+    buf.push(MSG_CLIENT_CAPS);
+    buf.extend_from_slice(&payload);
+    buf
+}
+
+/// Periodic feedback used by the server's adaptive bitrate controller.
+pub fn encode_client_stats(received: u32, dropped: u32, decode_ms: f32, rtt_ms: f32) -> Vec<u8> {
+    let json = serde_json::json!({
+        "received": received,
+        "dropped": dropped,
+        "decode_ms": decode_ms,
+        "rtt_ms": rtt_ms,
+    });
+    let payload = serde_json::to_vec(&json).unwrap();
+    let mut buf = Vec::with_capacity(1 + payload.len());
+    buf.push(MSG_CLIENT_STATS);
+    buf.extend_from_slice(&payload);
+    buf
+}
+
+/// RTT probe — the server echoes this message back unchanged.
+pub fn encode_ping(timestamp_ms: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(9);
+    buf.push(MSG_PING);
+    buf.extend_from_slice(&timestamp_ms.to_le_bytes());
+    buf
 }

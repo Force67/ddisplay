@@ -27,7 +27,16 @@ unsafe extern "C" {
         force_keyframe: i32,
         out: *mut NvencFrame,
     ) -> i32;
+    fn nvenc_encode_bgra(
+        ctx: *mut c_void,
+        bgra: *const u8,
+        src_stride: u32,
+        force_keyframe: i32,
+        out: *mut NvencFrame,
+    ) -> i32;
+    fn nvenc_has_gpu_convert(ctx: *mut c_void) -> i32;
     fn nvenc_unlock_bitstream(ctx: *mut c_void);
+    fn nvenc_set_bitrate(ctx: *mut c_void, bitrate: u32) -> i32;
     fn nvenc_destroy(ctx: *mut c_void);
 }
 
@@ -58,8 +67,12 @@ pub struct NvencEncoder {
     width: u32,
     height: u32,
     codec: u32,
+    /// CPU-side NV12 staging — only allocated when the GPU conversion path
+    /// is unavailable (lazy, see encode()).
     nv12_buf: Vec<u8>,
     y_len: usize,
+    /// True while the CUDA BGRA->NV12 fast path is usable.
+    gpu_convert: bool,
 }
 
 unsafe impl Send for NvencEncoder {}
@@ -74,15 +87,15 @@ impl NvencEncoder {
         }
 
         let y_len = (width as usize) * (height as usize);
-        let uv_len = (width as usize) * (height as usize / 2);
-        let nv12_buf = vec![0u8; y_len + uv_len];
+        let gpu_convert = unsafe { nvenc_has_gpu_convert(ctx) } != 0;
 
         tracing::info!(
-            "NVENC encoder initialized: {}x{} @ {} fps, {} bps ({} P1 ultra-low-latency)",
+            "NVENC encoder initialized: {}x{} @ {} fps, {} bps ({} P1 ultra-low-latency, {} color conversion)",
             width, height, fps, bitrate, codec_name,
+            if gpu_convert { "GPU" } else { "CPU" },
         );
 
-        Ok(Self { ctx, width, height, codec, nv12_buf, y_len })
+        Ok(Self { ctx, width, height, codec, nv12_buf: Vec::new(), y_len, gpu_convert })
     }
 
     pub fn codec_name(&self) -> &'static str {
@@ -109,9 +122,6 @@ impl EncoderTrait for NvencEncoder {
         let w = width as usize;
         let h = height as usize;
 
-        let (y_plane, uv_plane) = self.nv12_buf.split_at_mut(self.y_len);
-        color::bgra_to_nv12_pitched(frame_data, w, h, stride as usize, w, y_plane, uv_plane);
-
         let mut frame = NvencFrame {
             data: ptr::null(),
             size: 0,
@@ -119,12 +129,35 @@ impl EncoderTrait for NvencEncoder {
             pts: 0,
         };
 
-        let rc = unsafe {
-            nvenc_encode(self.ctx, self.nv12_buf.as_ptr(), force_keyframe as i32, &mut frame)
-        };
+        // Fast path: upload raw BGRA, convert with the CUDA kernel, encode
+        // from device memory — zero CPU pixel work.
+        if self.gpu_convert {
+            let rc = unsafe {
+                nvenc_encode_bgra(self.ctx, frame_data.as_ptr(), stride, force_keyframe as i32, &mut frame)
+            };
+            if rc != 0 {
+                tracing::warn!(
+                    "NVENC GPU conversion path failed ({}); falling back to CPU conversion",
+                    rc,
+                );
+                self.gpu_convert = false;
+            }
+        }
 
-        if rc != 0 {
-            bail!("NVENC encode failed with code {}", rc);
+        if !self.gpu_convert {
+            if self.nv12_buf.is_empty() {
+                let uv_len = w * (h / 2);
+                self.nv12_buf = vec![0u8; self.y_len + uv_len];
+            }
+            let (y_plane, uv_plane) = self.nv12_buf.split_at_mut(self.y_len);
+            color::bgra_to_nv12_pitched(frame_data, w, h, stride as usize, w, y_plane, uv_plane);
+
+            let rc = unsafe {
+                nvenc_encode(self.ctx, self.nv12_buf.as_ptr(), force_keyframe as i32, &mut frame)
+            };
+            if rc != 0 {
+                bail!("NVENC encode failed with code {}", rc);
+            }
         }
 
         let data = unsafe { std::slice::from_raw_parts(frame.data, frame.size as usize) }.to_vec();
@@ -138,6 +171,17 @@ impl EncoderTrait for NvencEncoder {
 
     fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
         Ok(Vec::new())
+    }
+
+    fn set_bitrate(&mut self, bitrate: u32) -> bool {
+        let rc = unsafe { nvenc_set_bitrate(self.ctx, bitrate) };
+        if rc == 0 {
+            tracing::info!("NVENC bitrate reconfigured to {} bps (live)", bitrate);
+            true
+        } else {
+            tracing::warn!("NVENC bitrate reconfigure failed ({})", rc);
+            false
+        }
     }
 }
 

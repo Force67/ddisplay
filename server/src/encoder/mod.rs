@@ -1,4 +1,4 @@
-pub mod color;
+pub use ddisplay_color as color;
 pub mod nvenc_enc;
 pub mod openh264_enc;
 
@@ -20,4 +20,11 @@ pub trait Encoder: Send {
 
     /// Flush the encoder and get any remaining packets.
     fn flush(&mut self) -> anyhow::Result<Vec<EncodedPacket>>;
+
+    /// Change the target bitrate without restarting the stream.
+    /// Returns false if the encoder cannot do this live (caller should
+    /// rebuild the encoder instead).
+    fn set_bitrate(&mut self, _bitrate: u32) -> bool {
+        false
+    }
 }

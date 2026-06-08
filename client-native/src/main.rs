@@ -100,6 +100,21 @@ struct App {
     overlay: Option<OverlayState>,
     /// File transfer state (HTTP, talks to server's /files/* endpoints).
     files_state: Option<files::FileTransferState>,
+    /// Frames received since the last stats report.
+    stats_received: u32,
+    /// Frames dropped (decode backlog) since the last stats report.
+    stats_dropped: u32,
+    /// When the last stats report + RTT probe was sent.
+    last_stats_sent: std::time::Instant,
+    /// Monotonic base for ping timestamps.
+    app_start: std::time::Instant,
+    /// Last measured round-trip time in ms (0 until first pong).
+    last_rtt_ms: f32,
+    /// Average decode time per frame in µs, written by the decode thread.
+    decode_us: Arc<std::sync::atomic::AtomicU32>,
+    /// After a decode-queue overflow the stream is corrupt until the next
+    /// keyframe — skip inter-frames instead of feeding garbage to the decoder.
+    skip_until_keyframe: bool,
 }
 
 impl ApplicationHandler for App {
@@ -260,7 +275,7 @@ impl ApplicationHandler for App {
                         input.set_remote_size(frame.width, frame.height);
                     }
                     if let Some(renderer) = &mut self.renderer {
-                        renderer.upload_frame(&frame.rgba, frame.width, frame.height);
+                        renderer.upload_frame(&frame);
                     }
                 }
 
@@ -272,7 +287,9 @@ impl ApplicationHandler for App {
                     let server = &self.args.server;
                     let codec = &self.codec;
                     let fps = self.session_fps;
-                    let (egui_data, act) = overlay.run_ui(server, codec, fps, window, Some(files));
+                    let rtt = self.last_rtt_ms;
+                    let (egui_data, act) =
+                        overlay.run_ui(server, codec, fps, rtt, window, Some(files));
                     if let Some(renderer) = &mut self.renderer {
                         renderer.set_display_mode(overlay.display_mode);
                     }
@@ -281,7 +298,8 @@ impl ApplicationHandler for App {
                     let server = &self.args.server;
                     let codec = &self.codec;
                     let fps = self.session_fps;
-                    let (egui_data, act) = overlay.run_ui(server, codec, fps, window, None);
+                    let rtt = self.last_rtt_ms;
+                    let (egui_data, act) = overlay.run_ui(server, codec, fps, rtt, window, None);
                     if let Some(renderer) = &mut self.renderer {
                         renderer.set_display_mode(overlay.display_mode);
                     }
@@ -335,6 +353,26 @@ impl ApplicationHandler for App {
             }
         }
 
+        // Once per second: RTT probe + stats report (feeds the server's
+        // adaptive bitrate controller).
+        if self.last_stats_sent.elapsed() >= std::time::Duration::from_secs(1) {
+            self.last_stats_sent = std::time::Instant::now();
+            if let Some(input) = &self.input_state {
+                let now_ms = self.app_start.elapsed().as_millis() as u64;
+                input.send_raw(protocol::encode_ping(now_ms));
+                let decode_ms =
+                    self.decode_us.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0;
+                input.send_raw(protocol::encode_client_stats(
+                    self.stats_received,
+                    self.stats_dropped,
+                    decode_ms,
+                    self.last_rtt_ms,
+                ));
+            }
+            self.stats_received = 0;
+            self.stats_dropped = 0;
+        }
+
         if !self.window_visible {
             return;
         }
@@ -374,6 +412,26 @@ impl App {
                     tracing::info!("Connected to server");
                     if let Some(input) = &self.input_state {
                         input.send_client_ready();
+
+                        // Report decoder capabilities + native monitor resolution.
+                        // The server uses this for codec arbitration (e.g. falls
+                        // back from AV1 to H.264) and --resize-to-client.
+                        let codecs: Vec<&str> = match self.args.force_codec.as_deref() {
+                            Some("av1") => vec!["av1"],
+                            Some(_) => vec!["h264"],
+                            None => vec!["av1", "h264"],
+                        };
+                        let (mon_w, mon_h) = self
+                            .window
+                            .as_ref()
+                            .and_then(|w| w.current_monitor())
+                            .map(|m| (m.size().width, m.size().height))
+                            .unwrap_or((0, 0));
+                        eprintln!(
+                            "[caps] reporting codecs={:?} native={}x{}",
+                            codecs, mon_w, mon_h,
+                        );
+                        input.send_raw(protocol::encode_client_caps(&codecs, mon_w, mon_h));
                     }
                     // Auto-upload --share-dir contents to the server's shared folder.
                     if let (Some(dir), Some(files)) =
@@ -401,6 +459,7 @@ impl App {
         match msg {
             ServerMessage::VideoFrame(frame) => {
                 self.frame_count += 1;
+                self.stats_received += 1;
 
                 // Log first 5 frames + occasional status; suppress per-frame spam after priming.
                 if self.frame_count <= 5 || self.frame_count % 300 == 0 {
@@ -413,15 +472,34 @@ impl App {
                 // Push to the background decode thread (non-blocking).
                 // Skip when the window is hidden — no point decoding frames nobody sees.
                 if self.window_visible {
+                    // After a dropped frame the bitstream is broken until the next
+                    // keyframe — discard inter-frames instead of decoding garbage.
+                    if self.skip_until_keyframe && !frame.keyframe {
+                        self.stats_dropped += 1;
+                        return;
+                    }
                     if let Some(tx) = &self.decode_tx {
                         let job = DecodeJob {
                             data: frame.data.to_vec(),
                             keyframe: frame.keyframe,
                         };
-                        if tx.try_send(job).is_err() {
-                            // Decode thread is behind — drop this frame.
-                            if self.frame_count <= 10 {
-                                eprintln!("[frame #{}] decode channel full, dropped", self.frame_count);
+                        match tx.try_send(job) {
+                            Ok(()) => {
+                                self.skip_until_keyframe = false;
+                            }
+                            Err(_) => {
+                                // Decode thread is behind — drop, resync on next IDR.
+                                self.stats_dropped += 1;
+                                if !self.skip_until_keyframe {
+                                    self.skip_until_keyframe = true;
+                                    eprintln!(
+                                        "[frame #{}] decode backlog — dropping until next keyframe",
+                                        self.frame_count,
+                                    );
+                                    if let Some(input) = &self.input_state {
+                                        input.send_keyframe_request();
+                                    }
+                                }
                             }
                         }
                     }
@@ -457,6 +535,12 @@ impl App {
             ServerMessage::CursorUpdate(_cursor) => {
                 // TODO: render remote cursor overlay
             }
+            ServerMessage::Pong(sent_ms) => {
+                let now_ms = self.app_start.elapsed().as_millis() as u64;
+                if now_ms >= sent_ms {
+                    self.last_rtt_ms = (now_ms - sent_ms) as f32;
+                }
+            }
             ServerMessage::ClipboardData(text) => {
                 clipboard::set_clipboard(&text, &self.clipboard_last_set);
             }
@@ -478,6 +562,7 @@ impl App {
         let slot = self.frame_slot.clone();
         let frame_ready = self.frame_ready.clone();
         let needs_keyframe = self.needs_keyframe.clone();
+        let decode_us = self.decode_us.clone();
         let codec_str = codec.to_string();
 
         std::thread::Builder::new()
@@ -491,20 +576,23 @@ impl App {
                         return;
                     }
                 };
-                // After a decoder reset we must skip non-keyframes — a fresh
-                // dav1d context cannot parse inter-frames without a prior
-                // sequence header + keyframe.
-                let mut awaiting_keyframe = false;
+                // A fresh decoder cannot parse inter-frames without a prior
+                // sequence header + keyframe; the same applies after a
+                // decoder self-reset.
+                let mut awaiting_keyframe = true;
+                // Exponential moving average of decode time, in µs.
+                let mut decode_ema_us: f32 = 0.0;
 
                 while let Ok(job) = rx.recv() {
                     if awaiting_keyframe && !job.keyframe {
                         continue; // discard until a keyframe arrives
                     }
                     if awaiting_keyframe && job.keyframe {
-                        eprintln!("[decode] got keyframe after reset — resuming");
+                        eprintln!("[decode] got keyframe — starting/resuming");
                         awaiting_keyframe = false;
                     }
 
+                    let t0 = std::time::Instant::now();
                     match dec.decode(&job.data) {
                         Ok(Some(frame)) => {
                             *slot.lock().unwrap() = Some(frame);
@@ -513,6 +601,10 @@ impl App {
                         Ok(None) => {}
                         Err(e) => eprintln!("[decode] error: {}", e),
                     }
+                    let us = t0.elapsed().as_micros() as f32;
+                    decode_ema_us = if decode_ema_us == 0.0 { us } else { decode_ema_us * 0.9 + us * 0.1 };
+                    decode_us.store(decode_ema_us as u32, std::sync::atomic::Ordering::Relaxed);
+
                     if dec.take_needs_keyframe() {
                         awaiting_keyframe = true;
                         needs_keyframe.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -563,6 +655,13 @@ fn main() {
         needs_keyframe: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         overlay: None,
         files_state: None,
+        stats_received: 0,
+        stats_dropped: 0,
+        last_stats_sent: std::time::Instant::now(),
+        app_start: std::time::Instant::now(),
+        last_rtt_ms: 0.0,
+        decode_us: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        skip_until_keyframe: false,
     };
 
     if let Err(e) = event_loop.run_app(&mut app) {

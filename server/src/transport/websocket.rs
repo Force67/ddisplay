@@ -13,14 +13,16 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tower_http::services::ServeDir;
 use tokio::sync::{broadcast, mpsc};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use parking_lot::Mutex;
-use crate::protocol::{self, ClientEvent};
+use crate::control::StreamControl;
+use crate::protocol::{self, ClientCaps, ClientEvent};
 
 /// Broadcast sender for encoded frames (server -> all clients).
 pub type FrameSender = broadcast::Sender<Vec<u8>>;
@@ -40,6 +42,43 @@ pub struct AppState {
     pub shared_dir: Option<PathBuf>,
     /// Path to the Windows client binary served at /download/client.
     pub client_bin: Option<PathBuf>,
+    /// Shared control plane with the capture/encode loop.
+    control: Arc<StreamControl>,
+    /// Codecs this server can encode, in preference order.
+    server_codecs: Vec<String>,
+    /// Resize the X display to a connecting client's native resolution.
+    resize_to_client: bool,
+    /// Capabilities reported by currently connected clients, by connection id.
+    client_caps: Mutex<HashMap<u64, ClientCaps>>,
+    next_conn_id: AtomicU64,
+}
+
+impl AppState {
+    /// Pick the best codec every caps-reporting client can decode and request
+    /// a switch when it differs from the live stream. Clients that never sent
+    /// caps (e.g. the web client) don't constrain the choice.
+    fn arbitrate_codec(&self) {
+        let caps = self.client_caps.lock();
+        let chosen = self
+            .server_codecs
+            .iter()
+            .find(|codec| {
+                caps.values()
+                    .all(|c| c.codecs.is_empty() || c.codecs.iter().any(|cc| cc == *codec))
+            })
+            .cloned();
+        drop(caps);
+
+        let Some(chosen) = chosen else {
+            tracing::warn!("[codec] no codec supported by all clients; keeping current");
+            return;
+        };
+        let current = self.control.session.lock().codec.clone();
+        if chosen != current {
+            tracing::info!("[codec] arbitration: {} -> {}", current, chosen);
+            *self.control.desired_codec.lock() = Some(chosen);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -47,18 +86,22 @@ struct ConnectionInputState {
     pressed_keys: HashSet<u32>,
     pressed_buttons: HashSet<u8>,
     last_pointer: (u16, u16),
+    /// Last time we saw a keydown for each held key (refreshed by OS auto-repeat).
+    /// Used by the stuck-key watchdog to distinguish a genuinely held key (refreshed
+    /// every repeat interval) from one stranded by client focus loss (never refreshed).
+    key_last_seen: HashMap<u32, Instant>,
 }
+
+/// Release a held key whose last keydown is older than this. The client's OS
+/// auto-repeat refreshes held keys roughly every 30ms, so a key untouched this
+/// long is stuck (e.g. the client lost focus without sending the release).
+const STUCK_KEY_TIMEOUT: Duration = Duration::from_millis(1500);
 
 #[derive(Clone)]
 pub struct ServerMetadata {
     pub session_name: String,
     pub display: String,
     pub xauthority: String,
-    pub width: u32,
-    pub height: u32,
-    pub fps: u32,
-    pub bitrate: u32,
-    pub codec: String,
 }
 
 #[derive(Clone)]
@@ -131,6 +174,9 @@ pub async fn start_server(
     runtime: ServerRuntimeConfig,
     shared_dir: Option<PathBuf>,
     client_bin: Option<PathBuf>,
+    control: Arc<StreamControl>,
+    server_codecs: Vec<String>,
+    resize_to_client: bool,
 ) -> anyhow::Result<(FrameSender, InputReceiver, KeyframeCache)> {
     let (frame_tx, _) = broadcast::channel::<Vec<u8>>(2);
     let (input_tx, input_rx) = mpsc::channel::<ClientEvent>(1024);
@@ -158,6 +204,22 @@ pub async fn start_server(
         clipboard_set_tx,
         shared_dir: shared_dir.clone(),
         client_bin,
+        control: control.clone(),
+        server_codecs,
+        resize_to_client,
+        client_caps: Mutex::new(HashMap::new()),
+        next_conn_id: AtomicU64::new(1),
+    });
+
+    // Adaptive bitrate recovery: ramp the target back towards the ceiling
+    // once the link has been congestion-free for a while.
+    let abr_control = control;
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(3));
+        loop {
+            ticker.tick().await;
+            abr_control.maybe_recover_bitrate();
+        }
     });
 
     let mut app = Router::new()
@@ -207,19 +269,18 @@ async fn ws_upgrade_handler(
 /// Manage the lifetime of a single WebSocket client.
 async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: bool) {
     let peer = "client"; // axum 0.8 doesn't expose peer addr on the ws directly
-    tracing::info!("{}: WebSocket connected (readonly={})", peer, readonly);
+    let conn_id = state.next_conn_id.fetch_add(1, Ordering::Relaxed);
+    tracing::info!("{}#{}: WebSocket connected (readonly={})", peer, conn_id, readonly);
     update_client_counts(&state, readonly, true);
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
     let input_state = Arc::new(Mutex::new(ConnectionInputState::default()));
 
-    // Send session info (codec, resolution, etc.) so client can configure decoder.
-    let session_info = protocol::encode_session_info(&protocol::SessionInfo {
-        width: state.metadata.width,
-        height: state.metadata.height,
-        fps: state.metadata.fps,
-        codec: state.metadata.codec.clone(),
-    });
+    // Per-client channel for direct (non-broadcast) replies, e.g. pong echoes.
+    let (direct_tx, mut direct_rx) = mpsc::channel::<Vec<u8>>(32);
+
+    // Send live session info (codec, resolution, etc.) so client can configure decoder.
+    let session_info = protocol::encode_session_info(&state.control.session.lock().clone());
     if ws_sender.send(Message::Binary(session_info.into())).await.is_err() {
         return;
     }
@@ -239,24 +300,46 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
     let recv_input_tx = input_tx.clone();
     let recv_input_state = input_state.clone();
     let clipboard_set_tx = state.clipboard_set_tx.clone();
+    let send_control = state.control.clone();
+    let recv_state = state.clone();
 
-    // Task: broadcast frames -> this WebSocket client
+    // Task: broadcast frames (+ direct replies) -> this WebSocket client
     let mut send_task = tokio::spawn(async move {
         loop {
-            match frame_rx.recv().await {
-                Ok(data) => {
-                    if ws_sender.send(Message::Binary(data.into())).await.is_err() {
-                        // Client disconnected
-                        break;
+            tokio::select! {
+                // Direct replies first — tiny and latency-sensitive (RTT probes).
+                biased;
+
+                direct = direct_rx.recv() => {
+                    match direct {
+                        Some(data) => {
+                            if ws_sender.send(Message::Binary(data.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    tracing::warn!("{}: dropped {} frames (slow client)", peer, n);
-                    // Continue – the receiver automatically advances past the gap.
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    // Server is shutting down.
-                    break;
+
+                frame = frame_rx.recv() => {
+                    match frame {
+                        Ok(data) => {
+                            if ws_sender.send(Message::Binary(data.into())).await.is_err() {
+                                // Client disconnected
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            tracing::warn!("{}: dropped {} frames (slow client)", peer, n);
+                            // The receiver automatically advances past the gap; tell the
+                            // ABR controller this link can't keep up at the current rate.
+                            send_control.record_congestion();
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            // Server is shutting down.
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -267,22 +350,60 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
         while let Some(Ok(msg)) = ws_receiver.next().await {
             match msg {
                 Message::Binary(data) => {
-                    if readonly {
+                    let Some(event) = protocol::parse_client_message(&data) else {
                         continue;
-                    }
-                    if let Some(event) = protocol::parse_client_message(&data) {
+                    };
+                    // Control-plane messages are handled here for every client
+                    // (including readonly viewers — they still decode video).
+                    match event {
+                        ClientEvent::Ping { payload } => {
+                            // Echo verbatim; client measures RTT.
+                            let _ = direct_tx.try_send(payload);
+                        }
+                        ClientEvent::Caps(caps) => {
+                            tracing::info!(
+                                "{}#{}: caps: codecs={:?} native={}x{}",
+                                peer, conn_id, caps.codecs, caps.width, caps.height,
+                            );
+                            if recv_state.resize_to_client
+                                && !readonly
+                                && caps.width > 0
+                                && caps.height > 0
+                            {
+                                *recv_state.control.resize_request.lock() =
+                                    Some((caps.width, caps.height));
+                            }
+                            recv_state.client_caps.lock().insert(conn_id, caps);
+                            recv_state.arbitrate_codec();
+                        }
+                        ClientEvent::Stats(stats) => {
+                            if stats.dropped > 0 {
+                                tracing::debug!(
+                                    "{}#{}: client dropped {} frames (decode backlog)",
+                                    peer, conn_id, stats.dropped,
+                                );
+                                recv_state.control.record_congestion();
+                            }
+                        }
                         // Clipboard data is handled locally; never forwarded to the input injector.
-                        if let ClientEvent::ClipboardData { text } = event {
+                        ClientEvent::ClipboardData { text } => {
+                            if readonly {
+                                continue;
+                            }
                             if let Some(ref tx) = clipboard_set_tx {
                                 let _ = tx.try_send(text);
                             }
-                            continue;
                         }
-                        let forwarded_events = normalize_input_events(&recv_input_state, event);
-                        for forwarded_event in forwarded_events {
-                            tracing::debug!("Input event: {:?}", forwarded_event);
-                            if recv_input_tx.send(forwarded_event).await.is_err() {
-                                return;
+                        other => {
+                            if readonly {
+                                continue;
+                            }
+                            let forwarded_events = normalize_input_events(&recv_input_state, other);
+                            for forwarded_event in forwarded_events {
+                                tracing::debug!("Input event: {:?}", forwarded_event);
+                                if recv_input_tx.send(forwarded_event).await.is_err() {
+                                    return;
+                                }
                             }
                         }
                     }
@@ -296,7 +417,49 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
         }
     });
 
-    // When either task finishes the connection is done; cancel the other.
+    // Task: release keys that get stranded mid-connection. A wedged client can stop
+    // sending the keyup for a held key (e.g. on focus loss) while staying connected, so
+    // the per-connection cleanup on disconnect never fires. Genuinely held keys keep
+    // refreshing key_last_seen via OS auto-repeat; a stuck one goes stale and is released.
+    let watchdog_state = input_state.clone();
+    let watchdog_tx = input_tx.clone();
+    let mut watchdog_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(500));
+        loop {
+            ticker.tick().await;
+            let stale: Vec<u32> = {
+                let mut st = watchdog_state.lock();
+                let now = Instant::now();
+                let stale: Vec<u32> = st
+                    .key_last_seen
+                    .iter()
+                    .filter(|(_, seen)| now.duration_since(**seen) > STUCK_KEY_TIMEOUT)
+                    .map(|(kc, _)| *kc)
+                    .collect();
+                for kc in &stale {
+                    st.pressed_keys.remove(kc);
+                    st.key_last_seen.remove(kc);
+                }
+                stale
+            };
+            for keycode in stale {
+                tracing::warn!(
+                    "Key {} held with no refresh for >{}ms; releasing (stuck-key watchdog)",
+                    keycode,
+                    STUCK_KEY_TIMEOUT.as_millis(),
+                );
+                if watchdog_tx
+                    .send(ClientEvent::KeyEvent { keycode, pressed: false })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    });
+
+    // When either task finishes the connection is done; cancel the others.
     tokio::select! {
         _ = &mut send_task => {},
         _ = &mut recv_task => {},
@@ -307,26 +470,34 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
     // This keeps disconnected clients from leaving background websocket tasks around.
     send_task.abort();
     recv_task.abort();
+    watchdog_task.abort();
 
     if !readonly {
         cleanup_connection_input(&input_tx, &input_state).await;
     }
     update_client_counts(&state, readonly, false);
 
-    tracing::info!("WebSocket disconnected");
+    // Forget this client's caps and re-arbitrate — e.g. when the only
+    // H.264-limited client leaves, the server switches back to AV1.
+    if state.client_caps.lock().remove(&conn_id).is_some() {
+        state.arbitrate_codec();
+    }
+
+    tracing::info!("{}#{}: WebSocket disconnected", peer, conn_id);
 }
 
 async fn status_handler(State(state): State<Arc<AppState>>) -> Json<StatusResponse> {
+    let session = state.control.session.lock().clone();
     let status = state.status.lock();
     Json(StatusResponse {
         session_name: state.metadata.session_name.clone(),
         display: state.metadata.display.clone(),
         xauthority: state.metadata.xauthority.clone(),
-        width: state.metadata.width,
-        height: state.metadata.height,
-        fps: state.metadata.fps,
-        bitrate: state.metadata.bitrate,
-        codec: state.metadata.codec.clone(),
+        width: session.width,
+        height: session.height,
+        fps: session.fps,
+        bitrate: session.bitrate,
+        codec: session.codec,
         total_clients: status.total_clients,
         writable_clients: status.writable_clients,
         readonly_clients: status.readonly_clients,
@@ -478,17 +649,20 @@ fn normalize_input_events(
             if pressed {
                 let already_pressed = state.pressed_keys.contains(&keycode);
                 state.pressed_keys.insert(keycode);
+                state.key_last_seen.insert(keycode, Instant::now());
                 if already_pressed {
-                    tracing::warn!("Key {} was already pressed; injecting release+press to resync", keycode);
-                    vec![
-                        ClientEvent::KeyEvent { keycode, pressed: false },
-                        ClientEvent::KeyEvent { keycode, pressed: true },
-                    ]
+                    // OS auto-repeat: the key is already down in X, and Xvfb runs its
+                    // own key-repeat off the held key, so swallow the duplicate keydown
+                    // instead of re-injecting release+press. The old resync turned every
+                    // repeat into a full keystroke, which is what let a wedged client flood
+                    // the session (e.g. stuck modifiers tripping global shortcuts).
+                    vec![]
                 } else {
                     vec![ClientEvent::KeyEvent { keycode, pressed: true }]
                 }
             } else {
                 state.pressed_keys.remove(&keycode);
+                state.key_last_seen.remove(&keycode);
                 vec![ClientEvent::KeyEvent { keycode, pressed: false }]
             }
         }
@@ -496,6 +670,7 @@ fn normalize_input_events(
         ClientEvent::PasteText { text } => vec![ClientEvent::PasteText { text }],
         ClientEvent::ReleaseKeys => {
             state.pressed_keys.clear();
+            state.key_last_seen.clear();
             vec![ClientEvent::ReleaseKeys]
         }
         ClientEvent::ReleaseMouse => {
@@ -504,6 +679,7 @@ fn normalize_input_events(
         }
         ClientEvent::ReleaseAll => {
             state.pressed_keys.clear();
+            state.key_last_seen.clear();
             state.pressed_buttons.clear();
             vec![ClientEvent::ReleaseAll]
         }
@@ -514,6 +690,10 @@ fn normalize_input_events(
         ClientEvent::RequestKeyframe => {
             // Passed through directly to the input handler which sets the force_keyframe flag.
             vec![ClientEvent::RequestKeyframe]
+        }
+        ClientEvent::Caps(_) | ClientEvent::Stats(_) | ClientEvent::Ping { .. } => {
+            // Intercepted in the recv_task before reaching normalization.
+            vec![]
         }
     }
 }

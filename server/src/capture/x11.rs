@@ -241,6 +241,21 @@ impl X11Capturer {
         self.height as u32
     }
 
+    /// Query the X server for the root window's current size.
+    ///
+    /// Returns `Some((w, h))` when it differs from the size this capturer was
+    /// initialized with (e.g. after a RandR resize) — the caller should then
+    /// rebuild the capturer (and the encoder). One round-trip; intended to be
+    /// polled around once per second, not per frame.
+    pub fn screen_size_changed(&self) -> Option<(u32, u32)> {
+        let geom = xproto::get_geometry(&self.conn, self.root).ok()?.reply().ok()?;
+        if geom.width != self.width || geom.height != self.height {
+            Some((geom.width as u32, geom.height as u32))
+        } else {
+            None
+        }
+    }
+
     /// Poll for damage events and return whether the screen has changed.
     ///
     /// Call this before `capture_frame_ref()`. If it returns `false`, the
@@ -318,6 +333,42 @@ impl X11Capturer {
         }
 
         Ok(Some(overlay_window))
+    }
+}
+
+impl super::ScreenCapturer for X11Capturer {
+    fn width(&self) -> u32 {
+        self.screen_width()
+    }
+
+    fn height(&self) -> u32 {
+        self.screen_height()
+    }
+
+    fn has_new_frame(&mut self) -> bool {
+        self.has_damage()
+    }
+
+    fn frame_ref(&mut self) -> Result<CapturedFrameRef<'_>> {
+        self.capture_frame_ref()
+    }
+
+    fn cursor_info(&mut self) -> Result<CursorInfo> {
+        self.get_cursor_info()
+    }
+
+    fn size_changed(&mut self) -> Option<(u32, u32)> {
+        self.screen_size_changed()
+    }
+
+    fn reinit(&mut self) -> Result<()> {
+        // The SHM segment is sized for the old resolution — rebuild from scratch.
+        *self = X11Capturer::new()?;
+        Ok(())
+    }
+
+    fn embeds_cursor(&self) -> bool {
+        false
     }
 }
 

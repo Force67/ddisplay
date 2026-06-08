@@ -20,6 +20,10 @@
 ///   0x17 ReleaseMouse: (no payload)
 ///   0x18 ReleaseAll: (no payload)
 ///   0x20 ClipboardData: [utf8 text...]   (bidirectional)
+///   0x21 RequestKeyframe: (no payload)
+///   0x22 ClientCaps: JSON {codecs, width, height} — decoder capabilities + native resolution
+///   0x23 ClientStats: JSON {received, dropped, decode_ms, rtt_ms} — periodic feedback
+///   0x24 Ping: [u64 LE timestamp] — echoed back verbatim by the server (RTT probe)
 
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +43,9 @@ pub const MSG_RELEASE_MOUSE: u8 = 0x17;
 pub const MSG_RELEASE_ALL: u8 = 0x18;
 pub const MSG_CLIPBOARD_DATA: u8 = 0x20;
 pub const MSG_REQUEST_KEYFRAME: u8 = 0x21;
+pub const MSG_CLIENT_CAPS: u8 = 0x22;
+pub const MSG_CLIENT_STATS: u8 = 0x23;
+pub const MSG_PING: u8 = 0x24;
 
 pub fn encode_clipboard_data(text: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(1 + text.len());
@@ -53,6 +60,40 @@ pub struct SessionInfo {
     pub height: u32,
     pub fps: u32,
     pub codec: String,
+    /// Current target bitrate in bits per second (informational for clients).
+    #[serde(default)]
+    pub bitrate: u32,
+}
+
+/// Decoder capabilities + native resolution reported by a client on connect.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientCaps {
+    /// Codecs the client can decode, in order of preference (e.g. ["av1", "h264"]).
+    #[serde(default)]
+    pub codecs: Vec<String>,
+    /// Client's native monitor width in pixels (0 = unknown).
+    #[serde(default)]
+    pub width: u32,
+    /// Client's native monitor height in pixels (0 = unknown).
+    #[serde(default)]
+    pub height: u32,
+}
+
+/// Periodic feedback from a client, used for adaptive bitrate.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClientStats {
+    /// Frames received since last report.
+    #[serde(default)]
+    pub received: u32,
+    /// Frames the client had to drop (decode backlog) since last report.
+    #[serde(default)]
+    pub dropped: u32,
+    /// Average decode time per frame in ms.
+    #[serde(default)]
+    pub decode_ms: f32,
+    /// Last measured round-trip time in ms (0 = not measured yet).
+    #[serde(default)]
+    pub rtt_ms: f32,
 }
 
 /// Encode a video frame message into a binary buffer.
@@ -106,6 +147,12 @@ pub enum ClientEvent {
     ReleaseAll,
     ClipboardData { text: String },
     RequestKeyframe,
+    /// Decoder capabilities (handled by the transport layer, never injected).
+    Caps(ClientCaps),
+    /// Periodic client feedback (handled by the transport layer, never injected).
+    Stats(ClientStats),
+    /// RTT probe — the transport layer echoes the raw payload back.
+    Ping { payload: Vec<u8> },
 }
 
 /// Parse a binary message from the client.
@@ -151,6 +198,15 @@ pub fn parse_client_message(data: &[u8]) -> Option<ClientEvent> {
             Some(ClientEvent::ClipboardData { text })
         }
         MSG_REQUEST_KEYFRAME => Some(ClientEvent::RequestKeyframe),
+        MSG_CLIENT_CAPS => {
+            let caps = serde_json::from_slice::<ClientCaps>(data.get(1..)?).ok()?;
+            Some(ClientEvent::Caps(caps))
+        }
+        MSG_CLIENT_STATS => {
+            let stats = serde_json::from_slice::<ClientStats>(data.get(1..)?).ok()?;
+            Some(ClientEvent::Stats(stats))
+        }
+        MSG_PING => Some(ClientEvent::Ping { payload: data.to_vec() }),
         _ => None,
     }
 }

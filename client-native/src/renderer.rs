@@ -1,11 +1,15 @@
 /// GPU-accelerated renderer using wgpu.
 ///
-/// Uploads decoded RGBA frames to a persistent GPU texture and renders a
+/// Uploads decoded YUV420 planes to persistent GPU textures, converts
+/// YUV→RGB in the fragment shader (BT.601 limited range), and renders a
 /// letterboxed quad that preserves the remote desktop's aspect ratio.
+/// Compared to CPU conversion + RGBA upload this saves a full-frame CPU
+/// pass and 62% of the per-frame upload bandwidth.
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
+use crate::decoder::DecodedFrame;
 use crate::overlay::{DisplayMode, EguiRenderData};
 
 pub struct Renderer {
@@ -16,7 +20,8 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    frame_texture: Option<wgpu::Texture>,
+    /// Y, U, V planes as R8 textures.
+    plane_textures: Option<[wgpu::Texture; 3]>,
     current_bind_group: Option<wgpu::BindGroup>,
     texture_size: (u32, u32),
     scale_buffer: wgpu::Buffer,
@@ -95,22 +100,25 @@ impl Renderer {
             source: wgpu::ShaderSource::Wgsl(FULLSCREEN_QUAD_WGSL.into()),
         });
 
-        // Bind group 0: frame texture + sampler
+        // Bind group 0: Y/U/V plane textures + sampler
+        let texture_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("texture_bind_group_layout"),
             entries: &[
+                texture_entry(0),
+                texture_entry(1),
+                texture_entry(2),
                 wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
+                    binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
@@ -118,12 +126,12 @@ impl Renderer {
             ],
         });
 
-        // Bind group 1: scale uniform (aspect ratio correction)
+        // Bind group 1: scale uniform (aspect ratio + srgb flag, read in both stages)
         let scale_bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scale_bind_group_layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
@@ -175,8 +183,8 @@ impl Renderer {
             ..Default::default()
         });
 
-        // Scale uniform: [scale_x, scale_y, 0, 0]
-        let scale_data = [1.0f32, 1.0, 0.0, 0.0];
+        // Scale uniform: [scale_x, scale_y, srgb_flag, 0]
+        let scale_data = [1.0f32, 1.0, if surface_format.is_srgb() { 1.0 } else { 0.0 }, 0.0];
         let scale_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("scale_uniform"),
             size: 16,
@@ -210,7 +218,7 @@ impl Renderer {
             pipeline,
             bind_group_layout,
             sampler,
-            frame_texture: None,
+            plane_textures: None,
             current_bind_group: None,
             texture_size: (0, 0),
             scale_buffer,
@@ -234,29 +242,41 @@ impl Renderer {
         self.update_scale();
     }
 
-    /// Upload a decoded RGBA frame to the GPU.
-    pub fn upload_frame(&mut self, rgba: &[u8], width: u32, height: u32) {
+    /// Upload a decoded YUV420 frame to the GPU (three R8 plane textures).
+    pub fn upload_frame(&mut self, frame: &DecodedFrame) {
+        let (width, height) = (frame.width, frame.height);
         if width == 0 || height == 0 {
             return;
         }
+        let chroma_w = width.div_ceil(2);
+        let chroma_h = height.div_ceil(2);
 
-        // Recreate texture only if dimensions changed
+        // Recreate textures only if dimensions changed
         if self.texture_size != (width, height) {
             self.texture_size = (width, height);
             self.remote_size = (width, height);
 
-            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("frame_texture"),
-                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-
-            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let plane = |label, w, h| {
+                self.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::R8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                })
+            };
+            let textures = [
+                plane("frame_y", width, height),
+                plane("frame_u", chroma_w, chroma_h),
+                plane("frame_v", chroma_w, chroma_h),
+            ];
+            let views: Vec<wgpu::TextureView> = textures
+                .iter()
+                .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()))
+                .collect();
 
             self.current_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("frame_bind_group"),
@@ -264,36 +284,54 @@ impl Renderer {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
+                        resource: wgpu::BindingResource::TextureView(&views[0]),
                     },
                     wgpu::BindGroupEntry {
                         binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&views[1]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&views[2]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
                         resource: wgpu::BindingResource::Sampler(&self.sampler),
                     },
                 ],
             }));
 
-            self.frame_texture = Some(texture);
+            self.plane_textures = Some(textures);
             self.update_scale();
         }
 
-        // Fast texture upload (no alloc, just copies into existing GPU texture)
-        if let Some(texture) = &self.frame_texture {
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                rgba,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(width * 4),
-                    rows_per_image: Some(height),
-                },
-                wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-            );
+        // Fast plane uploads — straight from the decoder's buffers (for AV1
+        // these are dav1d's own refcounted planes, zero CPU repack), using
+        // the source row stride as bytes_per_row.
+        if let Some(textures) = &self.plane_textures {
+            let mut write = |tex: &wgpu::Texture, data: &[u8], stride: u32, w: u32, h: u32| {
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    data,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(stride),
+                        rows_per_image: Some(h),
+                    },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                );
+            };
+            let (y, ys) = frame.y_plane();
+            let (u, us) = frame.u_plane();
+            let (v, vs) = frame.v_plane();
+            write(&textures[0], y, ys as u32, width, height);
+            write(&textures[1], u, us as u32, chroma_w, chroma_h);
+            write(&textures[2], v, vs as u32, chroma_w, chroma_h);
         }
     }
 
@@ -407,8 +445,9 @@ impl Renderer {
             return;
         }
 
+        let srgb = if self.surface_format.is_srgb() { 1.0f32 } else { 0.0 };
         let data = match self.display_mode {
-            DisplayMode::Stretch => [1.0f32, 1.0, 0.0, 0.0],
+            DisplayMode::Stretch => [1.0f32, 1.0, srgb, 0.0],
             DisplayMode::Letterbox => {
                 let (ww, wh) = (self.window_size.0 as f32, self.window_size.1 as f32);
                 let (rw, rh) = (self.remote_size.0 as f32, self.remote_size.1 as f32);
@@ -416,7 +455,7 @@ impl Renderer {
                 let scale = (ww / rw).min(wh / rh);
                 let sx = (rw * scale) / ww;
                 let sy = (rh * scale) / wh;
-                [sx, sy, 0.0f32, 0.0]
+                [sx, sy, srgb, 0.0]
             }
         };
         self.queue.write_buffer(&self.scale_buffer, 0, bytemuck::cast_slice(&data));
@@ -469,11 +508,35 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
     return out;
 }
 
-@group(0) @binding(0) var frame_texture: texture_2d<f32>;
-@group(0) @binding(1) var frame_sampler: sampler;
+@group(0) @binding(0) var tex_y: texture_2d<f32>;
+@group(0) @binding(1) var tex_u: texture_2d<f32>;
+@group(0) @binding(2) var tex_v: texture_2d<f32>;
+@group(0) @binding(3) var frame_sampler: sampler;
+
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let lower = c / 12.92;
+    let higher = pow((c + vec3(0.055)) / 1.055, vec3(2.4));
+    return select(higher, lower, c <= vec3(0.04045));
+}
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(frame_texture, frame_sampler, in.uv);
+    // BT.601 limited-range YUV -> RGB (matches the server's encode matrix).
+    let y = (textureSample(tex_y, frame_sampler, in.uv).r - 16.0 / 255.0) * (255.0 / 219.0);
+    let u = textureSample(tex_u, frame_sampler, in.uv).r - 0.5;
+    let v = textureSample(tex_v, frame_sampler, in.uv).r - 0.5;
+
+    var rgb = vec3<f32>(
+        y + 1.596 * v,
+        y - 0.391 * u - 0.813 * v,
+        y + 2.018 * u,
+    );
+    rgb = clamp(rgb, vec3(0.0), vec3(1.0));
+
+    // The decoded values are gamma-encoded; sRGB surfaces expect linear input.
+    if (scale.z > 0.5) {
+        rgb = srgb_to_linear(rgb);
+    }
+    return vec4(rgb, 1.0);
 }
 "#;

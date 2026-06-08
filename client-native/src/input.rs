@@ -112,6 +112,11 @@ impl InputState {
         self.sender.send(protocol::encode_request_keyframe());
     }
 
+    /// Send a pre-encoded protocol message (caps, stats, pings).
+    pub fn send_raw(&self, data: Vec<u8>) {
+        self.sender.send(data);
+    }
+
     pub fn release_all(&self) {
         self.sender.send(protocol::encode_release_all());
     }

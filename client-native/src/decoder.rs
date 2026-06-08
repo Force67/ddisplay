@@ -37,10 +37,99 @@ fn obu_type_name(first_byte: u8) -> &'static str {
     }
 }
 
+/// Decoded YUV420 frame.
+///
+/// YUV→RGB conversion happens on the GPU (see renderer.rs) — uploading planar
+/// YUV is 1.5 bytes/pixel vs 4 for RGBA and skips a full-frame CPU pass.
+///
+/// Planes are either owned packed buffers (H.264 path — OpenH264's output
+/// only lives until the next decode call) or a zero-copy reference into a
+/// refcounted dav1d picture (AV1 path — no repack, the GPU upload reads the
+/// decoder's buffer directly using its stride).
 pub struct DecodedFrame {
-    pub rgba: Vec<u8>,
+    storage: PlaneStorage,
     pub width: u32,
     pub height: u32,
+}
+
+enum PlaneStorage {
+    Packed {
+        y: Vec<u8>,
+        u: Vec<u8>,
+        v: Vec<u8>,
+    },
+    Dav1d(Dav1dPlaneGuard),
+}
+
+impl DecodedFrame {
+    /// (plane bytes, row stride) — stride may exceed the visible width.
+    pub fn y_plane(&self) -> (&[u8], usize) {
+        match &self.storage {
+            PlaneStorage::Packed { y, .. } => (y, self.width as usize),
+            PlaneStorage::Dav1d(g) => (g.y(), g.y_stride),
+        }
+    }
+
+    pub fn u_plane(&self) -> (&[u8], usize) {
+        match &self.storage {
+            PlaneStorage::Packed { u, .. } => (u, (self.width as usize).div_ceil(2)),
+            PlaneStorage::Dav1d(g) => (g.u(), g.uv_stride),
+        }
+    }
+
+    pub fn v_plane(&self) -> (&[u8], usize) {
+        match &self.storage {
+            PlaneStorage::Packed { v, .. } => (v, (self.width as usize).div_ceil(2)),
+            PlaneStorage::Dav1d(g) => (g.v(), g.uv_stride),
+        }
+    }
+}
+
+/// Keeps a dav1d picture alive (refcounted) so its planes can be read
+/// zero-copy from the render thread; unrefs on drop.
+struct Dav1dPlaneGuard {
+    pic: Dav1dPicture,
+    y_stride: usize,
+    uv_stride: usize,
+    height: usize,
+}
+
+// SAFETY: dav1d pictures are refcounted with thread-safe release; the planes
+// are immutable once output. We only read from them.
+unsafe impl Send for Dav1dPlaneGuard {}
+
+impl Dav1dPlaneGuard {
+    fn y(&self) -> &[u8] {
+        let p = self.pic.data[0].unwrap().as_ptr() as *const u8;
+        unsafe { std::slice::from_raw_parts(p, self.y_stride * self.height) }
+    }
+    fn u(&self) -> &[u8] {
+        let p = self.pic.data[1].unwrap().as_ptr() as *const u8;
+        unsafe { std::slice::from_raw_parts(p, self.uv_stride * self.height.div_ceil(2)) }
+    }
+    fn v(&self) -> &[u8] {
+        let p = self.pic.data[2].unwrap().as_ptr() as *const u8;
+        unsafe { std::slice::from_raw_parts(p, self.uv_stride * self.height.div_ceil(2)) }
+    }
+}
+
+impl Drop for Dav1dPlaneGuard {
+    fn drop(&mut self) {
+        unsafe { dav1d_picture_unref(&mut self.pic) };
+    }
+}
+
+/// Copy a possibly-strided plane into a tightly packed buffer.
+fn pack_plane(src: &[u8], src_stride: usize, w: usize, h: usize) -> Vec<u8> {
+    let mut out = vec![0u8; w * h];
+    if src_stride == w {
+        out.copy_from_slice(&src[..w * h]);
+    } else {
+        for row in 0..h {
+            out[row * w..(row + 1) * w].copy_from_slice(&src[row * src_stride..row * src_stride + w]);
+        }
+    }
+    out
 }
 
 pub enum VideoDecoder {
@@ -82,13 +171,12 @@ impl VideoDecoder {
 
 pub struct H264Decoder {
     decoder: Decoder,
-    rgba_buf: Vec<u8>,
 }
 
 impl H264Decoder {
     pub fn new() -> Result<Self> {
         let decoder = Decoder::new().context("Failed to create OpenH264 decoder")?;
-        Ok(Self { decoder, rgba_buf: Vec::new() })
+        Ok(Self { decoder })
     }
 
     pub fn decode(&mut self, data: &[u8]) -> Result<Option<DecodedFrame>> {
@@ -103,14 +191,20 @@ impl H264Decoder {
         let (w, h) = yuv.dimensions();
         if w == 0 || h == 0 { return Ok(None); }
 
-        self.rgba_buf.resize(w * h * 4, 255);
-        yuv_to_rgba(
-            yuv.y(), yuv.u(), yuv.v(),
-            yuv.strides().0, yuv.strides().1, yuv.strides().2,
-            w, h, &mut self.rgba_buf,
-        );
+        let (ys, us, vs) = yuv.strides();
+        let cw = w.div_ceil(2);
+        let ch = h.div_ceil(2);
 
-        Ok(Some(DecodedFrame { rgba: self.rgba_buf.clone(), width: w as u32, height: h as u32 }))
+        // OpenH264's planes only live until the next decode call — pack them.
+        Ok(Some(DecodedFrame {
+            storage: PlaneStorage::Packed {
+                y: pack_plane(yuv.y(), ys, w, h),
+                u: pack_plane(yuv.u(), us, cw, ch),
+                v: pack_plane(yuv.v(), vs, cw, ch),
+            },
+            width: w as u32,
+            height: h as u32,
+        }))
     }
 }
 
@@ -128,6 +222,28 @@ use rav1d::include::dav1d::dav1d::Dav1dSettings;
 use rav1d::include::dav1d::data::Dav1dData;
 use rav1d::include::dav1d::picture::Dav1dPicture;
 
+/// Low-latency decoder settings.
+///
+/// Threads scale with the machine (4K software AV1 needs them). The frame
+/// delay is capped at 2: lower decode latency than the unbounded default,
+/// while avoiding rav1d 1.1.0's single-frame-context mode (max_frame_delay=1
+/// → n_fc=1), which aborts in its error path (decode.rs on_error →
+/// in_cdf.try_write().unwrap() panic in a nounwind function).
+/// Override for experiments via DDISPLAY_AV1_THREADS / DDISPLAY_AV1_DELAY.
+fn apply_low_latency_settings(settings: &mut Dav1dSettings) {
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let threads = std::env::var("DDISPLAY_AV1_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| cores.min(16) as i32);
+    let delay = std::env::var("DDISPLAY_AV1_DELAY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2);
+    settings.n_threads = threads;
+    settings.max_frame_delay = delay;
+}
+
 extern "C" {
     fn dav1d_default_settings(s: *mut Dav1dSettings);
     fn dav1d_open(c_out: *mut *mut c_void, s: *const Dav1dSettings) -> i32;
@@ -142,7 +258,6 @@ extern "C" {
 pub struct Av1Decoder {
     /// Opaque dav1d context pointer (never null after successful init).
     ctx: *mut c_void,
-    rgba_buf: Vec<u8>,
     /// Latest decoded frame from drain_pictures (returned by decode()).
     last_frame: Option<DecodedFrame>,
     /// Total packets handed to dav1d_send_data.
@@ -169,9 +284,12 @@ impl Av1Decoder {
         unsafe {
             let mut settings: Dav1dSettings = std::mem::zeroed();
             dav1d_default_settings(&mut settings);
-            settings.n_threads = 4;
+            apply_low_latency_settings(&mut settings);
 
-            eprintln!("[av1] opening dav1d context (4 threads)...");
+            eprintln!(
+                "[av1] opening dav1d context (n_threads={}, max_frame_delay={})...",
+                settings.n_threads, settings.max_frame_delay,
+            );
             let mut ctx: *mut c_void = std::ptr::null_mut();
             let rc = dav1d_open(&mut ctx, &settings);
             if rc != 0 || ctx.is_null() {
@@ -181,7 +299,6 @@ impl Av1Decoder {
             eprintln!("[av1] dav1d context opened OK  ptr={:p}", ctx);
             Ok(Self {
                 ctx,
-                rgba_buf: Vec::new(),
                 last_frame: None,
                 frames_in: 0,
                 frames_out: 0,
@@ -288,14 +405,20 @@ impl Av1Decoder {
                         continue;
                     }
 
-                    let y_data = std::slice::from_raw_parts(y_ptr.unwrap(), y_stride * h);
-                    let u_data = std::slice::from_raw_parts(u_ptr.unwrap(), uv_stride * ((h + 1) / 2));
-                    let v_data = std::slice::from_raw_parts(v_ptr.unwrap(), uv_stride * ((h + 1) / 2));
+                    // Zero-copy: move the refcounted picture into the frame;
+                    // the renderer uploads straight from dav1d's buffers and
+                    // the guard unrefs when the frame is replaced.
+                    let frame = DecodedFrame {
+                        storage: PlaneStorage::Dav1d(Dav1dPlaneGuard {
+                            pic,
+                            y_stride,
+                            uv_stride,
+                            height: h,
+                        }),
+                        width: w as u32,
+                        height: h as u32,
+                    };
 
-                    self.rgba_buf.resize(w * h * 4, 255);
-                    yuv_to_rgba(y_data, u_data, v_data, y_stride, uv_stride, uv_stride, w, h, &mut self.rgba_buf);
-
-                    dav1d_picture_unref(&mut pic);
                     self.frames_out += 1;
                     self.consecutive_errors = 0;
 
@@ -305,11 +428,7 @@ impl Av1Decoder {
                             self.send_eagain, self.get_eagain, self.decode_errors);
                     }
 
-                    self.last_frame = Some(DecodedFrame {
-                        rgba: self.rgba_buf.clone(),
-                        width: w as u32,
-                        height: h as u32,
-                    });
+                    self.last_frame = Some(frame);
                 }
                 DAV1D_EAGAIN => {
                     self.get_eagain += 1;
@@ -329,7 +448,7 @@ impl Av1Decoder {
 
                         let mut settings: Dav1dSettings = std::mem::zeroed();
                         dav1d_default_settings(&mut settings);
-                        settings.n_threads = 4;
+                        apply_low_latency_settings(&mut settings);
                         let mut new_ctx: *mut c_void = std::ptr::null_mut();
                         let rc2 = dav1d_open(&mut new_ctx, &settings);
                         if rc2 == 0 && !new_ctx.is_null() {
@@ -356,31 +475,3 @@ impl Drop for Av1Decoder {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Integer BT.601 YUV→RGBA
-// ---------------------------------------------------------------------------
-
-fn yuv_to_rgba(
-    y_data: &[u8], u_data: &[u8], v_data: &[u8],
-    ys: usize, us: usize, vs: usize,
-    w: usize, h: usize,
-    rgba: &mut [u8],
-) {
-    for row in 0..h {
-        let y_row = row * ys;
-        let uv_u = (row / 2) * us;
-        let uv_v = (row / 2) * vs;
-        let dst_row = row * w * 4;
-
-        for col in 0..w {
-            let c = 298 * (y_data[y_row + col] as i32 - 16);
-            let d = u_data[uv_u + col / 2] as i32 - 128;
-            let e = v_data[uv_v + col / 2] as i32 - 128;
-
-            let idx = dst_row + col * 4;
-            rgba[idx]     = ((c + 409 * e + 128) >> 8).clamp(0, 255) as u8;
-            rgba[idx + 1] = ((c - 100 * d - 208 * e + 128) >> 8).clamp(0, 255) as u8;
-            rgba[idx + 2] = ((c + 516 * d + 128) >> 8).clamp(0, 255) as u8;
-        }
-    }
-}

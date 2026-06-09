@@ -28,13 +28,10 @@ use crate::protocol::{self, ClientCaps, ClientEvent};
 pub type FrameSender = broadcast::Sender<Vec<u8>>;
 /// Receiver end for input events from clients (client -> server).
 pub type InputReceiver = mpsc::Receiver<protocol::ClientEvent>;
-/// Shared cache for the latest keyframe.
-pub type KeyframeCache = Arc<Mutex<Option<Vec<u8>>>>;
 
 pub struct AppState {
     pub frame_tx: FrameSender,
     input_tx: mpsc::Sender<ClientEvent>,
-    keyframe_cache: KeyframeCache,
     metadata: ServerMetadata,
     status: Mutex<ServerStatusState>,
     runtime: ServerRuntimeConfig,
@@ -177,10 +174,13 @@ pub async fn start_server(
     control: Arc<StreamControl>,
     server_codecs: Vec<String>,
     resize_to_client: bool,
-) -> anyhow::Result<(FrameSender, InputReceiver, KeyframeCache)> {
-    let (frame_tx, _) = broadcast::channel::<Vec<u8>>(2);
+) -> anyhow::Result<(FrameSender, InputReceiver)> {
+    // Capacity absorbs short TCP send stalls without dropping frames (a drop
+    // breaks the H.264/AV1 reference chain and costs a full IDR resync).
+    // 8 frames ≈ 130ms at 60fps; a client further behind than that is
+    // genuinely congested and handled by the Lagged path below.
+    let (frame_tx, _) = broadcast::channel::<Vec<u8>>(8);
     let (input_tx, input_rx) = mpsc::channel::<ClientEvent>(1024);
-    let keyframe_cache: KeyframeCache = Arc::new(Mutex::new(None));
 
     // Start clipboard monitor (best-effort; server still runs if it fails).
     let clipboard_set_tx = match crate::clipboard::start(frame_tx.clone()) {
@@ -197,7 +197,6 @@ pub async fn start_server(
     let state = Arc::new(AppState {
         frame_tx: frame_tx.clone(),
         input_tx,
-        keyframe_cache: keyframe_cache.clone(),
         metadata,
         status: Mutex::new(ServerStatusState::default()),
         runtime,
@@ -253,7 +252,7 @@ pub async fn start_server(
         }
     });
 
-    Ok((frame_tx, input_rx, keyframe_cache))
+    Ok((frame_tx, input_rx))
 }
 
 /// Axum handler that upgrades an HTTP request to a WebSocket connection.
@@ -285,17 +284,13 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
         return;
     }
 
-    // Send cached keyframe immediately so the client can start decoding.
-    let cached_kf = state.keyframe_cache.lock().clone();
-    if let Some(kf) = cached_kf {
-        if ws_sender.send(Message::Binary(kf.into())).await.is_err() {
-            return;
-        }
-        tracing::debug!("Sent cached keyframe to new client");
-    }
-
-    // Subscribe to the frame broadcast so this client receives all future frames.
+    // Subscribe to the frame broadcast, then ask the encode loop for a fresh
+    // IDR. With an infinite GOP this is what bootstraps the new decoder —
+    // the IDR arrives within a frame interval (the wake cuts idle pacing
+    // short), so there's no value in caching stale keyframes.
     let mut frame_rx = state.frame_tx.subscribe();
+    state.control.force_keyframe.store(true, Ordering::Release);
+    state.control.notify_activity();
     let input_tx = state.input_tx.clone();
     let recv_input_tx = input_tx.clone();
     let recv_input_state = input_state.clone();
@@ -331,9 +326,13 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!("{}: dropped {} frames (slow client)", peer, n);
-                            // The receiver automatically advances past the gap; tell the
-                            // ABR controller this link can't keep up at the current rate.
+                            // The receiver advances past the gap, which breaks the
+                            // codec reference chain — without a fresh IDR the client
+                            // shows smeared/pixelated regions indefinitely (infinite
+                            // GOP). Also tell the ABR controller to back off.
                             send_control.record_congestion();
+                            send_control.force_keyframe.store(true, Ordering::Release);
+                            send_control.notify_activity();
                         }
                         Err(broadcast::error::RecvError::Closed) => {
                             // Server is shutting down.

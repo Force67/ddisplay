@@ -397,6 +397,16 @@ nvenc_ctx_t* nvenc_create(uint32_t width, uint32_t height, uint32_t fps, uint32_
     /* Spatial AQ shifts bits towards visually complex regions (text, UI
      * edges) which noticeably improves desktop content at a fixed bitrate. */
     cfg->rcParams.enableAQ = 1;
+    /* Quarter-resolution first pass: much more accurate per-frame rate
+     * control (fewer overshoots/stalls, less blocking under motion) for a
+     * negligible encode-time cost on desktop GPUs. */
+    cfg->rcParams.multiPass = NV_ENC_TWO_PASS_QUARTER_RESOLUTION;
+    /* With ultra-low-latency tuning + single-frame VBV the default keyframe
+     * budget is ONE P-frame's worth of bits, which makes every IDR a wall of
+     * macroblocks. IDRs are rare here (new client / recovery), so let them
+     * spend 4 frames of budget — a one-off ~3-frame send burst instead of a
+     * visibly pixelated screen. */
+    cfg->rcParams.lowDelayKeyFrameScale = 4;
 
     if (codec == DDISPLAY_CODEC_AV1) {
         cfg->encodeCodecConfig.av1Config.idrPeriod = NVENC_INFINITE_GOPLENGTH;

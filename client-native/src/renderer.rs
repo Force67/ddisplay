@@ -9,7 +9,7 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
-use crate::decoder::DecodedFrame;
+use crate::decoder::{DecodedFrame, FrameFormat};
 use crate::overlay::{DisplayMode, EguiRenderData};
 
 pub struct Renderer {
@@ -17,12 +17,17 @@ pub struct Renderer {
     queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
+    /// I420 pipeline: three R8 planes (software decoders).
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    /// NV12 pipeline: R8 luma + Rg8 interleaved chroma (hardware decode).
+    pipeline_nv12: wgpu::RenderPipeline,
+    bind_group_layout_nv12: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    /// Y, U, V planes as R8 textures.
-    plane_textures: Option<[wgpu::Texture; 3]>,
+    /// Plane textures for the current format (3 for I420, 2 for NV12).
+    plane_textures: Vec<wgpu::Texture>,
     current_bind_group: Option<wgpu::BindGroup>,
+    current_format: FrameFormat,
     texture_size: (u32, u32),
     scale_buffer: wgpu::Buffer,
     scale_bind_group: wgpu::BindGroup,
@@ -99,8 +104,12 @@ impl Renderer {
             label: Some("fullscreen_quad"),
             source: wgpu::ShaderSource::Wgsl(FULLSCREEN_QUAD_WGSL.into()),
         });
+        let shader_nv12 = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fullscreen_quad_nv12"),
+            source: wgpu::ShaderSource::Wgsl(FULLSCREEN_QUAD_NV12_WGSL.into()),
+        });
 
-        // Bind group 0: Y/U/V plane textures + sampler
+        // Bind group 0: plane textures + sampler (3 planes I420, 2 planes NV12)
         let texture_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -111,20 +120,26 @@ impl Renderer {
             },
             count: None,
         };
+        let sampler_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        };
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("texture_bind_group_layout"),
             entries: &[
                 texture_entry(0),
                 texture_entry(1),
                 texture_entry(2),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
+                sampler_entry(3),
             ],
         });
+        let bind_group_layout_nv12 =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("texture_bind_group_layout_nv12"),
+                entries: &[texture_entry(0), texture_entry(1), sampler_entry(2)],
+            });
 
         // Bind group 1: scale uniform (aspect ratio + srgb flag, read in both stages)
         let scale_bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -141,40 +156,47 @@ impl Renderer {
             }],
         });
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("pipeline_layout"),
-            bind_group_layouts: &[Some(&bind_group_layout), Some(&scale_bg_layout)],
-            immediate_size: 0,
-        });
-
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("render_pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: surface_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let make_pipeline = |label: &str,
+                             layout: &wgpu::BindGroupLayout,
+                             module: &wgpu::ShaderModule| {
+            let pipeline_layout =
+                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some(label),
+                    bind_group_layouts: &[Some(layout), Some(&scale_bg_layout)],
+                    immediate_size: 0,
+                });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let pipeline = make_pipeline("render_pipeline_i420", &bind_group_layout, &shader);
+        let pipeline_nv12 =
+            make_pipeline("render_pipeline_nv12", &bind_group_layout_nv12, &shader_nv12);
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("frame_sampler"),
@@ -217,9 +239,12 @@ impl Renderer {
             surface_config,
             pipeline,
             bind_group_layout,
+            pipeline_nv12,
+            bind_group_layout_nv12,
             sampler,
-            plane_textures: None,
+            plane_textures: Vec::new(),
             current_bind_group: None,
+            current_format: FrameFormat::I420,
             texture_size: (0, 0),
             scale_buffer,
             scale_bind_group,
@@ -242,96 +267,115 @@ impl Renderer {
         self.update_scale();
     }
 
-    /// Upload a decoded YUV420 frame to the GPU (three R8 plane textures).
+    /// Upload a decoded frame to the GPU — three R8 planes for I420
+    /// (software decoders) or R8 + Rg8 for NV12 (hardware decode). The
+    /// YUV→RGB conversion always runs in the fragment shader.
     pub fn upload_frame(&mut self, frame: &DecodedFrame) {
         let (width, height) = (frame.width, frame.height);
         if width == 0 || height == 0 {
             return;
         }
+        let format = frame.format();
         let chroma_w = width.div_ceil(2);
         let chroma_h = height.div_ceil(2);
 
-        // Recreate textures only if dimensions changed
-        if self.texture_size != (width, height) {
+        // Recreate textures when dimensions or pixel layout changed
+        if self.texture_size != (width, height) || self.current_format != format {
             self.texture_size = (width, height);
             self.remote_size = (width, height);
+            self.current_format = format;
 
-            let plane = |label, w, h| {
+            let plane = |label, w, h, fmt| {
                 self.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some(label),
                     size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::R8Unorm,
+                    format: fmt,
                     usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                     view_formats: &[],
                 })
             };
-            let textures = [
-                plane("frame_y", width, height),
-                plane("frame_u", chroma_w, chroma_h),
-                plane("frame_v", chroma_w, chroma_h),
-            ];
+            let textures: Vec<wgpu::Texture> = match format {
+                FrameFormat::I420 => vec![
+                    plane("frame_y", width, height, wgpu::TextureFormat::R8Unorm),
+                    plane("frame_u", chroma_w, chroma_h, wgpu::TextureFormat::R8Unorm),
+                    plane("frame_v", chroma_w, chroma_h, wgpu::TextureFormat::R8Unorm),
+                ],
+                FrameFormat::Nv12 => vec![
+                    plane("frame_y", width, height, wgpu::TextureFormat::R8Unorm),
+                    plane("frame_uv", chroma_w, chroma_h, wgpu::TextureFormat::Rg8Unorm),
+                ],
+            };
             let views: Vec<wgpu::TextureView> = textures
                 .iter()
                 .map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()))
                 .collect();
 
-            self.current_bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("frame_bind_group"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&views[0]),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&views[1]),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&views[2]),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler),
-                    },
-                ],
-            }));
+            let mut entries: Vec<wgpu::BindGroupEntry> = views
+                .iter()
+                .enumerate()
+                .map(|(i, v)| wgpu::BindGroupEntry {
+                    binding: i as u32,
+                    resource: wgpu::BindingResource::TextureView(v),
+                })
+                .collect();
+            entries.push(wgpu::BindGroupEntry {
+                binding: views.len() as u32,
+                resource: wgpu::BindingResource::Sampler(&self.sampler),
+            });
+            let layout = match format {
+                FrameFormat::I420 => &self.bind_group_layout,
+                FrameFormat::Nv12 => &self.bind_group_layout_nv12,
+            };
+            self.current_bind_group =
+                Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("frame_bind_group"),
+                    layout,
+                    entries: &entries,
+                }));
 
-            self.plane_textures = Some(textures);
+            self.plane_textures = textures;
             self.update_scale();
         }
 
         // Fast plane uploads — straight from the decoder's buffers (for AV1
         // these are dav1d's own refcounted planes, zero CPU repack), using
         // the source row stride as bytes_per_row.
-        if let Some(textures) = &self.plane_textures {
-            let mut write = |tex: &wgpu::Texture, data: &[u8], stride: u32, w: u32, h: u32| {
-                self.queue.write_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: tex,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    data,
-                    wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(stride),
-                        rows_per_image: Some(h),
-                    },
-                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                );
-            };
-            let (y, ys) = frame.y_plane();
-            let (u, us) = frame.u_plane();
-            let (v, vs) = frame.v_plane();
-            write(&textures[0], y, ys as u32, width, height);
-            write(&textures[1], u, us as u32, chroma_w, chroma_h);
-            write(&textures[2], v, vs as u32, chroma_w, chroma_h);
+        let textures = &self.plane_textures;
+        let write = |tex: &wgpu::Texture, data: &[u8], stride: u32, w: u32, h: u32| {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+        };
+        match format {
+            FrameFormat::I420 => {
+                let (y, ys) = frame.y_plane();
+                let (u, us) = frame.u_plane();
+                let (v, vs) = frame.v_plane();
+                write(&textures[0], y, ys as u32, width, height);
+                write(&textures[1], u, us as u32, chroma_w, chroma_h);
+                write(&textures[2], v, vs as u32, chroma_w, chroma_h);
+            }
+            FrameFormat::Nv12 => {
+                let (y, ys) = frame.y_plane();
+                let (uv, uvs) = frame.uv_plane();
+                write(&textures[0], y, ys as u32, width, height);
+                write(&textures[1], uv, uvs as u32, chroma_w, chroma_h);
+            }
         }
     }
 
@@ -386,7 +430,11 @@ impl Renderer {
                 multiview_mask: None,
             });
 
-            render_pass.set_pipeline(&self.pipeline);
+            let pipeline = match self.current_format {
+                FrameFormat::I420 => &self.pipeline,
+                FrameFormat::Nv12 => &self.pipeline_nv12,
+            };
+            render_pass.set_pipeline(pipeline);
             render_pass.set_bind_group(0, bind_group, &[]);
             render_pass.set_bind_group(1, &self.scale_bind_group, &[]);
             render_pass.draw(0..6, 0..1);
@@ -534,6 +582,76 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     rgb = clamp(rgb, vec3(0.0), vec3(1.0));
 
     // The decoded values are gamma-encoded; sRGB surfaces expect linear input.
+    if (scale.z > 0.5) {
+        rgb = srgb_to_linear(rgb);
+    }
+    return vec4(rgb, 1.0);
+}
+"#;
+
+/// NV12 variant: Y in an R8 texture, interleaved UV in an Rg8 texture
+/// (hardware decoder output, uploaded without any CPU repacking).
+const FULLSCREEN_QUAD_NV12_WGSL: &str = r#"
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@group(1) @binding(0) var<uniform> scale: vec4<f32>;
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
+    var positions = array<vec2<f32>, 6>(
+        vec2(-1.0, -1.0),
+        vec2( 1.0, -1.0),
+        vec2(-1.0,  1.0),
+        vec2(-1.0,  1.0),
+        vec2( 1.0, -1.0),
+        vec2( 1.0,  1.0),
+    );
+    var uvs = array<vec2<f32>, 6>(
+        vec2(0.0, 1.0),
+        vec2(1.0, 1.0),
+        vec2(0.0, 0.0),
+        vec2(0.0, 0.0),
+        vec2(1.0, 1.0),
+        vec2(1.0, 0.0),
+    );
+
+    var out: VertexOutput;
+    var pos = positions[idx];
+    pos.x *= scale.x;
+    pos.y *= scale.y;
+    out.position = vec4(pos, 0.0, 1.0);
+    out.uv = uvs[idx];
+    return out;
+}
+
+@group(0) @binding(0) var tex_y: texture_2d<f32>;
+@group(0) @binding(1) var tex_uv: texture_2d<f32>;
+@group(0) @binding(2) var frame_sampler: sampler;
+
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+    let lower = c / 12.92;
+    let higher = pow((c + vec3(0.055)) / 1.055, vec3(2.4));
+    return select(higher, lower, c <= vec3(0.04045));
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // BT.601 limited-range YUV -> RGB (matches the server's encode matrix).
+    let y = (textureSample(tex_y, frame_sampler, in.uv).r - 16.0 / 255.0) * (255.0 / 219.0);
+    let chroma = textureSample(tex_uv, frame_sampler, in.uv).rg - vec2(0.5);
+    let u = chroma.x;
+    let v = chroma.y;
+
+    var rgb = vec3<f32>(
+        y + 1.596 * v,
+        y - 0.391 * u - 0.813 * v,
+        y + 2.018 * u,
+    );
+    rgb = clamp(rgb, vec3(0.0), vec3(1.0));
+
     if (scale.z > 0.5) {
         rgb = srgb_to_linear(rgb);
     }

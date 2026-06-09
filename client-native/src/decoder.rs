@@ -47,26 +47,50 @@ fn obu_type_name(first_byte: u8) -> &'static str {
 /// refcounted dav1d picture (AV1 path — no repack, the GPU upload reads the
 /// decoder's buffer directly using its stride).
 pub struct DecodedFrame {
-    storage: PlaneStorage,
+    pub storage: PlaneStorage,
     pub width: u32,
     pub height: u32,
 }
 
-enum PlaneStorage {
+/// Pixel layout of a decoded frame, used by the renderer to pick a pipeline.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FrameFormat {
+    /// Three planes: Y, U, V (software decoders).
+    I420,
+    /// Two planes: Y + interleaved UV (D3D11 hardware decode output).
+    Nv12,
+}
+
+pub enum PlaneStorage {
     Packed {
         y: Vec<u8>,
         u: Vec<u8>,
         v: Vec<u8>,
     },
     Dav1d(Dav1dPlaneGuard),
+    /// NV12 from the hardware decoder: Y plane + interleaved UV plane,
+    /// both at `stride` bytes per row.
+    Nv12 {
+        y: Vec<u8>,
+        uv: Vec<u8>,
+        stride: usize,
+    },
 }
 
 impl DecodedFrame {
+    pub fn format(&self) -> FrameFormat {
+        match &self.storage {
+            PlaneStorage::Nv12 { .. } => FrameFormat::Nv12,
+            _ => FrameFormat::I420,
+        }
+    }
+
     /// (plane bytes, row stride) — stride may exceed the visible width.
     pub fn y_plane(&self) -> (&[u8], usize) {
         match &self.storage {
             PlaneStorage::Packed { y, .. } => (y, self.width as usize),
             PlaneStorage::Dav1d(g) => (g.y(), g.y_stride),
+            PlaneStorage::Nv12 { y, stride, .. } => (y, *stride),
         }
     }
 
@@ -74,6 +98,7 @@ impl DecodedFrame {
         match &self.storage {
             PlaneStorage::Packed { u, .. } => (u, (self.width as usize).div_ceil(2)),
             PlaneStorage::Dav1d(g) => (g.u(), g.uv_stride),
+            PlaneStorage::Nv12 { .. } => unreachable!("use uv_plane() for NV12"),
         }
     }
 
@@ -81,13 +106,22 @@ impl DecodedFrame {
         match &self.storage {
             PlaneStorage::Packed { v, .. } => (v, (self.width as usize).div_ceil(2)),
             PlaneStorage::Dav1d(g) => (g.v(), g.uv_stride),
+            PlaneStorage::Nv12 { .. } => unreachable!("use uv_plane() for NV12"),
+        }
+    }
+
+    /// Interleaved UV plane (NV12 only): (bytes, row stride in bytes).
+    pub fn uv_plane(&self) -> (&[u8], usize) {
+        match &self.storage {
+            PlaneStorage::Nv12 { uv, stride, .. } => (uv, *stride),
+            _ => unreachable!("uv_plane() is NV12-only"),
         }
     }
 }
 
 /// Keeps a dav1d picture alive (refcounted) so its planes can be read
 /// zero-copy from the render thread; unrefs on drop.
-struct Dav1dPlaneGuard {
+pub struct Dav1dPlaneGuard {
     pic: Dav1dPicture,
     y_stride: usize,
     uv_stride: usize,
@@ -135,10 +169,31 @@ fn pack_plane(src: &[u8], src_stride: usize, w: usize, h: usize) -> Vec<u8> {
 pub enum VideoDecoder {
     H264(H264Decoder),
     Av1(Av1Decoder),
+    /// Hardware decode via Media Foundation + D3D11 (Windows only).
+    #[cfg(windows)]
+    Mf(crate::decoder_mf::MfHwDecoder),
 }
 
 impl VideoDecoder {
-    pub fn for_codec(codec: &str) -> Result<Self> {
+    /// Build a decoder for `codec`. When `try_hw` is set (the startup probe
+    /// found a GPU decode block for this codec), the hardware path is tried
+    /// first and any init failure falls back to software with a log line.
+    pub fn for_codec(codec: &str, try_hw: bool) -> Result<Self> {
+        #[cfg(windows)]
+        if try_hw {
+            match crate::decoder_mf::MfHwDecoder::new(codec) {
+                Ok(d) => return Ok(Self::Mf(d)),
+                Err(e) => {
+                    eprintln!(
+                        "[decode] hardware {} decoder init failed ({e:#}); using software",
+                        codec
+                    );
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = try_hw;
+
         match codec {
             "av1" => Ok(Self::Av1(Av1Decoder::new()?)),
             _ => Ok(Self::H264(H264Decoder::new()?)),
@@ -149,13 +204,30 @@ impl VideoDecoder {
         match self {
             Self::H264(d) => d.decode(data),
             Self::Av1(d) => d.decode(data),
+            #[cfg(windows)]
+            Self::Mf(d) => match d.decode(data) {
+                Ok(f) => Ok(f),
+                Err(e) => {
+                    // Corrupt input wedges the MFT — flush and resync on the
+                    // IDR the caller will request via take_needs_keyframe().
+                    d.flush();
+                    d.needs_keyframe = true;
+                    Err(e)
+                }
+            },
         }
     }
 
-    /// True if the AV1 decoder just reset itself and needs a keyframe from the server.
+    /// True if the decoder just reset itself and needs a keyframe from the server.
     pub fn take_needs_keyframe(&mut self) -> bool {
         match self {
             Self::Av1(d) => {
+                let v = d.needs_keyframe;
+                d.needs_keyframe = false;
+                v
+            }
+            #[cfg(windows)]
+            Self::Mf(d) => {
                 let v = d.needs_keyframe;
                 d.needs_keyframe = false;
                 v

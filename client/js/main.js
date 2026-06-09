@@ -49,6 +49,10 @@ let readOnly = pageParams.get('readonly') === '1';
 let statusPollTimer = null;
 let msgCount = 0;
 let frameIndex = 0;
+// The server streams an infinite GOP and sends a fresh IDR on connect; a
+// stray inter-frame can still arrive first (broadcast race). Decoders need
+// a keyframe to start, so drop frames until one shows up.
+let awaitingKeyframe = true;
 let serverStatus = null;
 let sidebarCollapsed = false;
 
@@ -103,6 +107,10 @@ transport.onMessage = (data) => {
 
 function handleVideoFrame(view, data) {
     const keyframe = view.getUint8(1) !== 0;
+    if (awaitingKeyframe) {
+        if (!keyframe) return;
+        awaitingKeyframe = false;
+    }
     const width = view.getUint16(10, true);
     const height = view.getUint16(12, true);
     const payload = new Uint8Array(data, 14);
@@ -131,6 +139,7 @@ async function handleSessionInfo(data) {
         if (info.codec && info.codec !== serverCodec) {
             serverCodec = info.codec;
             decoder.destroy();
+            awaitingKeyframe = true;
 
             if (info.codec === 'av1' && await isAV1Supported()) {
                 console.log('[session] Switching to AV1 WebCodecs decoder');
@@ -175,6 +184,7 @@ transport.onStateChange = (state) => {
             connectionLabel.textContent = 'Disconnected - reconnecting...';
             overlay.classList.remove('hidden');
             stopStatusPolling();
+            awaitingKeyframe = true;
             break;
     }
 };

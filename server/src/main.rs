@@ -1,6 +1,6 @@
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -385,7 +385,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
-    let (frame_tx, input_rx, keyframe_cache) = transport::websocket::start_server(
+    let (frame_tx, input_rx) = transport::websocket::start_server(
         args.bind.clone(),
         client_dir,
         metadata,
@@ -401,12 +401,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Listening on http://{}", args.bind);
 
     // --- Input handler (dedicated blocking thread) ---
-    let input_pending = Arc::new(AtomicBool::new(false));
-    spawn_input_handler(injector, input_rx, Arc::clone(&input_pending), stream_control.clone());
+    spawn_input_handler(injector, input_rx, stream_control.clone());
 
     // --- Capture+encode loop (dedicated thread, zero-copy) ---
     let fps = args.fps;
-    let kf_cache = keyframe_cache;
     let loop_control = stream_control;
 
     tokio::task::spawn_blocking(move || {
@@ -418,9 +416,7 @@ async fn main() -> anyhow::Result<()> {
             setup,
             user_bitrate,
             frame_tx,
-            kf_cache,
             fps,
-            input_pending,
             loop_control,
         ) {
             tracing::error!("Capture loop error: {}", e);
@@ -436,7 +432,6 @@ async fn main() -> anyhow::Result<()> {
 fn spawn_input_handler(
     mut injector: Box<dyn InputInjector>,
     mut input_rx: mpsc::Receiver<ClientEvent>,
-    input_pending: Arc<AtomicBool>,
     control: Arc<StreamControl>,
 ) {
     let (sync_tx, sync_rx) = std::sync::mpsc::channel::<ClientEvent>();
@@ -455,7 +450,7 @@ fn spawn_input_handler(
                 ClientEvent::RequestKeyframe => {
                     tracing::debug!("[keyframe] client requested keyframe");
                     control.force_keyframe.store(true, Ordering::Release);
-                    input_pending.store(true, Ordering::Release);
+                    control.notify_activity();
                     continue;
                 }
                 _ => {}
@@ -463,7 +458,7 @@ fn spawn_input_handler(
             if let Err(e) = injector.inject_event(&event) {
                 tracing::error!("Failed to inject input event: {}", e);
             }
-            input_pending.store(true, Ordering::Release);
+            control.notify_activity();
         }
         tracing::info!("Input handler shutting down");
     });
@@ -485,33 +480,50 @@ fn capture_encode_loop(
     setup: EncoderSetup,
     user_bitrate: Option<u32>,
     frame_tx: transport::websocket::FrameSender,
-    keyframe_cache: transport::websocket::KeyframeCache,
     fps: u32,
-    input_pending: Arc<AtomicBool>,
     control: Arc<StreamControl>,
 ) -> anyhow::Result<()> {
     let active_interval = Duration::from_secs_f64(1.0 / fps as f64);
     let idle_interval = Duration::from_secs_f64(1.0 / 10.0); // 10 fps when idle
     // After this much silence we drop to idle FPS.
     let idle_timeout = Duration::from_millis(500);
-    let keyframe_interval = fps as u64 * 2; // IDR every 2 seconds
 
     let mut screen_w = capturer.width();
     let mut screen_h = capturer.height();
     let mut applied_bitrate = control.target_bitrate.load(Ordering::Acquire);
 
     let mut frame_count: u64 = 0;
-    let mut next_frame_time = Instant::now();
+    let mut last_tick = Instant::now();
     let mut fps_timer = Instant::now();
     let mut fps_frame_count: u64 = 0;
     let mut last_activity = Instant::now();
     let mut last_recheck = Instant::now();
+    let mut last_cursor: Option<(u16, u16, bool)> = None;
 
     loop {
+        // ---- Frame pacing ----
+        // Two-phase wait. Phase 1 is the hard rate cap: never start two
+        // captures closer than the active interval — a flood of mouse moves
+        // must not outrun the target fps, or the client's decoder drowns and
+        // every queued frame becomes latency. Phase 2 stretches the wait to
+        // the idle schedule, but is cut short the instant activity arrives.
+        let active = last_activity.elapsed() < idle_timeout;
+        let frame_interval = if active { active_interval } else { idle_interval };
+        let earliest = last_tick + active_interval;
+        let scheduled = last_tick + frame_interval;
+
         let now = Instant::now();
-        let input_arrived = input_pending.swap(false, Ordering::AcqRel);
+        if earliest > now {
+            std::thread::sleep(earliest - now);
+        }
+        if scheduled > earliest && !control.input_pending.load(Ordering::Acquire) {
+            control.wait_activity_until(scheduled);
+        }
+        last_tick = Instant::now();
+
+        let input_arrived = control.input_pending.swap(false, Ordering::AcqRel);
         if input_arrived {
-            last_activity = now;
+            last_activity = last_tick;
         }
 
         // ---- Reconfiguration checks (cheap; heavier X round-trips ~1/sec) ----
@@ -611,9 +623,6 @@ fn capture_encode_loop(
                         bitrate,
                     };
                     *control.session.lock() = info.clone();
-                    // Old cached keyframe is from the previous encoder — drop it
-                    // so new clients never receive an undecodable frame.
-                    *keyframe_cache.lock() = None;
                     let _ = frame_tx.send(protocol::encode_session_info(&info));
                     control.force_keyframe.store(true, Ordering::Release);
                     last_activity = Instant::now();
@@ -628,23 +637,16 @@ fn capture_encode_loop(
             }
         }
 
-        // ---- Frame pacing ----
-        // Pick frame interval based on recent activity.
-        let active = now.duration_since(last_activity) < idle_timeout;
-        let frame_interval = if active { active_interval } else { idle_interval };
-
-        if !input_arrived && next_frame_time > now {
-            std::thread::sleep(next_frame_time - now);
-        }
-        next_frame_time += frame_interval;
-        if next_frame_time < Instant::now() {
-            next_frame_time = Instant::now() + frame_interval;
-        }
-
-        let client_requested_kf = control.force_keyframe.swap(false, Ordering::AcqRel);
-        let force_kf = frame_count == 0 || frame_count % keyframe_interval == 0 || client_requested_kf;
-        if client_requested_kf {
-            tracing::debug!("[keyframe] forcing IDR frame on client request");
+        // The GOP is infinite — IDRs only happen on demand: the first frame,
+        // a new client connecting, a recovery request (client decode drop or
+        // server broadcast lag), or after an encoder rebuild. Periodic IDRs
+        // are pure quality loss with single-frame VBV (they show up as a
+        // flash of pixelation) and the recovery paths above cover every
+        // resync case.
+        let requested_kf = control.force_keyframe.swap(false, Ordering::AcqRel);
+        let force_kf = frame_count == 0 || requested_kf;
+        if requested_kf {
+            tracing::debug!("[keyframe] forcing IDR frame on request");
         }
         let has_damage = capturer.has_new_frame();
 
@@ -653,22 +655,21 @@ fn capture_encode_loop(
             last_activity = Instant::now();
         }
 
-        // Always send cursor updates regardless of screen damage — unless the
+        // Send cursor updates when the cursor actually moved — unless the
         // backend embeds the cursor in the frames (Wayland EMBEDDED mode).
+        // Also resend on keyframes so new clients learn the position.
         if !capturer.embeds_cursor() {
             if let Some(ci) = capturer.cursor_info().ok() {
-                let wire = protocol::encode_cursor_update(
-                    ci.x.max(0) as u16,
-                    ci.y.max(0) as u16,
-                    ci.visible,
-                );
-                let _ = frame_tx.send(wire);
+                let cur = (ci.x.max(0) as u16, ci.y.max(0) as u16, ci.visible);
+                if force_kf || last_cursor != Some(cur) {
+                    last_cursor = Some(cur);
+                    let _ = frame_tx.send(protocol::encode_cursor_update(cur.0, cur.1, cur.2));
+                }
             }
         }
 
         // Skip capture+encode if nothing changed (saves CPU, GPU, and bandwidth).
-        // Always capture on keyframe intervals (for new client sync).
-        // Also always capture on the frame after input (app may have just responded).
+        // Always capture on the frame after input (app may have just responded).
         if !force_kf && !has_damage && !input_arrived {
             frame_count += 1;
             fps_frame_count += 1;
@@ -713,10 +714,6 @@ fn capture_encode_loop(
             screen_h as u16,
             &packet.data,
         );
-
-        if packet.keyframe {
-            *keyframe_cache.lock() = Some(wire.clone());
-        }
 
         let _ = frame_tx.send(wire);
 

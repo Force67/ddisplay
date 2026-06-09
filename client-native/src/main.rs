@@ -19,6 +19,8 @@ use winit::window::{Window, WindowAttributes, WindowId};
 mod protocol;
 mod transport;
 mod decoder;
+#[cfg(windows)]
+mod decoder_mf;
 mod renderer;
 mod input;
 mod clipboard;
@@ -115,6 +117,8 @@ struct App {
     /// After a decode-queue overflow the stream is corrupt until the next
     /// keyframe — skip inter-frames instead of feeding garbage to the decoder.
     skip_until_keyframe: bool,
+    /// Hardware (GPU) decode support found at startup: (h264, av1).
+    hw_decode: (bool, bool),
 }
 
 impl ApplicationHandler for App {
@@ -132,6 +136,18 @@ impl ApplicationHandler for App {
         let attrs = WindowAttributes::default()
             .with_title(&self.args.title)
             .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
+
+        // winit's default drag-and-drop support calls OleInitialize, which requires
+        // the thread to be in an STA COM apartment. The Media Foundation hardware
+        // decode probe (decoder_mf::probe) already put the main thread into an MTA
+        // apartment via CoInitializeEx, so OleInitialize would fail with
+        // RPC_E_CHANGED_MODE and panic window creation. We don't use OS file-drop
+        // onto the window (file sharing goes through the shared dir), so disable it.
+        #[cfg(windows)]
+        let attrs = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs.with_drag_and_drop(false)
+        };
 
         let window = Arc::new(event_loop.create_window(attrs).expect("Failed to create window"));
 
@@ -416,9 +432,16 @@ impl App {
                         // Report decoder capabilities + native monitor resolution.
                         // The server uses this for codec arbitration (e.g. falls
                         // back from AV1 to H.264) and --resize-to-client.
+                        //
+                        // Codec preference favours the GPU: when the GPU can
+                        // hardware-decode H.264 but not AV1, report H.264 only
+                        // so the server doesn't pick AV1 and push us onto the
+                        // (much slower) software path.
+                        let (hw_h264, hw_av1) = self.hw_decode;
                         let codecs: Vec<&str> = match self.args.force_codec.as_deref() {
                             Some("av1") => vec!["av1"],
                             Some(_) => vec!["h264"],
+                            None if hw_h264 && !hw_av1 => vec!["h264"],
                             None => vec!["av1", "h264"],
                         };
                         let (mon_w, mon_h) = self
@@ -556,7 +579,11 @@ impl App {
         // Dropping the old sender closes the channel → old thread exits cleanly.
         self.decode_tx = None;
 
-        let (tx, rx) = std::sync::mpsc::sync_channel::<DecodeJob>(16);
+        // Keep this queue shallow: every buffered frame is added display
+        // latency (the decoder must decode all of them — inter-frames can't
+        // be skipped without breaking the reference chain). 4 frames ≈ 66ms
+        // at 60fps before we drop + request an IDR resync.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<DecodeJob>(4);
         self.decode_tx = Some(tx);
 
         let slot = self.frame_slot.clone();
@@ -564,12 +591,14 @@ impl App {
         let needs_keyframe = self.needs_keyframe.clone();
         let decode_us = self.decode_us.clone();
         let codec_str = codec.to_string();
+        let (hw_h264, hw_av1) = self.hw_decode;
+        let try_hw = if codec == "av1" { hw_av1 } else { hw_h264 };
 
         std::thread::Builder::new()
             .name(format!("decode-{}", codec_str))
             .spawn(move || {
-                eprintln!("[decode] thread started, codec={}", codec_str);
-                let mut dec = match decoder::VideoDecoder::for_codec(&codec_str) {
+                eprintln!("[decode] thread started, codec={} hw={}", codec_str, try_hw);
+                let mut dec = match decoder::VideoDecoder::for_codec(&codec_str, try_hw) {
                     Ok(d) => d,
                     Err(e) => {
                         eprintln!("[decode] FATAL: {} decoder init failed: {}", codec_str, e);
@@ -637,6 +666,13 @@ fn main() {
 
     let event_loop = EventLoop::new().expect("Failed to create event loop");
 
+    // Probe GPU hardware decode once, before connecting — the result decides
+    // both which codecs we advertise and which decoder the decode thread uses.
+    #[cfg(windows)]
+    let hw_decode = decoder_mf::probe();
+    #[cfg(not(windows))]
+    let hw_decode = (false, false);
+
     let mut app = App {
         args,
         window: None,
@@ -662,6 +698,7 @@ fn main() {
         last_rtt_ms: 0.0,
         decode_us: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         skip_until_keyframe: false,
+        hw_decode,
     };
 
     if let Err(e) = event_loop.run_app(&mut app) {

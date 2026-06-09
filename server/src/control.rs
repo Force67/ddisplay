@@ -3,7 +3,7 @@
 /// switches, bitrate targets, display resizes); the encode loop applies them
 /// between frames and publishes the live session info back.
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
@@ -12,6 +12,12 @@ use crate::protocol::SessionInfo;
 pub struct StreamControl {
     /// Set by clients (keyframe request) or after a reconfiguration.
     pub force_keyframe: AtomicBool,
+    /// Activity flag: input arrived or a client connected since the encode
+    /// loop last checked. Paired with the wake condvar so the loop can leave
+    /// idle pacing immediately instead of finishing a (up to 100ms) sleep.
+    pub input_pending: AtomicBool,
+    wake_lock: Mutex<()>,
+    wake_cv: Condvar,
     /// Codec switch requested by client capability arbitration.
     /// `Some("h264")` means: rebuild the encoder with this codec.
     pub desired_codec: Mutex<Option<String>>,
@@ -33,12 +39,37 @@ impl StreamControl {
     pub fn new(session: SessionInfo, bitrate_ceiling: u32) -> Self {
         Self {
             force_keyframe: AtomicBool::new(false),
+            input_pending: AtomicBool::new(false),
+            wake_lock: Mutex::new(()),
+            wake_cv: Condvar::new(),
             desired_codec: Mutex::new(None),
             target_bitrate: AtomicU32::new(session.bitrate),
             bitrate_ceiling: AtomicU32::new(bitrate_ceiling),
             resize_request: Mutex::new(None),
             session: Mutex::new(session),
             last_congestion: Mutex::new(None),
+        }
+    }
+
+    /// Signal activity (input event, new client) to the encode loop: sets the
+    /// pending flag and wakes the loop if it is sleeping on idle pacing.
+    pub fn notify_activity(&self) {
+        self.input_pending.store(true, Ordering::Release);
+        let _guard = self.wake_lock.lock();
+        self.wake_cv.notify_one();
+    }
+
+    /// Block until `deadline`, returning early (true) if activity is signalled.
+    /// Spurious wakeups simply re-check the clock.
+    pub fn wait_activity_until(&self, deadline: Instant) -> bool {
+        let mut guard = self.wake_lock.lock();
+        loop {
+            if self.input_pending.load(Ordering::Acquire) {
+                return true;
+            }
+            if self.wake_cv.wait_until(&mut guard, deadline).timed_out() {
+                return self.input_pending.load(Ordering::Acquire);
+            }
         }
     }
 
@@ -79,11 +110,13 @@ impl StreamControl {
 
 /// Default bitrate for a given resolution/fps/codec (bits per second).
 ///
-/// Tuned for desktop/screen content: ~0.07 bits per pixel per frame for
-/// H.264, AV1 gets ~40% less for similar quality. Clamped to sane bounds —
-/// 1080p60 H.264 ≈ 8.7 Mbps, 4K60 AV1 ≈ 20 Mbps.
+/// Tuned for desktop/screen content on a LAN, where bandwidth is cheap and
+/// crispness is the point: ~0.12 bits per pixel per frame for H.264, AV1
+/// gets ~40% less for similar quality. This is a ceiling — the adaptive
+/// controller backs off when a link can't keep up. 1080p60 H.264 ≈ 15 Mbps,
+/// 1080p60 AV1 ≈ 9.3 Mbps, 4K60 AV1 ≈ 37 Mbps.
 pub fn auto_bitrate(width: u32, height: u32, fps: u32, codec: &str) -> u32 {
-    let bpp = if codec == "av1" { 0.042 } else { 0.07 };
+    let bpp = if codec == "av1" { 0.075 } else { 0.12 };
     let bps = width as f64 * height as f64 * fps as f64 * bpp;
-    bps.clamp(3_000_000.0, 60_000_000.0) as u32
+    bps.clamp(6_000_000.0, 80_000_000.0) as u32
 }

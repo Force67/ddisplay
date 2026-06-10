@@ -388,11 +388,14 @@ impl Renderer {
     }
 
     /// Render the current frame + optional egui overlay to the window.
+    ///
+    /// Runs even before the first video frame when there is egui output —
+    /// egui sends its font atlas in the textures_delta of its first pass
+    /// exactly once, and skipping that delta poisons every later egui draw.
     pub fn render(&mut self, egui_output: Option<EguiRenderData>) -> Result<()> {
-        let bind_group = match &self.current_bind_group {
-            Some(bg) => bg,
-            None => return Ok(()),
-        };
+        if self.current_bind_group.is_none() && egui_output.is_none() {
+            return Ok(());
+        }
 
         let output = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -434,10 +437,12 @@ impl Renderer {
                 FrameFormat::I420 => &self.pipeline,
                 FrameFormat::Nv12 => &self.pipeline_nv12,
             };
-            render_pass.set_pipeline(pipeline);
-            render_pass.set_bind_group(0, bind_group, &[]);
-            render_pass.set_bind_group(1, &self.scale_bind_group, &[]);
-            render_pass.draw(0..6, 0..1);
+            if let Some(bind_group) = &self.current_bind_group {
+                render_pass.set_pipeline(pipeline);
+                render_pass.set_bind_group(0, bind_group, &[]);
+                render_pass.set_bind_group(1, &self.scale_bind_group, &[]);
+                render_pass.draw(0..6, 0..1);
+            }
         }
 
         // egui overlay pass (drawn on top of video)

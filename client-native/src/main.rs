@@ -119,6 +119,10 @@ struct App {
     skip_until_keyframe: bool,
     /// Hardware (GPU) decode support found at startup: (h264, av1).
     hw_decode: (bool, bool),
+    /// Rolling per-second metric history for the F3 stats HUD.
+    stats: overlay::StatsHistory,
+    /// Wire bytes received since the last stats tick (all message types).
+    stats_bytes: u64,
 }
 
 impl ApplicationHandler for App {
@@ -260,6 +264,13 @@ impl ApplicationHandler for App {
                             return;
                         }
                     }
+                    // F3 toggles the stats HUD (latency/fps/bandwidth histograms)
+                    if let winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::F3) = key_event.physical_key {
+                        if let Some(overlay) = &mut self.overlay {
+                            overlay.stats_visible = !overlay.stats_visible;
+                            return;
+                        }
+                    }
                 }
                 if self.overlay.as_ref().map_or(true, |o| !o.visible) {
                     if let Some(input) = &mut self.input_state {
@@ -305,7 +316,7 @@ impl ApplicationHandler for App {
                     let fps = self.session_fps;
                     let rtt = self.last_rtt_ms;
                     let (egui_data, act) =
-                        overlay.run_ui(server, codec, fps, rtt, window, Some(files));
+                        overlay.run_ui(server, codec, fps, rtt, &self.stats, window, Some(files));
                     if let Some(renderer) = &mut self.renderer {
                         renderer.set_display_mode(overlay.display_mode);
                     }
@@ -315,7 +326,8 @@ impl ApplicationHandler for App {
                     let codec = &self.codec;
                     let fps = self.session_fps;
                     let rtt = self.last_rtt_ms;
-                    let (egui_data, act) = overlay.run_ui(server, codec, fps, rtt, window, None);
+                    let (egui_data, act) =
+                        overlay.run_ui(server, codec, fps, rtt, &self.stats, window, None);
                     if let Some(renderer) = &mut self.renderer {
                         renderer.set_display_mode(overlay.display_mode);
                     }
@@ -371,13 +383,14 @@ impl ApplicationHandler for App {
 
         // Once per second: RTT probe + stats report (feeds the server's
         // adaptive bitrate controller).
-        if self.last_stats_sent.elapsed() >= std::time::Duration::from_secs(1) {
+        let stats_elapsed = self.last_stats_sent.elapsed();
+        if stats_elapsed >= std::time::Duration::from_secs(1) {
             self.last_stats_sent = std::time::Instant::now();
+            let decode_ms =
+                self.decode_us.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0;
             if let Some(input) = &self.input_state {
                 let now_ms = self.app_start.elapsed().as_millis() as u64;
                 input.send_raw(protocol::encode_ping(now_ms));
-                let decode_ms =
-                    self.decode_us.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0;
                 input.send_raw(protocol::encode_client_stats(
                     self.stats_received,
                     self.stats_dropped,
@@ -385,6 +398,15 @@ impl ApplicationHandler for App {
                     self.last_rtt_ms,
                 ));
             }
+            // Feed the F3 stats HUD one sample per tick.
+            let secs = stats_elapsed.as_secs_f32();
+            self.stats.push(
+                self.last_rtt_ms,
+                self.stats_received as f32 / secs,
+                (self.stats_bytes * 8) as f32 / 1_000_000.0 / secs,
+                decode_ms,
+            );
+            self.stats_bytes = 0;
             self.stats_received = 0;
             self.stats_dropped = 0;
         }
@@ -392,7 +414,10 @@ impl ApplicationHandler for App {
         if !self.window_visible {
             return;
         }
-        let overlay_open = self.overlay.as_ref().map_or(false, |o| o.visible);
+        let overlay_open = self
+            .overlay
+            .as_ref()
+            .map_or(false, |o| o.visible || o.stats_visible);
         let has_frame = self.frame_ready.load(std::sync::atomic::Ordering::Relaxed);
         if has_frame || overlay_open {
             self.frame_ready.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -474,6 +499,9 @@ impl App {
     }
 
     fn handle_server_message(&mut self, data: &[u8]) {
+        // Count every wire byte (video, cursor, clipboard) for the stats HUD.
+        self.stats_bytes += data.len() as u64;
+
         let msg = match protocol::parse_server_message(data) {
             Some(m) => m,
             None => return,
@@ -699,6 +727,8 @@ fn main() {
         decode_us: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         skip_until_keyframe: false,
         hw_decode,
+        stats: overlay::StatsHistory::new(),
+        stats_bytes: 0,
     };
 
     if let Err(e) = event_loop.run_app(&mut app) {

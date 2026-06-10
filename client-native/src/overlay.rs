@@ -1,10 +1,51 @@
-/// Egui-based overlay menu (toggle with F2).
+/// Egui-based overlay menu (toggle with F2) and stats HUD (toggle with F3).
 ///
-/// Shows: connection info, display mode selector, file transfer panel.
+/// Overlay shows: connection info, display mode selector, file transfer
+/// panel. The stats HUD renders rolling histograms of latency, fps and
+/// network throughput in the top-right corner.
+
+use std::collections::VecDeque;
 
 use egui_winit::winit;
 
 use crate::files::FileTransferState;
+
+/// Samples kept per metric (one per second → two minutes of history).
+const STATS_CAPACITY: usize = 120;
+
+/// Rolling per-second metric history for the stats HUD. The app pushes one
+/// sample per stats tick; the HUD draws each series as a bar histogram.
+pub struct StatsHistory {
+    pub rtt_ms: VecDeque<f32>,
+    pub fps: VecDeque<f32>,
+    pub mbps: VecDeque<f32>,
+    /// Latest decode time in ms (single value, shown as text).
+    pub decode_ms: f32,
+}
+
+impl StatsHistory {
+    pub fn new() -> Self {
+        Self {
+            rtt_ms: VecDeque::with_capacity(STATS_CAPACITY),
+            fps: VecDeque::with_capacity(STATS_CAPACITY),
+            mbps: VecDeque::with_capacity(STATS_CAPACITY),
+            decode_ms: 0.0,
+        }
+    }
+
+    pub fn push(&mut self, rtt_ms: f32, fps: f32, mbps: f32, decode_ms: f32) {
+        fn push_capped(buf: &mut VecDeque<f32>, v: f32) {
+            if buf.len() == STATS_CAPACITY {
+                buf.pop_front();
+            }
+            buf.push_back(v);
+        }
+        push_capped(&mut self.rtt_ms, rtt_ms);
+        push_capped(&mut self.fps, fps);
+        push_capped(&mut self.mbps, mbps);
+        self.decode_ms = decode_ms;
+    }
+}
 
 /// Pre-tessellated egui frame ready for GPU upload and rendering.
 /// Produced by [`OverlayState::run_ui`] so the renderer never needs to
@@ -39,6 +80,8 @@ pub struct OverlayState {
     pub ctx: egui::Context,
     pub winit_state: egui_winit::State,
     pub visible: bool,
+    /// Stats HUD (histograms) visibility — independent of the menu.
+    pub stats_visible: bool,
     pub display_mode: DisplayMode,
 }
 
@@ -69,6 +112,8 @@ impl OverlayState {
             ctx,
             winit_state,
             visible: false,
+            // F3 toggles at runtime; DDISPLAY_STATS=1 starts with the HUD on.
+            stats_visible: std::env::var("DDISPLAY_STATS").map(|v| v == "1").unwrap_or(false),
             display_mode: DisplayMode::default(),
         }
     }
@@ -84,13 +129,14 @@ impl OverlayState {
         codec: &str,
         fps: u32,
         rtt_ms: f32,
+        stats: &StatsHistory,
         window: &winit::window::Window,
         files: Option<&mut FileTransferState>,
     ) -> (Option<EguiRenderData>, OverlayAction) {
         // Always drain accumulated winit input so it doesn't pile up while hidden.
         let raw_input = self.winit_state.take_egui_input(window);
 
-        if !self.visible {
+        if !self.visible && !self.stats_visible {
             return (None, OverlayAction::None);
         }
 
@@ -103,6 +149,11 @@ impl OverlayState {
 
         let mut action = OverlayAction::None;
 
+        if self.stats_visible {
+            draw_stats_hud(&self.ctx, codec, stats);
+        }
+
+        if self.visible {
         egui::Area::new(egui::Id::new("overlay_panel"))
             .fixed_pos(egui::pos2(panel_x, panel_y))
             .order(egui::Order::Foreground)
@@ -211,9 +262,10 @@ impl OverlayState {
                         ui.add_space(12.0);
                         ui.separator();
                         ui.add_space(8.0);
-                        ui.weak("Press F2 to close");
+                        ui.weak("F2 close · F3 stats");
                     });
             });
+        } // self.visible
 
         let full_output = self.ctx.end_pass();
         let pixels_per_point = full_output.pixels_per_point;
@@ -227,4 +279,111 @@ impl OverlayState {
             action,
         )
     }
+}
+
+/// Stats HUD: latency / fps / throughput histograms, top-right corner.
+fn draw_stats_hud(ctx: &egui::Context, codec: &str, stats: &StatsHistory) {
+    let hud_w = 280.0f32;
+    let screen = ctx.screen_rect();
+
+    egui::Area::new(egui::Id::new("stats_hud"))
+        .fixed_pos(egui::pos2(screen.width() - hud_w - 12.0, 12.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgba_premultiplied(12, 12, 18, 200))
+                .corner_radius(8.0)
+                .inner_margin(egui::Margin::same(10))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(60)))
+                .show(ui, |ui| {
+                    ui.set_width(hud_w - 20.0);
+
+                    histogram(
+                        ui,
+                        "Latency",
+                        &stats.rtt_ms,
+                        egui::Color32::from_rgb(250, 179, 135),
+                        |v| format!("{v:.0} ms"),
+                    );
+                    ui.add_space(6.0);
+                    histogram(
+                        ui,
+                        "FPS",
+                        &stats.fps,
+                        egui::Color32::from_rgb(166, 227, 161),
+                        |v| format!("{v:.0}"),
+                    );
+                    ui.add_space(6.0);
+                    histogram(
+                        ui,
+                        "Data",
+                        &stats.mbps,
+                        egui::Color32::from_rgb(137, 180, 250),
+                        |v| format!("{v:.1} Mbit/s"),
+                    );
+
+                    ui.add_space(4.0);
+                    ui.weak(format!(
+                        "{codec} · decode {:.1} ms · F3 to close",
+                        stats.decode_ms
+                    ));
+                });
+        });
+}
+
+/// One labelled bar-histogram row: newest sample on the right, bars scaled
+/// to the visible maximum (printed in the corner of the plot).
+fn histogram(
+    ui: &mut egui::Ui,
+    title: &str,
+    data: &std::collections::VecDeque<f32>,
+    color: egui::Color32,
+    fmt: impl Fn(f32) -> String,
+) {
+    let current = data.back().copied().unwrap_or(0.0);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(title).strong().size(13.0));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(egui::RichText::new(fmt(current)).monospace().size(13.0).color(color));
+        });
+    });
+
+    let height = 46.0f32;
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 3.0, egui::Color32::from_black_alpha(140));
+
+    if data.is_empty() {
+        return;
+    }
+    let max = data.iter().copied().fold(f32::EPSILON, f32::max);
+    let bar_w = rect.width() / STATS_CAPACITY as f32;
+    let usable_h = rect.height() - 4.0;
+    // Newest sample is flush right; history grows leftwards.
+    let offset = STATS_CAPACITY - data.len();
+    for (i, v) in data.iter().enumerate() {
+        let h = (v / max).clamp(0.0, 1.0) * usable_h;
+        if h <= 0.0 {
+            continue;
+        }
+        let x0 = rect.left() + (offset + i) as f32 * bar_w;
+        painter.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(x0, rect.bottom() - 2.0 - h),
+                egui::pos2(x0 + bar_w * 0.8, rect.bottom() - 2.0),
+            ),
+            0.0,
+            color,
+        );
+    }
+    painter.text(
+        rect.left_top() + egui::vec2(4.0, 2.0),
+        egui::Align2::LEFT_TOP,
+        format!("max {}", fmt(max)),
+        egui::FontId::proportional(10.0),
+        egui::Color32::from_gray(150),
+    );
 }

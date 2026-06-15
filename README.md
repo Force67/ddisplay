@@ -1,105 +1,81 @@
 # ddisplay
 
-GPU-accelerated remote display. It captures a Linux desktop session, encodes it
-on the GPU (NVENC H.264/AV1, with an OpenH264 software fallback), and streams it
-with low latency to a native Windows/Linux client or a browser. Input, clipboard,
-and file transfer are bidirectional.
+ddisplay captures a Linux desktop session and streams it to remote clients with low latency. Encoding runs on the GPU with NVENC (H.264 or AV1) and falls back to OpenH264 in software when no NVIDIA encoder is present. Input and clipboard sync both ways, and files transfer in either direction.
 
-> **Status: pre-alpha (`0.1.0-prealpha`).** Experimental and unstable — the wire
-> protocol, CLI, and APIs change without notice. Expect rough edges.
+> Status: pre-alpha (`0.1.0-prealpha`). The wire protocol, CLI and APIs are unstable and change without notice.
 
-## Components
-
-- **`server/`** — Linux capture/encode/stream server. X11 (MIT-SHM) and Wayland
-  (Mutter native, XDG Desktop Portal) backends; NVENC via CUDA with an OpenH264
-  software fallback; adaptive bitrate, dynamic resolution, on-demand keyframes.
-  Serves the web client and the WebSocket stream on a single port.
-- **`client-native/`** — Native client for Windows and Linux (winit + wgpu).
-  Hardware decode on Windows via Media Foundation / D3D11 (NVDEC / QuickSync);
-  OpenH264 and rav1d software decode elsewhere.
-- **`client/`** — Browser client (Media Source Extensions), served by the server.
-- **`server/color/`** — Standalone BGRA → YUV/NV12 color conversion (scalar,
-  AVX2, NEON).
+The repository is a Rust workspace. The server in `server/` runs the capture and encoding pipeline on Linux, with X11 (MIT-SHM) and Wayland (Mutter native, with an XDG Desktop Portal fallback) backends. It adapts bitrate and resolution at runtime and requests keyframes on demand. The native client in `client-native/` runs on Windows and Linux and is built on winit and wgpu. On Windows it decodes in hardware through Media Foundation and D3D11, and elsewhere it falls back to OpenH264 or rav1d in software. A browser client in `client/` uses Media Source Extensions and is served by the server. Color conversion from BGRA to YUV/NV12 lives in `server/color/`, with AVX2 and NEON acceleration over a scalar baseline.
 
 ## Building
 
-Rust stable (the server uses the 2024 edition). Build one component at a time
-with `cargo build --release -p <crate>`.
+The toolchain is Rust stable, and the server uses the 2024 edition. Build one component at a time with `cargo build --release -p <crate>`.
 
 ### Server (Linux)
-
-System packages (Debian/Ubuntu):
 
 ```sh
 sudo apt install build-essential pkg-config clang libclang-dev \
                  libpipewire-0.3-dev libxcb1-dev nasm
 ```
 
-- `clang` / `libclang-dev` and `libpipewire-0.3-dev` — bindgen and headers for
-  the Wayland/PipeWire backend.
-- `libxcb1-dev` — the X11 backend links libxcb.
-- `nasm` — OpenH264 assembly (x86_64 only).
-- NVENC headers are vendored (`server/third_party/ffnvcodec`); CUDA and NVENC are
-  loaded at runtime, so no CUDA toolkit is needed to build.
+The clang and libpipewire-0.3-dev packages provide bindgen and the Wayland backend headers. The X11 backend links libxcb, so the libxcb1-dev package is required. The nasm assembler builds the OpenH264 sources on x86_64. NVENC headers are vendored under `server/third_party/ffnvcodec`, and CUDA and NVENC load at runtime, so the build needs no CUDA toolkit.
 
 ```sh
 cargo build --release -p ddisplay-server
 ```
 
-### Native client (Windows / Linux)
+### Native client (Windows and Linux)
 
-- Windows: the MSVC toolchain and `nasm`.
-- Linux: `build-essential pkg-config libssl-dev nasm`.
+On Linux:
+
+```sh
+sudo apt install build-essential pkg-config libssl-dev nasm
+```
+
+On Windows the build needs the MSVC toolchain and nasm.
 
 ```sh
 cargo build --release -p ddisplay-client
 ```
 
-Binaries for Linux and Windows (amd64 and arm64) are also built by CI on every
-push.
+CI builds both clients and the server for amd64 and arm64 on every push.
 
 ## Running
 
-### Server
+Start the server against an X11 display, then connect from a browser or the native client.
 
 ```sh
 ./target/release/ddisplay-server --bind 0.0.0.0:9550 --display :10
 ```
 
-Open `http://<server-host>:9550` in a browser for the web client, or point the
-native client at the same address. The server captures the X11 display given by
-`--display` (or auto-detects a Wayland session). `scripts/` has helpers that spin
-up headless GNOME/KDE sessions to capture.
+Opening `http://<server-host>:9550` in a browser loads the web client, and the native client connects to the same address. When `--display` is omitted the server tries to auto-detect a Wayland session. The `scripts/` directory has helpers that start headless GNOME and KDE sessions to capture.
 
-Common flags (`--help` for the full list):
+The commonly used flags are below, and `--help` lists the rest.
 
 | Flag | Default | Purpose |
 |------|---------|---------|
 | `--bind` | `0.0.0.0:9550` | Listen address |
 | `--fps` | `60` | Target frame rate |
-| `--bitrate` | `0` (auto) | Video bitrate in bps; auto scales to resolution/fps/codec |
-| `--codec` | `auto` | `av1`, `h264`, or `auto` (AV1 when NVENC supports it) |
-| `--encoder` | `auto` | `nvenc`, `openh264`, or `auto` |
-| `--backend` | `auto` | `x11`, `wayland`, `portal`, or `auto` |
-| `--resize-to-client` | `true` | Resize the X display to the client's resolution (RandR) |
-| `--shared-dir <dir>` | — | Serve a directory over HTTP for file transfer |
+| `--bitrate` | `0` | Video bitrate in bps, where 0 auto-scales to resolution and fps |
+| `--codec` | `auto` | `auto` / `av1` / `h264` |
+| `--encoder` | `auto` | `auto` / `nvenc` / `openh264` |
+| `--backend` | `auto` | `auto` / `x11` / `wayland` / `portal` |
+| `--resize-to-client` | `true` | Resize the X display to the client resolution using RandR |
+| `--shared-dir <dir>` | none | Serve a directory over HTTP for file transfer |
 
-### Native client
+Connect the native client to the same address.
 
 ```sh
 ./target/release/ddisplay-client --server <server-host>:9550
 ```
 
-- **F2** — overlay menu (display mode, stats, codec).
-- **F3** — latency / fps / bandwidth HUD (`DDISPLAY_STATS=1` to start it enabled).
-- `DDISPLAY_NO_HWDEC=1` forces software decode.
+F2 opens the overlay menu and F3 toggles the stats HUD, which `DDISPLAY_STATS=1` starts enabled. Setting `DDISPLAY_NO_HWDEC=1` forces software decode.
 
 ## Layout
 
 ```
-server/         Linux capture/encode/stream server
-server/color/   BGRA -> YUV/NV12 SIMD color conversion
-client-native/  Windows/Linux native client (winit + wgpu)
+server/         Linux capture and encode server
+server/color/   BGRA to YUV/NV12 SIMD color conversion
+client-native/  Windows and Linux native client (winit and wgpu)
 client/         Browser client (MSE)
-scripts/        Headless GNOME/KDE session launchers
+scripts/        Headless GNOME and KDE session launchers
 ```

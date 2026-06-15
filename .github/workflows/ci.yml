@@ -24,27 +24,27 @@ jobs:
             runner: ubuntu-24.04
             package: ddisplay-server
             bin: ddisplay-server
-            kind: server
+            apt: build-essential pkg-config clang libclang-dev libpipewire-0.3-dev
           - name: server-linux-arm64
             runner: ubuntu-24.04-arm
             package: ddisplay-server
             bin: ddisplay-server
-            kind: server
+            apt: build-essential pkg-config clang libclang-dev libpipewire-0.3-dev
           - name: client-linux-amd64
             runner: ubuntu-24.04
             package: ddisplay-client
             bin: ddisplay-client
-            kind: client
+            apt: build-essential pkg-config libssl-dev
           - name: client-linux-arm64
             runner: ubuntu-24.04-arm
             package: ddisplay-client
             bin: ddisplay-client
-            kind: client
+            apt: build-essential pkg-config libssl-dev
           - name: client-windows-amd64
             runner: windows-latest
             package: ddisplay-client
             bin: ddisplay-client.exe
-            kind: client
+            apt: ""
 
     steps:
       - uses: actions/checkout@v4
@@ -55,28 +55,30 @@ jobs:
         if: runner.arch == 'X64'
         uses: ilammy/setup-nasm@v1
 
-      - name: Install Linux build dependencies
+      # Cached APT install: .deb packages are restored from the GitHub cache on
+      # a hit (no download / no apt-get update), keyed on the package set.
+      #   server: PipeWire headers + libclang (Wayland bindgen) + cc for NVENC
+      #   client: OpenSSL for native-tls (reqwest / tokio-tungstenite)
+      - name: Install and cache APT packages
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          if [ "${{ matrix.kind }}" = "server" ]; then
-            # PipeWire headers + libclang (bindgen) for the Wayland backend;
-            # build-essential/pkg-config for the NVENC wrapper (cc).
-            sudo apt-get install -y --no-install-recommends \
-              build-essential pkg-config clang libclang-dev libpipewire-0.3-dev
-          else
-            # OpenSSL for native-tls (reqwest / tokio-tungstenite).
-            sudo apt-get install -y --no-install-recommends \
-              build-essential pkg-config libssl-dev
-          fi
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        with:
+          packages: ${{ matrix.apt }}
+          version: 1
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo registry and build
+      # Caches ~/.cargo/{registry,git} and ./target, keyed on the lockfile and
+      # rustc version (per build target via `key`). cache-on-failure keeps a
+      # partial cache when a build breaks; only main writes the cache so PRs
+      # read it without each producing their own copy.
+      - name: Cache Rust dependencies and build output
         uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.name }}
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build ${{ matrix.package }} (release)
         run: cargo build --release --locked -p ${{ matrix.package }}

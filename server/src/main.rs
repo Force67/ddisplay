@@ -531,7 +531,11 @@ fn capture_encode_loop(
         let mut rebuild = false; // encoder must be rebuilt
         let mut resolution_changed = false;
 
-        if last_recheck.elapsed() >= Duration::from_secs(1) {
+        // A pending monitor plug/unplug opens the recheck immediately (the
+        // transport wakes the loop via notify_activity) so it doesn't wait up to
+        // a second — otherwise add/remove feels sluggish.
+        let monitor_pending = control.monitor_request.lock().is_some();
+        if last_recheck.elapsed() >= Duration::from_secs(1) || monitor_pending {
             last_recheck = Instant::now();
 
             // Client requested a display resize (--resize-to-client). Skipped
@@ -575,10 +579,15 @@ fn capture_encode_loop(
                         cur_count, desired, base_w, base_h,
                     );
                     match monitor::apply_layout(desired, base_w, base_h) {
-                        Ok(rects) => {
-                            *control.monitors.lock() = rects.clone();
+                        Ok(_) => {
+                            // Provisional layout (responsive); the size_changed
+                            // reconcile below corrects it to the real captured
+                            // size, which is what the client crops against.
+                            let rects =
+                                monitor::equal_columns(desired, base_w * desired as u32, base_h);
+                            *control.monitors.lock() = rects;
                             let _ = frame_tx.send(protocol::encode_monitor_layout(
-                                &protocol::MonitorLayout { monitors: rects },
+                                &control.monitor_layout(),
                             ));
                         }
                         Err(e) => tracing::warn!("[monitor] layout change failed: {:#}", e),
@@ -599,6 +608,22 @@ fn capture_encode_loop(
                         screen_h = capturer.height();
                         rebuild = true;
                         resolution_changed = true;
+
+                        // Reconcile the broadcast layout to the ACTUAL captured
+                        // size (the driver may snap to a nearby mode). The client
+                        // crops and maps input against these rects, so they must
+                        // tile the real framebuffer exactly. Covers both
+                        // resize-to-client (single head) and a head add/remove.
+                        let count = control.monitors.lock().len().max(1);
+                        let rects = monitor::equal_columns(count, screen_w, screen_h);
+                        let mut mons = control.monitors.lock();
+                        if *mons != rects {
+                            *mons = rects;
+                            drop(mons);
+                            let _ = frame_tx.send(protocol::encode_monitor_layout(
+                                &control.monitor_layout(),
+                            ));
+                        }
                     }
                     Err(e) => tracing::error!("Failed to rebuild capturer after resize: {}", e),
                 }

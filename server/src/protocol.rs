@@ -77,7 +77,7 @@ pub struct SessionInfo {
 }
 
 /// One monitor (head) and its pixel rectangle inside the captured framebuffer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MonitorRect {
     /// Stable 0-based index. Monitor 0 is the primary head.
     pub id: u32,

@@ -485,10 +485,15 @@ impl ApplicationHandler for App {
         // in lockstep (each renderer crops its own head out of the same frame).
         if has_frame {
             if let Some(frame) = self.frame_slot.lock().unwrap().take() {
-                // No layout yet (legacy server) → primary maps the whole frame.
-                if self.monitors.is_empty() {
+                // With 0 or 1 monitor the primary head IS the whole framebuffer,
+                // so track the live frame size (this also follows resize-to-client,
+                // which doesn't change the monitor count). With 2+ monitors the
+                // framebuffer size is fixed by the layout, so reconcile_windows
+                // owns the primary's input map and we leave it alone.
+                if self.monitors.len() <= 1 {
                     if let Some(input) = &mut self.input_state {
                         input.set_remote_size(frame.width, frame.height);
+                        input.set_remote_offset(0, 0);
                     }
                 }
                 if let Some(renderer) = &mut self.renderer {
@@ -607,8 +612,9 @@ impl App {
                 }
 
                 // Push to the background decode thread (non-blocking).
-                // Skip when the window is hidden — no point decoding frames nobody sees.
-                if self.window_visible {
+                // Skip only when nothing is visible — the second-monitor window
+                // shares this decode pipeline, so keep decoding if it is open.
+                if self.window_visible || self.secondary.is_some() {
                     // After a dropped frame the bitstream is broken until the next
                     // keyframe — discard inter-frames instead of decoding garbage.
                     if self.skip_until_keyframe && !frame.keyframe {
@@ -671,9 +677,16 @@ impl App {
             }
             ServerMessage::MonitorLayout(json_bytes) => {
                 if let Ok(layout) = serde_json::from_slice::<MonitorLayoutMsg>(json_bytes) {
-                    if layout.monitors != self.monitors {
-                        eprintln!("[monitor] layout: {} head(s)", layout.monitors.len());
-                        self.monitors = layout.monitors;
+                    // Drop any malformed zero-size heads so we never open a black
+                    // window or divide by zero computing crops.
+                    let monitors: Vec<MonitorInfo> = layout
+                        .monitors
+                        .into_iter()
+                        .filter(|m| m.width > 0 && m.height > 0)
+                        .collect();
+                    if !monitors.is_empty() && monitors != self.monitors {
+                        eprintln!("[monitor] layout: {} head(s)", monitors.len());
+                        self.monitors = monitors;
                         // Window reconciliation needs the event loop; defer it.
                         self.layout_dirty = true;
                     }
@@ -772,7 +785,11 @@ impl App {
             .transport_sender
             .clone()
             .ok_or_else(|| anyhow::anyhow!("transport sender not ready"))?;
-        let input = input::InputState::new(sender);
+        let mut input = input::InputState::new(sender);
+        // Seed the window size so input scaling is correct before the first
+        // Resized event (which some platforms don't deliver on creation).
+        let size = window.inner_size();
+        input.set_window_size(size.width, size.height);
         Ok(MonitorWindow { window, renderer, input })
     }
 

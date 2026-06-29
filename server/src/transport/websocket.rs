@@ -507,6 +507,17 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
         state.arbitrate_codec();
     }
 
+    // When no client that can manage monitors remains, unplug any virtual
+    // monitors so the session isn't left altered (and a lone read-only viewer
+    // isn't stranded with a head it can't remove). Keyed on writable clients,
+    // since read-only clients can't add or remove monitors.
+    let no_writers = state.status.lock().writable_clients == 0;
+    if no_writers && state.control.monitors.lock().len() > 1 {
+        tracing::info!("[monitor] no writable clients left; restoring single head");
+        *state.control.monitor_request.lock() = Some(1);
+        state.control.notify_activity();
+    }
+
     tracing::info!("{}#{}: WebSocket disconnected", peer, conn_id);
 }
 

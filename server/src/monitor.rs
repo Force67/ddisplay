@@ -26,6 +26,24 @@ fn monitor_name(i: usize) -> String {
     format!("ddisplay-{i}")
 }
 
+/// Split a `w`×`h` framebuffer into `count` equal-width heads. The last head
+/// absorbs any remainder so the heads tile the framebuffer exactly (the client
+/// derives crop UVs and input offsets from these, so they must cover the real
+/// captured size with no gap). This is the authoritative client-facing layout,
+/// recomputed from the *actual* captured size after every resolution change.
+pub fn equal_columns(count: usize, w: u32, h: u32) -> Vec<MonitorRect> {
+    let n = count.clamp(1, MAX_MONITORS);
+    let col_w = ((w / n as u32) & !1).max(2);
+    (0..n)
+        .map(|i| {
+            let x = i as u32 * col_w;
+            // The rightmost head takes whatever is left, so the union == w.
+            let width = if i == n - 1 { w.saturating_sub(x).max(2) } else { col_w };
+            MonitorRect { id: i as u32, x, y: 0, width, height: h }
+        })
+        .collect()
+}
+
 /// Pixel size to millimetres at a nominal 96 dpi (xrandr wants a physical size).
 fn mm(px: u32) -> u32 {
     (px * 254 / 960).max(1)
@@ -39,6 +57,17 @@ fn mm(px: u32) -> u32 {
 pub fn apply_layout(count: usize, base_w: u32, base_h: u32) -> Result<Vec<MonitorRect>> {
     let count = count.clamp(1, MAX_MONITORS);
 
+    // The framebuffer must hold every head side by side. resize_display caps
+    // width at 7680, beyond which the heads would fall outside it and
+    // --setmonitor would fail — reject up front with a clear error.
+    let total_w = base_w as u64 * count as u64;
+    if total_w > 7680 {
+        anyhow::bail!(
+            "{} heads of {}px exceed the {}px framebuffer limit",
+            count, base_w, 7680,
+        );
+    }
+
     // Always clear any heads we declared on a previous call before re-laying out
     // (xrandr rejects a --setmonitor whose region falls outside the framebuffer,
     // so the geometry must be torn down before a shrink).
@@ -49,12 +78,16 @@ pub fn apply_layout(count: usize, base_w: u32, base_h: u32) -> Result<Vec<Monito
     // Size the framebuffer to hold every head.
     resize::resize_display(base_w * count as u32, base_h)?;
 
-    let mut rects = Vec::with_capacity(count);
     if count == 1 {
-        // Single head: leave the output's own monitor in place.
-        rects.push(MonitorRect { id: 0, x: 0, y: 0, width: base_w, height: base_h });
-        return Ok(rects);
+        // Single head: we declared no user monitors (the delmonitor loop above
+        // cleared any from a previous multi-head layout). With no user-defined
+        // RandR monitors, the X server reports the output's automatic monitor
+        // again, restoring the normal single-display view. The client-facing
+        // rects are recomputed from the real captured size by the caller, so we
+        // return a placeholder here.
+        return Ok(equal_columns(1, base_w, base_h));
     }
+    let mut rects = Vec::with_capacity(count);
 
     let output = resize::connected_output()?;
     for i in 0..count {

@@ -74,6 +74,10 @@ pub enum OverlayAction {
     Download(String),
     /// User clicked refresh.
     RefreshFiles,
+    /// User asked to plug in a virtual second monitor.
+    AddMonitor,
+    /// User asked to unplug the last virtual monitor.
+    RemoveMonitor,
 }
 
 pub struct OverlayState {
@@ -83,6 +87,9 @@ pub struct OverlayState {
     /// Stats HUD (histograms) visibility — independent of the menu.
     pub stats_visible: bool,
     pub display_mode: DisplayMode,
+    /// Number of monitors (heads) the session currently exposes, mirrored from
+    /// the app each frame so the panel can show and gate the add/remove buttons.
+    pub monitor_count: usize,
 }
 
 impl OverlayState {
@@ -115,6 +122,7 @@ impl OverlayState {
             // F3 toggles at runtime; DDISPLAY_STATS=1 starts with the HUD on.
             stats_visible: std::env::var("DDISPLAY_STATS").map(|v| v == "1").unwrap_or(false),
             display_mode: DisplayMode::default(),
+            monitor_count: 1,
         }
     }
 
@@ -191,6 +199,31 @@ impl OverlayState {
                                 DisplayMode::Stretch,
                                 "⤢ Stretch",
                             );
+                        });
+
+                        // ── Monitors ──────────────────────────────────────────
+                        ui.add_space(12.0);
+                        ui.label(format!("🖥 Monitors: {}", self.monitor_count.max(1)));
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    self.monitor_count < 2,
+                                    egui::Button::new("➕ Add monitor"),
+                                )
+                                .on_hover_text("Plug in a second virtual monitor")
+                                .clicked()
+                            {
+                                action = OverlayAction::AddMonitor;
+                            }
+                            if ui
+                                .add_enabled(
+                                    self.monitor_count > 1,
+                                    egui::Button::new("➖ Remove"),
+                                )
+                                .clicked()
+                            {
+                                action = OverlayAction::RemoveMonitor;
+                            }
                         });
 
                         // ── File transfer panel ──────────────────────────────

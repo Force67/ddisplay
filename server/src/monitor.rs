@@ -1,0 +1,76 @@
+//! Virtual multi-monitor support for the captured X session.
+//!
+//! "Plugging in" a second monitor means exposing a genuine second head to the
+//! desktop (so the window manager treats it as a real display: its own work
+//! area, maximize target, etc.), not just a wider single screen. We do that by
+//! widening the framebuffer to hold the heads side by side and then declaring
+//! one RandR *monitor* per head with `xrandr --setmonitor`, which Mutter/KDE
+//! honour as separate displays.
+//!
+//! The capture still grabs the whole root as one stream; the client crops each
+//! head's rect ([`MonitorRect`]) into its own window.
+//!
+//! Requires a RandR-capable X server (the Xorg "dummy" driver in the usual
+//! ddisplay setup). Xvfb can't resize, so multi-monitor is unavailable there.
+
+use anyhow::Result;
+
+use crate::protocol::MonitorRect;
+use crate::resize;
+
+/// Hard cap on virtual heads (keeps the framebuffer and encoder sane).
+pub const MAX_MONITORS: usize = 4;
+
+/// Name of the i-th logical monitor we declare via xrandr.
+fn monitor_name(i: usize) -> String {
+    format!("ddisplay-{i}")
+}
+
+/// Pixel size to millimetres at a nominal 96 dpi (xrandr wants a physical size).
+fn mm(px: u32) -> u32 {
+    (px * 254 / 960).max(1)
+}
+
+/// Lay the session out as `count` side-by-side heads, each `base_w`×`base_h`.
+///
+/// Widens the framebuffer to `base_w * count`×`base_h`, declares one logical
+/// monitor per head, and returns their rects. `count == 1` tears the extra
+/// heads down and restores the single-head framebuffer.
+pub fn apply_layout(count: usize, base_w: u32, base_h: u32) -> Result<Vec<MonitorRect>> {
+    let count = count.clamp(1, MAX_MONITORS);
+
+    // Always clear any heads we declared on a previous call before re-laying out
+    // (xrandr rejects a --setmonitor whose region falls outside the framebuffer,
+    // so the geometry must be torn down before a shrink).
+    for i in 0..MAX_MONITORS {
+        let _ = resize::run_xrandr(&["--delmonitor", &monitor_name(i)]);
+    }
+
+    // Size the framebuffer to hold every head.
+    resize::resize_display(base_w * count as u32, base_h)?;
+
+    let mut rects = Vec::with_capacity(count);
+    if count == 1 {
+        // Single head: leave the output's own monitor in place.
+        rects.push(MonitorRect { id: 0, x: 0, y: 0, width: base_w, height: base_h });
+        return Ok(rects);
+    }
+
+    let output = resize::connected_output()?;
+    for i in 0..count {
+        let x = i as u32 * base_w;
+        // geometry: <w>/<mmw>x<h>/<mmh>+<x>+<y>
+        let geom = format!(
+            "{}/{}x{}/{}+{}+{}",
+            base_w, mm(base_w), base_h, mm(base_h), x, 0,
+        );
+        // The first logical monitor claims the real output; the rest are
+        // free-standing heads (`none`) carved out of the same framebuffer.
+        let outputs = if i == 0 { output.as_str() } else { "none" };
+        resize::run_xrandr(&["--setmonitor", &monitor_name(i), &geom, outputs])?;
+        rects.push(MonitorRect { id: i as u32, x, y: 0, width: base_w, height: base_h });
+    }
+
+    tracing::info!("[monitor] laid out {} head(s) at {}x{} each", count, base_w, base_h);
+    Ok(rects)
+}

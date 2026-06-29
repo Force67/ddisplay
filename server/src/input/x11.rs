@@ -125,7 +125,11 @@ impl X11InputInjector {
                 // Handled by spawn_input_handler before reaching inject_event.
                 return Ok(());
             }
-            ClientEvent::Caps(_) | ClientEvent::Stats(_) | ClientEvent::Ping { .. } => {
+            ClientEvent::Caps(_)
+            | ClientEvent::Stats(_)
+            | ClientEvent::Ping { .. }
+            | ClientEvent::RequestAddMonitor
+            | ClientEvent::RequestRemoveMonitor => {
                 // Handled by the WebSocket layer; never forwarded to the input injector.
                 return Ok(());
             }

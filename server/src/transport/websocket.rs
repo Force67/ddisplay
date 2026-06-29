@@ -284,6 +284,13 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
         return;
     }
 
+    // Send the current monitor layout so the client opens one window per head
+    // and crops each to its rect.
+    let layout = protocol::encode_monitor_layout(&state.control.monitor_layout());
+    if ws_sender.send(Message::Binary(layout.into())).await.is_err() {
+        return;
+    }
+
     // Subscribe to the frame broadcast, then ask the encode loop for a fresh
     // IDR. With an infinite GOP this is what bootstraps the new decoder —
     // the IDR arrives within a frame interval (the wake cuts idle pacing
@@ -392,6 +399,24 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
                             if let Some(ref tx) = clipboard_set_tx {
                                 let _ = tx.try_send(text);
                             }
+                        }
+                        // Plug/unplug a virtual head. The encode loop applies the
+                        // new count (widen framebuffer + declare heads) and
+                        // broadcasts the layout. Gated like input.
+                        ev @ (ClientEvent::RequestAddMonitor
+                        | ClientEvent::RequestRemoveMonitor) => {
+                            if readonly {
+                                continue;
+                            }
+                            let current = recv_state.control.monitors.lock().len();
+                            let desired = match ev {
+                                ClientEvent::RequestAddMonitor => {
+                                    (current + 1).min(crate::monitor::MAX_MONITORS)
+                                }
+                                _ => current.saturating_sub(1).max(1),
+                            };
+                            *recv_state.control.monitor_request.lock() = Some(desired);
+                            recv_state.control.notify_activity();
                         }
                         other => {
                             if readonly {
@@ -690,7 +715,11 @@ fn normalize_input_events(
             // Passed through directly to the input handler which sets the force_keyframe flag.
             vec![ClientEvent::RequestKeyframe]
         }
-        ClientEvent::Caps(_) | ClientEvent::Stats(_) | ClientEvent::Ping { .. } => {
+        ClientEvent::Caps(_)
+        | ClientEvent::Stats(_)
+        | ClientEvent::Ping { .. }
+        | ClientEvent::RequestAddMonitor
+        | ClientEvent::RequestRemoveMonitor => {
             // Intercepted in the recv_task before reaching normalization.
             vec![]
         }

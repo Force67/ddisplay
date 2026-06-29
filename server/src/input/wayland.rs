@@ -155,7 +155,9 @@ impl super::InputInjector for WaylandInputInjector {
             | ClientEvent::RequestKeyframe
             | ClientEvent::Caps(_)
             | ClientEvent::Stats(_)
-            | ClientEvent::Ping { .. } => {}
+            | ClientEvent::Ping { .. }
+            | ClientEvent::RequestAddMonitor
+            | ClientEvent::RequestRemoveMonitor => {}
         }
         Ok(())
     }

@@ -10,6 +10,7 @@ mod protocol;
 mod capture;
 mod control;
 mod encoder;
+mod monitor;
 mod transport;
 mod input;
 mod clipboard;
@@ -533,9 +534,12 @@ fn capture_encode_loop(
         if last_recheck.elapsed() >= Duration::from_secs(1) {
             last_recheck = Instant::now();
 
-            // Client requested a display resize (--resize-to-client).
+            // Client requested a display resize (--resize-to-client). Skipped
+            // while more than one head is plugged in — the monitor layout owns
+            // the framebuffer size then (resize-to-client would shrink it back).
             if let Some((rw, rh)) = control.resize_request.lock().take() {
-                if (rw, rh) != (screen_w, screen_h) {
+                let multi_monitor = control.monitors.lock().len() > 1;
+                if (rw, rh) != (screen_w, screen_h) && !multi_monitor {
                     if backend == BackendKind::Wayland {
                         // Dynamic resize is out of scope for the Wayland v1
                         // backend (the headless virtual monitor is fixed).
@@ -548,6 +552,36 @@ fn capture_encode_loop(
                         if let Err(e) = resize::resize_display(rw, rh) {
                             tracing::warn!("[resize] failed: {:#}", e);
                         }
+                    }
+                }
+            }
+
+            // Client plugged/unplugged a virtual monitor. Re-lay-out the heads;
+            // the framebuffer resize is picked up by the size_changed() check
+            // below (which rebuilds the capturer + encoder). The new layout is
+            // broadcast so every client opens/closes its extra windows.
+            if let Some(desired) = control.monitor_request.lock().take() {
+                let cur_count = control.monitors.lock().len().max(1);
+                if backend == BackendKind::Wayland {
+                    tracing::info!(
+                        "[monitor] {} head(s) requested — ignored (wayland backend)",
+                        desired,
+                    );
+                } else if desired != cur_count {
+                    let base_w = (screen_w / cur_count as u32).max(2) & !1;
+                    let base_h = screen_h;
+                    tracing::info!(
+                        "[monitor] heads {} -> {} (base {}x{})",
+                        cur_count, desired, base_w, base_h,
+                    );
+                    match monitor::apply_layout(desired, base_w, base_h) {
+                        Ok(rects) => {
+                            *control.monitors.lock() = rects.clone();
+                            let _ = frame_tx.send(protocol::encode_monitor_layout(
+                                &protocol::MonitorLayout { monitors: rects },
+                            ));
+                        }
+                        Err(e) => tracing::warn!("[monitor] layout change failed: {:#}", e),
                     }
                 }
             }

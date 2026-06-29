@@ -73,6 +73,36 @@ struct DecodeJob {
     keyframe: bool,
 }
 
+/// One monitor (head) and its pixel rect inside the captured framebuffer,
+/// parsed from MSG_MONITOR_LAYOUT.
+#[derive(serde::Deserialize, Clone, Default, PartialEq)]
+struct MonitorInfo {
+    #[serde(default)]
+    id: u32,
+    #[serde(default)]
+    x: u32,
+    #[serde(default)]
+    y: u32,
+    #[serde(default)]
+    width: u32,
+    #[serde(default)]
+    height: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct MonitorLayoutMsg {
+    #[serde(default)]
+    monitors: Vec<MonitorInfo>,
+}
+
+/// A secondary-monitor window: its own OS window, GPU surface, and input map.
+/// Renders a crop of the shared decoded frame for one extra head.
+struct MonitorWindow {
+    window: Arc<Window>,
+    renderer: renderer::Renderer,
+    input: input::InputState,
+}
+
 /// Application state.
 struct App {
     args: Args,
@@ -123,6 +153,16 @@ struct App {
     stats: overlay::StatsHistory,
     /// Wire bytes received since the last stats tick (all message types).
     stats_bytes: u64,
+    /// Current monitor layout from the server (one entry per head). Empty until
+    /// the first MSG_MONITOR_LAYOUT; treated as a single full-frame monitor then.
+    monitors: Vec<MonitorInfo>,
+    /// Set when `monitors` changed so `about_to_wait` reconciles windows (open
+    /// or close the secondary head) — winit window creation needs the event loop.
+    layout_dirty: bool,
+    /// Extra-monitor window (second head). Phase 1 supports one beyond primary.
+    secondary: Option<MonitorWindow>,
+    /// Clone of the transport sender, used to build a second window's input map.
+    transport_sender: Option<transport::TransportSender>,
 }
 
 impl ApplicationHandler for App {
@@ -190,7 +230,8 @@ impl ApplicationHandler for App {
         let clipboard_last_set = clipboard::spawn_monitor(sender.clone());
         self.clipboard_last_set = clipboard_last_set;
 
-        let input_state = input::InputState::new(sender);
+        let input_state = input::InputState::new(sender.clone());
+        self.transport_sender = Some(sender);
 
         self.window = Some(window.clone());
         self.renderer = Some(renderer);
@@ -206,7 +247,13 @@ impl ApplicationHandler for App {
         tracing::info!("Window created, connecting to server...");
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // Route events for the secondary-monitor window to its own handler.
+        if self.secondary.as_ref().map_or(false, |s| s.window.id() == id) {
+            self.handle_secondary_event(event);
+            return;
+        }
+
         // Only let egui consume events while the overlay is actually visible.
         // Otherwise stale egui focus/capture state can swallow remote input.
         if let (Some(overlay), Some(window)) = (&mut self.overlay, &self.window) {
@@ -296,14 +343,13 @@ impl ApplicationHandler for App {
                     return;
                 }
 
-                // Upload latest frame decoded by the background thread.
-                if let Some(frame) = self.frame_slot.lock().unwrap().take() {
-                    if let Some(input) = &mut self.input_state {
-                        input.set_remote_size(frame.width, frame.height);
-                    }
-                    if let Some(renderer) = &mut self.renderer {
-                        renderer.upload_frame(&frame);
-                    }
+                // (Decoded frames are uploaded to every monitor window in
+                // about_to_wait, so they stay in lockstep.)
+
+                // Mirror the current monitor count so the panel can show and
+                // gate the add/remove-monitor buttons.
+                if let Some(overlay) = &mut self.overlay {
+                    overlay.monitor_count = self.monitors.len().max(1);
                 }
 
                 // Run egui UI — only produces output when overlay is visible.
@@ -357,6 +403,16 @@ impl ApplicationHandler for App {
                             }
                         }
                     }
+                    OverlayAction::AddMonitor => {
+                        if let Some(input) = &self.input_state {
+                            input.send_raw(protocol::encode_request_add_monitor());
+                        }
+                    }
+                    OverlayAction::RemoveMonitor => {
+                        if let Some(input) = &self.input_state {
+                            input.send_raw(protocol::encode_request_remove_monitor());
+                        }
+                    }
                     OverlayAction::None => {}
                 }
 
@@ -370,9 +426,15 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // Always drain transport events — this must not depend on rendering.
         self.process_transport_events();
+
+        // Open/close the secondary window to match the latest layout (needs the
+        // event loop, so it can't run inside the message handler).
+        if self.layout_dirty {
+            self.reconcile_windows(event_loop);
+        }
 
         // If the decoder reset itself, ask the server for a fresh keyframe immediately.
         if self.needs_keyframe.swap(false, std::sync::atomic::Ordering::Relaxed) {
@@ -411,18 +473,42 @@ impl ApplicationHandler for App {
             self.stats_dropped = 0;
         }
 
-        if !self.window_visible {
-            return;
-        }
         let overlay_open = self
             .overlay
             .as_ref()
             .map_or(false, |o| o.visible || o.stats_visible);
-        let has_frame = self.frame_ready.load(std::sync::atomic::Ordering::Relaxed);
-        if has_frame || overlay_open {
-            self.frame_ready.store(false, std::sync::atomic::Ordering::Relaxed);
+        let has_frame = self
+            .frame_ready
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+
+        // Upload the newest decoded frame to every monitor window so they stay
+        // in lockstep (each renderer crops its own head out of the same frame).
+        if has_frame {
+            if let Some(frame) = self.frame_slot.lock().unwrap().take() {
+                // No layout yet (legacy server) → primary maps the whole frame.
+                if self.monitors.is_empty() {
+                    if let Some(input) = &mut self.input_state {
+                        input.set_remote_size(frame.width, frame.height);
+                    }
+                }
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.upload_frame(&frame);
+                }
+                if let Some(sec) = &mut self.secondary {
+                    sec.renderer.upload_frame(&frame);
+                }
+            }
+        }
+
+        if (has_frame || overlay_open) && self.window_visible {
             if let Some(window) = &self.window {
                 window.request_redraw();
+            }
+        }
+        // The secondary head has no overlay; redraw it whenever a frame arrives.
+        if has_frame {
+            if let Some(sec) = &self.secondary {
+                sec.window.request_redraw();
             }
         }
     }
@@ -583,6 +669,16 @@ impl App {
                     eprintln!("[session] WARNING: failed to parse SessionInfo JSON");
                 }
             }
+            ServerMessage::MonitorLayout(json_bytes) => {
+                if let Ok(layout) = serde_json::from_slice::<MonitorLayoutMsg>(json_bytes) {
+                    if layout.monitors != self.monitors {
+                        eprintln!("[monitor] layout: {} head(s)", layout.monitors.len());
+                        self.monitors = layout.monitors;
+                        // Window reconciliation needs the event loop; defer it.
+                        self.layout_dirty = true;
+                    }
+                }
+            }
             ServerMessage::CursorUpdate(_cursor) => {
                 // TODO: render remote cursor overlay
             }
@@ -598,6 +694,140 @@ impl App {
             ServerMessage::Unknown(t) => {
                 eprintln!("[proto] unknown message type 0x{:02x}", t);
             }
+        }
+    }
+
+    /// Bounding size of the captured framebuffer (union of all heads), in px.
+    fn framebuffer_size(&self) -> (f32, f32) {
+        let mut fw = 0u32;
+        let mut fh = 0u32;
+        for m in &self.monitors {
+            fw = fw.max(m.x + m.width);
+            fh = fh.max(m.y + m.height);
+        }
+        (fw.max(1) as f32, fh.max(1) as f32)
+    }
+
+    /// UV sub-rect of the decoded frame that this monitor occupies.
+    fn crop_for(&self, m: &MonitorInfo) -> [f32; 4] {
+        let (fw, fh) = self.framebuffer_size();
+        [m.x as f32 / fw, m.y as f32 / fh, m.width as f32 / fw, m.height as f32 / fh]
+    }
+
+    /// Open/close the secondary window and refresh each window's crop + input
+    /// map to match the current monitor layout. Needs the event loop to create
+    /// windows, so it runs from `about_to_wait`, not the message handler.
+    fn reconcile_windows(&mut self, event_loop: &ActiveEventLoop) {
+        self.layout_dirty = false;
+        if self.monitors.is_empty() {
+            return;
+        }
+
+        // Primary window shows monitor 0.
+        let m0 = self.monitors[0].clone();
+        let crop0 = self.crop_for(&m0);
+        if let Some(r) = &mut self.renderer {
+            r.set_crop(crop0);
+        }
+        if let Some(input) = &mut self.input_state {
+            input.set_remote_size(m0.width, m0.height);
+            input.set_remote_offset(m0.x, m0.y);
+        }
+
+        if self.monitors.len() >= 2 {
+            let m1 = self.monitors[1].clone();
+            let crop1 = self.crop_for(&m1);
+            if self.secondary.is_none() {
+                eprintln!("[monitor] opening second window for head 1");
+                let created = self.create_secondary(event_loop);
+                match created {
+                    Ok(sec) => self.secondary = Some(sec),
+                    Err(e) => eprintln!("[monitor] failed to open second window: {e:#}"),
+                }
+            }
+            if let Some(sec) = &mut self.secondary {
+                sec.renderer.set_crop(crop1);
+                sec.input.set_remote_size(m1.width, m1.height);
+                sec.input.set_remote_offset(m1.x, m1.y);
+            }
+        } else if self.secondary.is_some() {
+            eprintln!("[monitor] closing second window");
+            self.secondary = None;
+        }
+    }
+
+    /// Create the secondary-monitor window with its own GPU surface and input.
+    fn create_secondary(&self, event_loop: &ActiveEventLoop) -> anyhow::Result<MonitorWindow> {
+        let attrs = WindowAttributes::default()
+            .with_title(format!("{} — monitor 2", self.args.title))
+            .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
+        #[cfg(windows)]
+        let attrs = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs.with_drag_and_drop(false)
+        };
+        let window = Arc::new(event_loop.create_window(attrs)?);
+        let renderer = pollster::block_on(renderer::Renderer::new(window.clone()))?;
+        let sender = self
+            .transport_sender
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("transport sender not ready"))?;
+        let input = input::InputState::new(sender);
+        Ok(MonitorWindow { window, renderer, input })
+    }
+
+    /// Handle a window event for the secondary-monitor window.
+    fn handle_secondary_event(&mut self, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => {
+                if let Some(sec) = &self.secondary {
+                    sec.input.release_all();
+                }
+                // Closing the second window unplugs the virtual monitor.
+                if let Some(sender) = &self.transport_sender {
+                    sender.send(protocol::encode_request_remove_monitor());
+                }
+                self.secondary = None;
+            }
+            WindowEvent::Resized(size) => {
+                if let Some(sec) = &mut self.secondary {
+                    sec.renderer.resize(size.width, size.height);
+                    sec.input.set_window_size(size.width, size.height);
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(sec) = &mut self.secondary {
+                    sec.input.on_cursor_moved(position.x, position.y);
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if let Some(sec) = &mut self.secondary {
+                    sec.input.on_mouse_button(button, state);
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if let Some(sec) = &mut self.secondary {
+                    sec.input.on_scroll(delta);
+                }
+            }
+            WindowEvent::KeyboardInput { event: key_event, .. } => {
+                if let Some(sec) = &mut self.secondary {
+                    sec.input.on_key(key_event.physical_key, key_event.state);
+                }
+            }
+            WindowEvent::Focused(false) => {
+                if let Some(sec) = &self.secondary {
+                    sec.input.release_all();
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                if let Some(sec) = &mut self.secondary {
+                    if let Err(e) = sec.renderer.render(None) {
+                        tracing::warn!("[monitor2] render error: {}", e);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -729,6 +959,10 @@ fn main() {
         hw_decode,
         stats: overlay::StatsHistory::new(),
         stats_bytes: 0,
+        monitors: Vec::new(),
+        layout_dirty: false,
+        secondary: None,
+        transport_sender: None,
     };
 
     if let Err(e) = event_loop.run_app(&mut app) {

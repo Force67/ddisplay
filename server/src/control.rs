@@ -7,7 +7,7 @@ use parking_lot::{Condvar, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
-use crate::protocol::SessionInfo;
+use crate::protocol::{MonitorLayout, MonitorRect, SessionInfo};
 
 pub struct StreamControl {
     /// Set by clients (keyframe request) or after a reconfiguration.
@@ -33,10 +33,25 @@ pub struct StreamControl {
     pub session: Mutex<SessionInfo>,
     /// Last time congestion was observed (lagging client or reported drops).
     pub last_congestion: Mutex<Option<Instant>>,
+    /// Desired monitor count requested by a client (plug/unplug a virtual
+    /// head). The encode loop applies it: widen the framebuffer, declare the
+    /// heads, then publish `monitors` and broadcast the new layout.
+    pub monitor_request: Mutex<Option<usize>>,
+    /// Current monitor layout (one entry per head). Read by the transport to
+    /// hand each new client the layout on connect.
+    pub monitors: Mutex<Vec<MonitorRect>>,
 }
 
 impl StreamControl {
     pub fn new(session: SessionInfo, bitrate_ceiling: u32) -> Self {
+        // Start as a single head covering the whole framebuffer.
+        let primary = MonitorRect {
+            id: 0,
+            x: 0,
+            y: 0,
+            width: session.width,
+            height: session.height,
+        };
         Self {
             force_keyframe: AtomicBool::new(false),
             input_pending: AtomicBool::new(false),
@@ -48,7 +63,14 @@ impl StreamControl {
             resize_request: Mutex::new(None),
             session: Mutex::new(session),
             last_congestion: Mutex::new(None),
+            monitor_request: Mutex::new(None),
+            monitors: Mutex::new(vec![primary]),
         }
+    }
+
+    /// Current monitor layout snapshot.
+    pub fn monitor_layout(&self) -> MonitorLayout {
+        MonitorLayout { monitors: self.monitors.lock().clone() }
     }
 
     /// Signal activity (input event, new client) to the encode loop: sets the

@@ -61,7 +61,13 @@ struct XrandrInfo {
     current: Option<(u32, u32)>,
 }
 
-fn run_xrandr(args: &[&str]) -> Result<String> {
+/// The first connected xrandr output (the head ddisplay drives).
+pub(crate) fn connected_output() -> Result<String> {
+    let query = run_xrandr(&["--query"])?;
+    Ok(parse_xrandr_query(&query)?.output)
+}
+
+pub(crate) fn run_xrandr(args: &[&str]) -> Result<String> {
     let out = Command::new("xrandr")
         .args(args)
         .output()

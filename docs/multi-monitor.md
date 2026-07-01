@@ -11,23 +11,25 @@ window the user can place anywhere.
 
 ## How it works
 
-One video stream, one or more heads.
+One capture, one independent encoded stream per head.
 
 - **Server.** `monitor::apply_layout` widens the X framebuffer to hold the heads
   side by side and declares one RandR monitor per head with `xrandr
   --setmonitor`, which X11 window managers (Mutter, KWin) honour as real
-  displays. The screen capture still grabs the whole root as a single encoded
-  stream. The authoritative client-facing layout is `equal_columns(count,
-  actual_w, actual_h)`, recomputed from the real captured size after every
-  resolution change so the client's crops and input always tile the true
-  framebuffer (the driver may snap to a nearby mode).
+  displays. The screen is captured once; a `HeadStream` per head then encodes
+  that head's region as its own stream (the primary head stays zero-copy when it
+  covers the whole frame, other heads copy their sub-rect into a tight buffer).
+  The authoritative layout is `equal_columns(count, actual_w, actual_h)`,
+  recomputed from the real captured size after every resolution change so the
+  client always matches the true framebuffer (the driver may snap to a mode).
 - **Wire.** `MSG_MONITOR_LAYOUT` (0x08, server to client) carries
   `{monitors:[{id,x,y,width,height}]}`, sent on connect and on every change.
+  Head 0's frames use `MSG_VIDEO_FRAME` (0x01, so the web client still shows the
+  primary); heads 1+ use `MSG_MONITOR_FRAME` (0x09), tagged with the head id.
   `MSG_REQUEST_ADD_MONITOR` (0x29) / `MSG_REQUEST_REMOVE_MONITOR` (0x2a) go the
   other way.
-- **Client.** Each head is a window with its own GPU surface. The renderer
-  samples only that head's sub-rect of the shared decoded frame (a crop set in
-  the uniform and applied in the shader), and the input map adds the head's
+- **Client.** Each head is a window with its own GPU surface and its own
+  `DecodePipeline`, decoding that head's stream. The input map adds the head's
   framebuffer offset so a click in the second window lands on the second head.
   The second window is opened/closed to match the layout, can be moved and
   resized freely, and closing it unplugs the monitor.
@@ -48,9 +50,11 @@ One video stream, one or more heads.
 
 - Needs a RandR-capable X server (the Xorg "dummy" driver, the usual ddisplay
   setup). Ignored on the Wayland backend and unavailable under Xvfb (no resize).
-- Phase 1 supports one extra head (two total) and one shared stream, so a second
-  head doubles the encoded width. Per-head independent streams are a possible
-  later optimisation.
+- The client supports one extra head (two windows total). The server encodes up
+  to `MAX_MONITORS` heads, so raising the client cap is the only change needed
+  for more.
+- Adaptive bitrate drives the primary head live; extra heads use a fixed
+  per-resolution bitrate, rebuilt when the layout changes.
 - The single-head restore relies on RandR re-reporting the output's automatic
   monitor once the user monitors are deleted (standard behaviour).
 

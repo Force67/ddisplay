@@ -33,9 +33,9 @@ pub struct Renderer {
     scale_bind_group: wgpu::BindGroup,
     window_size: (u32, u32),
     remote_size: (u32, u32),
-    /// Sub-rect of the decoded frame this window shows, in UV space
-    /// [u0, v0, u_width, v_height]. Full frame = [0,0,1,1]; a second monitor
-    /// occupying the right half of the framebuffer = [0.5, 0, 0.5, 1].
+    /// Sub-rect of the decoded frame to sample, in UV space
+    /// [u0, v0, u_width, v_height]. Currently always the full frame, since each
+    /// monitor head is its own stream.
     crop_uv: [f32; 4],
     display_mode: DisplayMode,
     egui_renderer: egui_wgpu::Renderer,
@@ -501,15 +501,6 @@ impl Renderer {
         Ok(())
     }
 
-    /// Set which sub-rect of the decoded frame this window shows (UV space).
-    /// `[u0, v0, u_width, v_height]`; full frame is `[0.0, 0.0, 1.0, 1.0]`.
-    pub fn set_crop(&mut self, crop_uv: [f32; 4]) {
-        if self.crop_uv != crop_uv {
-            self.crop_uv = crop_uv;
-            self.update_scale();
-        }
-    }
-
     /// Recompute the scale factors based on current display mode + crop.
     fn update_scale(&mut self) {
         if self.remote_size.0 == 0 || self.remote_size.1 == 0 {
@@ -552,7 +543,7 @@ struct VertexOutput {
 struct Params {
     // [scale_x, scale_y, srgb_flag, 0]
     scale: vec4<f32>,
-    // [u0, v0, u_width, v_height] — sub-rect of the frame this window shows
+    // [u0, v0, u_width, v_height], the sub-rect of the frame this window shows
     crop: vec4<f32>,
 };
 @group(1) @binding(0) var<uniform> params: Params;

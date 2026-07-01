@@ -7,8 +7,11 @@
 ///   0x01 VideoFrame: [keyframe: u8] [pts: u64 LE] [width: u16 LE] [height: u16 LE] [data...]
 ///   0x02 CursorUpdate: [x: u16 LE] [y: u16 LE] [visible: u8]
 ///   0x03 SessionInfo: JSON payload
-///   0x08 MonitorLayout: JSON {monitors:[{id,x,y,width,height}]} — the heads
-///        inside the captured framebuffer; the client shows one window per head
+///   0x08 MonitorLayout: JSON {monitors:[{id,x,y,width,height}]}, the heads
+///        inside the captured framebuffer (one client window per head)
+///   0x09 MonitorFrame: [monitor_id: u8] [keyframe: u8] [pts: u64 LE]
+///        [width: u16 LE] [height: u16 LE] [data...]. An extra head's own
+///        encoded stream. Head 0 uses VideoFrame (0x01); heads 1+ use this.
 ///   0x20 ClipboardData: [utf8 text...]   (bidirectional)
 ///
 /// Client -> Server:
@@ -26,8 +29,8 @@
 ///   0x22 ClientCaps: JSON {codecs, width, height} — decoder capabilities + native resolution
 ///   0x23 ClientStats: JSON {received, dropped, decode_ms, rtt_ms} — periodic feedback
 ///   0x24 Ping: [u64 LE timestamp] — echoed back verbatim by the server (RTT probe)
-///   0x29 RequestAddMonitor: (no payload) — plug in a virtual second monitor
-///   0x2a RequestRemoveMonitor: (no payload) — unplug the last virtual monitor
+///   0x29 RequestAddMonitor: (no payload), plug in a virtual second monitor
+///   0x2a RequestRemoveMonitor: (no payload), unplug the last virtual monitor
 
 use serde::{Deserialize, Serialize};
 
@@ -35,9 +38,12 @@ use serde::{Deserialize, Serialize};
 pub const MSG_VIDEO_FRAME: u8 = 0x01;
 pub const MSG_CURSOR_UPDATE: u8 = 0x02;
 pub const MSG_SESSION_INFO: u8 = 0x03;
-/// JSON {monitors:[{id,x,y,width,height}]} — the heads inside the captured
+/// JSON {monitors:[{id,x,y,width,height}]}, the heads inside the captured
 /// framebuffer. Sent on connect and whenever the monitor set changes.
 pub const MSG_MONITOR_LAYOUT: u8 = 0x08;
+/// A non-primary head's encoded frame, tagged with its monitor id. Head 0 uses
+/// [`MSG_VIDEO_FRAME`]; heads 1+ use this so each head is its own stream.
+pub const MSG_MONITOR_FRAME: u8 = 0x09;
 
 pub const MSG_MOUSE_MOVE: u8 = 0x10;
 pub const MSG_MOUSE_BUTTON: u8 = 0x11;
@@ -150,6 +156,26 @@ pub fn encode_cursor_update(x: u16, y: u16, visible: bool) -> Vec<u8> {
     buf.extend_from_slice(&x.to_le_bytes());
     buf.extend_from_slice(&y.to_le_bytes());
     buf.push(visible as u8);
+    buf
+}
+
+/// Encode a non-primary head's video frame, tagged with its monitor id.
+pub fn encode_monitor_frame(
+    monitor_id: u8,
+    keyframe: bool,
+    pts: u64,
+    width: u16,
+    height: u16,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 1 + 1 + 8 + 2 + 2 + data.len());
+    buf.push(MSG_MONITOR_FRAME);
+    buf.push(monitor_id);
+    buf.push(keyframe as u8);
+    buf.extend_from_slice(&pts.to_le_bytes());
+    buf.extend_from_slice(&width.to_le_bytes());
+    buf.extend_from_slice(&height.to_le_bytes());
+    buf.extend_from_slice(data);
     buf
 }
 

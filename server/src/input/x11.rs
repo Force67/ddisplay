@@ -138,9 +138,9 @@ impl X11InputInjector {
         Ok(())
     }
 
-    // ------------------------------------------------------------------
+    // -
     // Private helpers
-    // ------------------------------------------------------------------
+    // -
 
     /// Send a motion event without flushing.
     fn send_move(&self, x: u16, y: u16) -> anyhow::Result<()> {

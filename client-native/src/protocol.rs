@@ -29,8 +29,10 @@
 // Server message types
 pub const MSG_VIDEO_FRAME: u8 = 0x01;
 pub const MSG_CURSOR_UPDATE: u8 = 0x02;
-/// JSON {monitors:[{id,x,y,width,height}]} — heads inside the captured frame.
+/// JSON {monitors:[{id,x,y,width,height}]}, the heads inside the captured frame.
 pub const MSG_MONITOR_LAYOUT: u8 = 0x08;
+/// A non-primary head's encoded frame: [monitor_id][keyframe][pts][w][h][data].
+pub const MSG_MONITOR_FRAME: u8 = 0x09;
 
 // Client message types
 pub const MSG_MOUSE_MOVE: u8 = 0x10;
@@ -71,6 +73,16 @@ pub struct CursorUpdate {
     pub visible: bool,
 }
 
+/// A non-primary head's encoded frame (MSG_MONITOR_FRAME).
+pub struct MonitorFrame<'a> {
+    pub monitor_id: u8,
+    pub keyframe: bool,
+    pub pts: u64,
+    pub width: u16,
+    pub height: u16,
+    pub data: &'a [u8],
+}
+
 pub const MSG_SESSION_INFO: u8 = 0x03;
 
 /// Parse a server message.
@@ -80,6 +92,8 @@ pub enum ServerMessage<'a> {
     SessionInfo(&'a [u8]),
     /// JSON monitor layout (MSG_MONITOR_LAYOUT).
     MonitorLayout(&'a [u8]),
+    /// A non-primary head's encoded frame (MSG_MONITOR_FRAME).
+    MonitorFrame(MonitorFrame<'a>),
     ClipboardData(String),
     /// Echo of our MSG_PING — payload is the timestamp we sent.
     Pong(u64),
@@ -115,6 +129,21 @@ pub fn parse_server_message(data: &[u8]) -> Option<ServerMessage<'_>> {
         }
         MSG_MONITOR_LAYOUT if data.len() >= 2 => {
             Some(ServerMessage::MonitorLayout(&data[1..]))
+        }
+        MSG_MONITOR_FRAME if data.len() >= 15 => {
+            let monitor_id = data[1];
+            let keyframe = data[2] != 0;
+            let pts = u64::from_le_bytes(data[3..11].try_into().ok()?);
+            let width = u16::from_le_bytes(data[11..13].try_into().ok()?);
+            let height = u16::from_le_bytes(data[13..15].try_into().ok()?);
+            Some(ServerMessage::MonitorFrame(MonitorFrame {
+                monitor_id,
+                keyframe,
+                pts,
+                width,
+                height,
+                data: &data[15..],
+            }))
         }
         MSG_CLIPBOARD_DATA => {
             let text = String::from_utf8_lossy(data.get(1..).unwrap_or_default()).into_owned();

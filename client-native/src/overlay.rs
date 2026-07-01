@@ -201,7 +201,7 @@ impl OverlayState {
                             );
                         });
 
-                        // ── Monitors ──────────────────────────────────────────
+                        // Monitors
                         ui.add_space(12.0);
                         ui.label(format!("🖥 Monitors: {}", self.monitor_count.max(1)));
                         ui.horizontal(|ui| {
@@ -226,7 +226,7 @@ impl OverlayState {
                             }
                         });
 
-                        // ── File transfer panel ──────────────────────────────
+                        // File transfer panel
                         ui.add_space(12.0);
                         ui.separator();
                         ui.add_space(8.0);

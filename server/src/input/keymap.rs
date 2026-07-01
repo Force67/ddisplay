@@ -13,7 +13,7 @@
 /// keycode 20 to 'ß', which is what the user expects.
 pub fn js_keycode_to_x11_hw(js: u32) -> Option<u8> {
     Some(match js {
-        // ── Editing / control ─────────────────────────────────────────
+        // Editing / control
         8  => 22,  // Backspace
         9  => 23,  // Tab
         13 => 36,  // Enter
@@ -27,7 +27,7 @@ pub fn js_keycode_to_x11_hw(js: u32) -> Option<u8> {
         45 => 118, // Insert
         46 => 119, // Delete
 
-        // ── Navigation ────────────────────────────────────────────────
+        // Navigation
         33 => 112, // PageUp
         34 => 117, // PageDown
         35 => 115, // End
@@ -37,7 +37,7 @@ pub fn js_keycode_to_x11_hw(js: u32) -> Option<u8> {
         39 => 114, // ArrowRight
         40 => 116, // ArrowDown
 
-        // ── Digit row (48–57) ─────────────────────────────────────────
+        // Digit row (48–57)
         48 => 19,  // 0
         49 => 10,  // 1
         50 => 11,  // 2
@@ -49,7 +49,7 @@ pub fn js_keycode_to_x11_hw(js: u32) -> Option<u8> {
         56 => 17,  // 8
         57 => 18,  // 9
 
-        // ── Letters A–Z (QWERTY physical positions) ───────────────────
+        // Letters A–Z (QWERTY physical positions)
         65 => 38,  // A
         66 => 56,  // B
         67 => 54,  // C
@@ -77,12 +77,12 @@ pub fn js_keycode_to_x11_hw(js: u32) -> Option<u8> {
         89 => 29,  // Y
         90 => 52,  // Z
 
-        // ── Meta / context ────────────────────────────────────────────
+        // Meta / context
         91 => 133, // LMeta/LSuper
         92 => 134, // RMeta/RSuper
         93 => 135, // ContextMenu
 
-        // ── Numpad 0–9 ────────────────────────────────────────────────
+        // Numpad 0–9
         96  => 90,  // KP_0
         97  => 87,  // KP_1
         98  => 88,  // KP_2
@@ -94,14 +94,14 @@ pub fn js_keycode_to_x11_hw(js: u32) -> Option<u8> {
         104 => 80,  // KP_8
         105 => 81,  // KP_9
 
-        // ── Numpad operators ──────────────────────────────────────────
+        // Numpad operators
         106 => 63,  // KP_Multiply
         107 => 86,  // KP_Add
         109 => 82,  // KP_Subtract
         110 => 91,  // KP_Decimal
         111 => 106, // KP_Divide
 
-        // ── F1–F12 ────────────────────────────────────────────────────
+        // F1–F12
         112 => 67,  // F1
         113 => 68,  // F2
         114 => 69,  // F3
@@ -115,11 +115,11 @@ pub fn js_keycode_to_x11_hw(js: u32) -> Option<u8> {
         122 => 95,  // F11  (evdev 87 → X11 95)
         123 => 96,  // F12  (evdev 88 → X11 96)
 
-        // ── Lock keys ─────────────────────────────────────────────────
+        // Lock keys
         144 => 77,  // NumLock
         145 => 78,  // ScrollLock
 
-        // ── Punctuation (layout-sensitive — position-based) ───────────
+        // Punctuation (layout-sensitive — position-based)
         186 => 47,  // Semicolon / ;
         187 => 21,  // Equals / =
         188 => 59,  // Comma / ,

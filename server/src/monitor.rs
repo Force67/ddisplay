@@ -59,7 +59,7 @@ pub fn apply_layout(count: usize, base_w: u32, base_h: u32) -> Result<Vec<Monito
 
     // The framebuffer must hold every head side by side. resize_display caps
     // width at 7680, beyond which the heads would fall outside it and
-    // --setmonitor would fail — reject up front with a clear error.
+    // --setmonitor would fail, so reject up front with a clear error.
     let total_w = base_w as u64 * count as u64;
     if total_w > 7680 {
         anyhow::bail!(

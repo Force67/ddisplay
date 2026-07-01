@@ -19,6 +19,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 mod protocol;
 mod transport;
 mod decoder;
+mod decode_pipeline;
 #[cfg(windows)]
 mod decoder_mf;
 mod renderer;
@@ -29,6 +30,7 @@ mod files;
 
 use overlay::{OverlayAction, OverlayState};
 
+use decode_pipeline::DecodePipeline;
 use protocol::ServerMessage;
 use transport::TransportEvent;
 
@@ -67,12 +69,6 @@ struct Args {
     share_dir: Option<std::path::PathBuf>,
 }
 
-/// Payload sent through the decode channel: raw frame bytes + keyframe flag.
-struct DecodeJob {
-    data: Vec<u8>,
-    keyframe: bool,
-}
-
 /// One monitor (head) and its pixel rect inside the captured framebuffer,
 /// parsed from MSG_MONITOR_LAYOUT.
 #[derive(serde::Deserialize, Clone, Default, PartialEq)]
@@ -95,11 +91,14 @@ struct MonitorLayoutMsg {
     monitors: Vec<MonitorInfo>,
 }
 
-/// A secondary-monitor window: its own OS window, GPU surface, and input map.
-/// Renders a crop of the shared decoded frame for one extra head.
+/// A secondary-monitor window: its own OS window, GPU surface, decode pipeline
+/// and input map. Renders one extra head's independent stream.
 struct MonitorWindow {
+    /// The head's id, matched against incoming MonitorFrames.
+    id: u8,
     window: Arc<Window>,
     renderer: renderer::Renderer,
+    decode: DecodePipeline,
     input: input::InputState,
 }
 
@@ -108,10 +107,8 @@ struct App {
     args: Args,
     window: Option<Arc<Window>>,
     renderer: Option<renderer::Renderer>,
-    /// Sends raw frame bytes to the background decode thread.
-    decode_tx: Option<std::sync::mpsc::SyncSender<DecodeJob>>,
-    /// Latest frame decoded by the background thread; render loop takes it each tick.
-    frame_slot: Arc<std::sync::Mutex<Option<decoder::DecodedFrame>>>,
+    /// Primary head's decode pipeline (fed by VideoFrame). None until resumed().
+    decode: Option<DecodePipeline>,
     input_state: Option<input::InputState>,
     transport_rx: Option<tokio::sync::mpsc::UnboundedReceiver<TransportEvent>>,
     rt: tokio::runtime::Handle,
@@ -123,11 +120,6 @@ struct App {
     clipboard_last_set: Arc<std::sync::Mutex<Option<String>>>,
     /// False when window is minimized or fully occluded — skip decode and render.
     window_visible: bool,
-    /// Set to true by the decode thread when a new frame is stored in frame_slot.
-    /// Cleared by about_to_wait after requesting a redraw.
-    frame_ready: Arc<std::sync::atomic::AtomicBool>,
-    /// Set by the decode thread when the AV1 decoder self-reset and needs a keyframe.
-    needs_keyframe: Arc<std::sync::atomic::AtomicBool>,
     /// Egui overlay state.
     overlay: Option<OverlayState>,
     /// File transfer state (HTTP, talks to server's /files/* endpoints).
@@ -142,11 +134,6 @@ struct App {
     app_start: std::time::Instant,
     /// Last measured round-trip time in ms (0 until first pong).
     last_rtt_ms: f32,
-    /// Average decode time per frame in µs, written by the decode thread.
-    decode_us: Arc<std::sync::atomic::AtomicU32>,
-    /// After a decode-queue overflow the stream is corrupt until the next
-    /// keyframe — skip inter-frames instead of feeding garbage to the decoder.
-    skip_until_keyframe: bool,
     /// Hardware (GPU) decode support found at startup: (h264, av1).
     hw_decode: (bool, bool),
     /// Rolling per-second metric history for the F3 stats HUD.
@@ -157,7 +144,7 @@ struct App {
     /// the first MSG_MONITOR_LAYOUT; treated as a single full-frame monitor then.
     monitors: Vec<MonitorInfo>,
     /// Set when `monitors` changed so `about_to_wait` reconciles windows (open
-    /// or close the secondary head) — winit window creation needs the event loop.
+    /// or close the secondary head), since winit window creation needs the event loop.
     layout_dirty: bool,
     /// Extra-monitor window (second head). Phase 1 supports one beyond primary.
     secondary: Option<MonitorWindow>,
@@ -218,7 +205,7 @@ impl ApplicationHandler for App {
             eprintln!("[init] --force-codec={} (server SessionInfo codec will be IGNORED)", fc);
         }
 
-        self.start_decode_thread(&startup_codec);
+        self.decode = Some(DecodePipeline::new(&startup_codec, self.hw_decode));
         self.codec = startup_codec;
 
         eprintln!("[init] Connecting to ws://{}...", self.args.server);
@@ -436,8 +423,11 @@ impl ApplicationHandler for App {
             self.reconcile_windows(event_loop);
         }
 
-        // If the decoder reset itself, ask the server for a fresh keyframe immediately.
-        if self.needs_keyframe.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        // If any head's decoder reset itself, ask for a fresh keyframe (it
+        // re-IDRs every head, which resyncs whichever one reset).
+        let primary_reset = self.decode.as_ref().map_or(false, |d| d.take_needs_keyframe());
+        let secondary_reset = self.secondary.as_ref().map_or(false, |s| s.decode.take_needs_keyframe());
+        if primary_reset || secondary_reset {
             if let Some(input) = &self.input_state {
                 input.send_keyframe_request();
             }
@@ -448,8 +438,7 @@ impl ApplicationHandler for App {
         let stats_elapsed = self.last_stats_sent.elapsed();
         if stats_elapsed >= std::time::Duration::from_secs(1) {
             self.last_stats_sent = std::time::Instant::now();
-            let decode_ms =
-                self.decode_us.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0;
+            let decode_ms = self.decode.as_ref().map_or(0.0, |d| d.decode_ms());
             if let Some(input) = &self.input_state {
                 let now_ms = self.app_start.elapsed().as_millis() as u64;
                 input.send_raw(protocol::encode_ping(now_ms));
@@ -477,19 +466,14 @@ impl ApplicationHandler for App {
             .overlay
             .as_ref()
             .map_or(false, |o| o.visible || o.stats_visible);
-        let has_frame = self
-            .frame_ready
-            .swap(false, std::sync::atomic::Ordering::Relaxed);
 
-        // Upload the newest decoded frame to every monitor window so they stay
-        // in lockstep (each renderer crops its own head out of the same frame).
-        if has_frame {
-            if let Some(frame) = self.frame_slot.lock().unwrap().take() {
-                // With 0 or 1 monitor the primary head IS the whole framebuffer,
-                // so track the live frame size (this also follows resize-to-client,
-                // which doesn't change the monitor count). With 2+ monitors the
-                // framebuffer size is fixed by the layout, so reconcile_windows
-                // owns the primary's input map and we leave it alone.
+        // Primary head: upload its newest decoded frame, then redraw.
+        let primary_frame = self.decode.as_ref().map_or(false, |d| d.take_frame_ready());
+        if primary_frame {
+            if let Some(frame) = self.decode.as_ref().and_then(|d| d.take_frame()) {
+                // With 0 or 1 head the primary IS the whole framebuffer, so track
+                // the live frame size (this also follows resize-to-client). With
+                // 2+ heads reconcile_windows owns the input map.
                 if self.monitors.len() <= 1 {
                     if let Some(input) = &mut self.input_state {
                         input.set_remote_size(frame.width, frame.height);
@@ -499,20 +483,21 @@ impl ApplicationHandler for App {
                 if let Some(renderer) = &mut self.renderer {
                     renderer.upload_frame(&frame);
                 }
-                if let Some(sec) = &mut self.secondary {
-                    sec.renderer.upload_frame(&frame);
-                }
             }
         }
-
-        if (has_frame || overlay_open) && self.window_visible {
+        if (primary_frame || overlay_open) && self.window_visible {
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
         }
-        // The secondary head has no overlay; redraw it whenever a frame arrives.
-        if has_frame {
-            if let Some(sec) = &self.secondary {
+
+        // Secondary head: its own independent stream, uploaded and redrawn on
+        // its own schedule.
+        if let Some(sec) = &mut self.secondary {
+            if sec.decode.take_frame_ready() {
+                if let Some(frame) = sec.decode.take_frame() {
+                    sec.renderer.upload_frame(&frame);
+                }
                 sec.window.request_redraw();
             }
         }
@@ -611,38 +596,17 @@ impl App {
                         self.codec);
                 }
 
-                // Push to the background decode thread (non-blocking).
-                // Skip only when nothing is visible — the second-monitor window
-                // shares this decode pipeline, so keep decoding if it is open.
-                if self.window_visible || self.secondary.is_some() {
-                    // After a dropped frame the bitstream is broken until the next
-                    // keyframe — discard inter-frames instead of decoding garbage.
-                    if self.skip_until_keyframe && !frame.keyframe {
-                        self.stats_dropped += 1;
-                        return;
-                    }
-                    if let Some(tx) = &self.decode_tx {
-                        let job = DecodeJob {
-                            data: frame.data.to_vec(),
-                            keyframe: frame.keyframe,
-                        };
-                        match tx.try_send(job) {
-                            Ok(()) => {
-                                self.skip_until_keyframe = false;
-                            }
-                            Err(_) => {
-                                // Decode thread is behind — drop, resync on next IDR.
-                                self.stats_dropped += 1;
-                                if !self.skip_until_keyframe {
-                                    self.skip_until_keyframe = true;
-                                    eprintln!(
-                                        "[frame #{}] decode backlog — dropping until next keyframe",
-                                        self.frame_count,
-                                    );
-                                    if let Some(input) = &self.input_state {
-                                        input.send_keyframe_request();
-                                    }
-                                }
+                // Feed the primary head's decode pipeline. Skip only when the
+                // window is hidden (the second window has its own pipeline).
+                if self.window_visible {
+                    if let Some(decode) = &mut self.decode {
+                        let outcome = decode.submit(frame.data, frame.keyframe);
+                        if outcome.dropped {
+                            self.stats_dropped += 1;
+                        }
+                        if outcome.request_keyframe {
+                            if let Some(input) = &self.input_state {
+                                input.send_keyframe_request();
                             }
                         }
                     }
@@ -665,8 +629,14 @@ impl App {
                     }
 
                     if !info.codec.is_empty() && info.codec != self.codec {
-                        eprintln!("[session] switching decoder: {} → {}", self.codec, info.codec);
-                        self.start_decode_thread(&info.codec);
+                        eprintln!("[session] switching decoder: {} -> {}", self.codec, info.codec);
+                        if let Some(decode) = &mut self.decode {
+                            decode.set_codec(&info.codec);
+                        }
+                        // Extra heads share the codec; rebuild their pipelines too.
+                        if let Some(sec) = &mut self.secondary {
+                            sec.decode.set_codec(&info.codec);
+                        }
                         self.codec = info.codec.clone();
                     } else {
                         eprintln!("[session] codec unchanged ({})", self.codec);
@@ -692,6 +662,21 @@ impl App {
                     }
                 }
             }
+            ServerMessage::MonitorFrame(frame) => {
+                self.stats_bytes += frame.data.len() as u64;
+                if let Some(sec) = &mut self.secondary {
+                    if sec.id == frame.monitor_id {
+                        let outcome = sec.decode.submit(frame.data, frame.keyframe);
+                        // Keyframe requests are global (they re-IDR every head),
+                        // which is enough to resync this one.
+                        if outcome.request_keyframe {
+                            if let Some(input) = &self.input_state {
+                                input.send_keyframe_request();
+                            }
+                        }
+                    }
+                }
+            }
             ServerMessage::CursorUpdate(_cursor) => {
                 // TODO: render remote cursor overlay
             }
@@ -710,38 +695,18 @@ impl App {
         }
     }
 
-    /// Bounding size of the captured framebuffer (union of all heads), in px.
-    fn framebuffer_size(&self) -> (f32, f32) {
-        let mut fw = 0u32;
-        let mut fh = 0u32;
-        for m in &self.monitors {
-            fw = fw.max(m.x + m.width);
-            fh = fh.max(m.y + m.height);
-        }
-        (fw.max(1) as f32, fh.max(1) as f32)
-    }
-
-    /// UV sub-rect of the decoded frame that this monitor occupies.
-    fn crop_for(&self, m: &MonitorInfo) -> [f32; 4] {
-        let (fw, fh) = self.framebuffer_size();
-        [m.x as f32 / fw, m.y as f32 / fh, m.width as f32 / fw, m.height as f32 / fh]
-    }
-
-    /// Open/close the secondary window and refresh each window's crop + input
-    /// map to match the current monitor layout. Needs the event loop to create
-    /// windows, so it runs from `about_to_wait`, not the message handler.
+    /// Open/close the secondary window and refresh each head's input offset to
+    /// match the layout. Each head shows its own stream, so no crop is needed;
+    /// input still carries the head's framebuffer offset. Needs the event loop
+    /// to create windows, so it runs from `about_to_wait`.
     fn reconcile_windows(&mut self, event_loop: &ActiveEventLoop) {
         self.layout_dirty = false;
         if self.monitors.is_empty() {
             return;
         }
 
-        // Primary window shows monitor 0.
+        // Primary window shows head 0.
         let m0 = self.monitors[0].clone();
-        let crop0 = self.crop_for(&m0);
-        if let Some(r) = &mut self.renderer {
-            r.set_crop(crop0);
-        }
         if let Some(input) = &mut self.input_state {
             input.set_remote_size(m0.width, m0.height);
             input.set_remote_offset(m0.x, m0.y);
@@ -749,17 +714,15 @@ impl App {
 
         if self.monitors.len() >= 2 {
             let m1 = self.monitors[1].clone();
-            let crop1 = self.crop_for(&m1);
             if self.secondary.is_none() {
                 eprintln!("[monitor] opening second window for head 1");
-                let created = self.create_secondary(event_loop);
+                let created = self.create_secondary(event_loop, &m1);
                 match created {
                     Ok(sec) => self.secondary = Some(sec),
                     Err(e) => eprintln!("[monitor] failed to open second window: {e:#}"),
                 }
             }
             if let Some(sec) = &mut self.secondary {
-                sec.renderer.set_crop(crop1);
                 sec.input.set_remote_size(m1.width, m1.height);
                 sec.input.set_remote_offset(m1.x, m1.y);
             }
@@ -769,10 +732,14 @@ impl App {
         }
     }
 
-    /// Create the secondary-monitor window with its own GPU surface and input.
-    fn create_secondary(&self, event_loop: &ActiveEventLoop) -> anyhow::Result<MonitorWindow> {
+    /// Create the secondary-monitor window with its own surface, decoder and input.
+    fn create_secondary(
+        &self,
+        event_loop: &ActiveEventLoop,
+        head: &MonitorInfo,
+    ) -> anyhow::Result<MonitorWindow> {
         let attrs = WindowAttributes::default()
-            .with_title(format!("{} — monitor 2", self.args.title))
+            .with_title(format!("{} (monitor 2)", self.args.title))
             .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
         #[cfg(windows)]
         let attrs = {
@@ -790,7 +757,8 @@ impl App {
         // Resized event (which some platforms don't deliver on creation).
         let size = window.inner_size();
         input.set_window_size(size.width, size.height);
-        Ok(MonitorWindow { window, renderer, input })
+        let decode = DecodePipeline::new(&self.codec, self.hw_decode);
+        Ok(MonitorWindow { id: head.id as u8, window, renderer, decode, input })
     }
 
     /// Handle a window event for the secondary-monitor window.
@@ -848,76 +816,6 @@ impl App {
         }
     }
 
-    /// Spawn a background decode thread for `codec`, replacing any previous one.
-    /// The old thread exits automatically when its channel sender is dropped.
-    fn start_decode_thread(&mut self, codec: &str) {
-        // Dropping the old sender closes the channel → old thread exits cleanly.
-        self.decode_tx = None;
-
-        // Keep this queue shallow: every buffered frame is added display
-        // latency (the decoder must decode all of them — inter-frames can't
-        // be skipped without breaking the reference chain). 4 frames ≈ 66ms
-        // at 60fps before we drop + request an IDR resync.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<DecodeJob>(4);
-        self.decode_tx = Some(tx);
-
-        let slot = self.frame_slot.clone();
-        let frame_ready = self.frame_ready.clone();
-        let needs_keyframe = self.needs_keyframe.clone();
-        let decode_us = self.decode_us.clone();
-        let codec_str = codec.to_string();
-        let (hw_h264, hw_av1) = self.hw_decode;
-        let try_hw = if codec == "av1" { hw_av1 } else { hw_h264 };
-
-        std::thread::Builder::new()
-            .name(format!("decode-{}", codec_str))
-            .spawn(move || {
-                eprintln!("[decode] thread started, codec={} hw={}", codec_str, try_hw);
-                let mut dec = match decoder::VideoDecoder::for_codec(&codec_str, try_hw) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        eprintln!("[decode] FATAL: {} decoder init failed: {}", codec_str, e);
-                        return;
-                    }
-                };
-                // A fresh decoder cannot parse inter-frames without a prior
-                // sequence header + keyframe; the same applies after a
-                // decoder self-reset.
-                let mut awaiting_keyframe = true;
-                // Exponential moving average of decode time, in µs.
-                let mut decode_ema_us: f32 = 0.0;
-
-                while let Ok(job) = rx.recv() {
-                    if awaiting_keyframe && !job.keyframe {
-                        continue; // discard until a keyframe arrives
-                    }
-                    if awaiting_keyframe && job.keyframe {
-                        eprintln!("[decode] got keyframe — starting/resuming");
-                        awaiting_keyframe = false;
-                    }
-
-                    let t0 = std::time::Instant::now();
-                    match dec.decode(&job.data) {
-                        Ok(Some(frame)) => {
-                            *slot.lock().unwrap() = Some(frame);
-                            frame_ready.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        Ok(None) => {}
-                        Err(e) => eprintln!("[decode] error: {}", e),
-                    }
-                    let us = t0.elapsed().as_micros() as f32;
-                    decode_ema_us = if decode_ema_us == 0.0 { us } else { decode_ema_us * 0.9 + us * 0.1 };
-                    decode_us.store(decode_ema_us as u32, std::sync::atomic::Ordering::Relaxed);
-
-                    if dec.take_needs_keyframe() {
-                        awaiting_keyframe = true;
-                        needs_keyframe.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-                eprintln!("[decode] thread exiting");
-            })
-            .expect("failed to spawn decode thread");
-    }
 }
 
 fn main() {
@@ -952,8 +850,7 @@ fn main() {
         args,
         window: None,
         renderer: None,
-        decode_tx: None,
-        frame_slot: Arc::new(std::sync::Mutex::new(None)),
+        decode: None,
         input_state: None,
         transport_rx: None,
         rt: rt.handle().clone(),
@@ -962,8 +859,6 @@ fn main() {
         frame_count: 0,
         clipboard_last_set: Arc::new(std::sync::Mutex::new(None)),
         window_visible: true,
-        frame_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        needs_keyframe: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         overlay: None,
         files_state: None,
         stats_received: 0,
@@ -971,8 +866,6 @@ fn main() {
         last_stats_sent: std::time::Instant::now(),
         app_start: std::time::Instant::now(),
         last_rtt_ms: 0.0,
-        decode_us: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        skip_until_keyframe: false,
         hw_decode,
         stats: overlay::StatsHistory::new(),
         stats_bytes: 0,

@@ -4,7 +4,7 @@ ddisplay captures a Linux desktop session and streams it to remote clients with 
 
 > Status: pre-alpha (`0.1.0-prealpha`). Protocol and CLI change without notice.
 
-It is a Rust workspace. `server/` does capture and encoding on Linux over X11 or Wayland. `client-native/` is a winit and wgpu client for Windows and Linux, with hardware decode on Windows. `client/` is a browser client the server hosts itself. `server/color/` holds the SIMD color conversion.
+It is a Rust workspace. `server/` does capture and encoding on Linux over X11 or Wayland. `client-native/` is a winit and wgpu client for Windows and Linux, with hardware decode on Windows. `client/` is a browser client the server hosts itself. `server/color/` holds the SIMD color conversion. `client-android/` is a Compose client for Android phones and tablets, with hardware decode over MediaCodec.
 
 ## Build
 
@@ -51,5 +51,6 @@ server/         capture and encode server (Linux)
 server/color/   SIMD BGRA to YUV/NV12 conversion
 client-native/  native client (Windows and Linux)
 client/         browser client
+client-android/ Android client (Compose)
 scripts/        headless GNOME and KDE launchers
 ```

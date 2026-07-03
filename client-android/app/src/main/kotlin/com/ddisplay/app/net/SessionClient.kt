@@ -18,7 +18,7 @@ sealed interface SessionEvent {
 
 /**
  * WebSocket transport to a ddisplay server. Frames are binary and framed per
- * com.ddisplay.core.protocol. Implemented in a later phase.
+ * com.ddisplay.core.protocol. The OkHttp implementation is [OkHttpSessionClient].
  */
 interface SessionClient {
     val events: Flow<SessionEvent>

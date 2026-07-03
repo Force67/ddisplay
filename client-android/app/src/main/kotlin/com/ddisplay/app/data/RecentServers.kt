@@ -30,6 +30,13 @@ class RecentServers(private val context: Context) {
         }
     }
 
+    suspend fun forget(address: String) {
+        val trimmed = address.trim()
+        context.dataStore.edit { prefs ->
+            prefs[key] = prefs[key].toList().filter { it != trimmed }.joinToString("\n")
+        }
+    }
+
     private fun String?.toList(): List<String> =
         this?.split('\n')?.filter { it.isNotBlank() } ?: emptyList()
 

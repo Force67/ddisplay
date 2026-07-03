@@ -4,7 +4,7 @@ import android.view.Surface
 
 /**
  * Feeds one head's encoded stream into a hardware decoder that renders onto a
- * [Surface]. Implemented over MediaCodec in a later phase.
+ * [Surface]. The MediaCodec implementation is [MediaCodecVideoDecoder].
  */
 interface VideoDecoder {
     /** (Re)initialise for a codec ("av1"/"h264") and frame size, drawing onto [surface]. */

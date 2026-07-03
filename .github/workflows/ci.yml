@@ -90,3 +90,32 @@ jobs:
           name: ${{ matrix.name }}
           path: target/release/${{ matrix.bin }}
           if-no-files-found: error
+
+  # Kotlin/Gradle Android client. :core is pure JVM (unit-tested); :app is the
+  # Compose UI. The runner's preinstalled ANDROID_HOME supplies the SDK, so no
+  # local.properties is needed.
+  client-android:
+    name: client-android
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Caches ~/.gradle (dependencies, wrapper dist, configuration cache).
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Test and assemble
+        run: cd client-android && ./gradlew --no-daemon :core:test :app:assembleDebug
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-android-debug-apk
+          path: client-android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error

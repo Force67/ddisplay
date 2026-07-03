@@ -284,12 +284,19 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
         return;
     }
 
+    // Send the current monitor layout so the client opens one window per head
+    // and crops each to its rect.
+    let layout = protocol::encode_monitor_layout(&state.control.monitor_layout());
+    if ws_sender.send(Message::Binary(layout.into())).await.is_err() {
+        return;
+    }
+
     // Subscribe to the frame broadcast, then ask the encode loop for a fresh
     // IDR. With an infinite GOP this is what bootstraps the new decoder —
     // the IDR arrives within a frame interval (the wake cuts idle pacing
     // short), so there's no value in caching stale keyframes.
     let mut frame_rx = state.frame_tx.subscribe();
-    state.control.force_keyframe.store(true, Ordering::Release);
+    state.control.request_keyframe_all();
     state.control.notify_activity();
     let input_tx = state.input_tx.clone();
     let recv_input_tx = input_tx.clone();
@@ -331,7 +338,7 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
                             // shows smeared/pixelated regions indefinitely (infinite
                             // GOP). Also tell the ABR controller to back off.
                             send_control.record_congestion();
-                            send_control.force_keyframe.store(true, Ordering::Release);
+                            send_control.request_keyframe_all();
                             send_control.notify_activity();
                         }
                         Err(broadcast::error::RecvError::Closed) => {
@@ -392,6 +399,24 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
                             if let Some(ref tx) = clipboard_set_tx {
                                 let _ = tx.try_send(text);
                             }
+                        }
+                        // Plug/unplug a virtual head. The encode loop applies the
+                        // new count (widen framebuffer + declare heads) and
+                        // broadcasts the layout. Gated like input.
+                        ev @ (ClientEvent::RequestAddMonitor
+                        | ClientEvent::RequestRemoveMonitor) => {
+                            if readonly {
+                                continue;
+                            }
+                            let current = recv_state.control.monitors.lock().len();
+                            let desired = match ev {
+                                ClientEvent::RequestAddMonitor => {
+                                    (current + 1).min(crate::monitor::MAX_MONITORS)
+                                }
+                                _ => current.saturating_sub(1).max(1),
+                            };
+                            *recv_state.control.monitor_request.lock() = Some(desired);
+                            recv_state.control.notify_activity();
                         }
                         other => {
                             if readonly {
@@ -480,6 +505,17 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
     // H.264-limited client leaves, the server switches back to AV1.
     if state.client_caps.lock().remove(&conn_id).is_some() {
         state.arbitrate_codec();
+    }
+
+    // When no client that can manage monitors remains, unplug any virtual
+    // monitors so the session isn't left altered (and a lone read-only viewer
+    // isn't stranded with a head it can't remove). Keyed on writable clients,
+    // since read-only clients can't add or remove monitors.
+    let no_writers = state.status.lock().writable_clients == 0;
+    if no_writers && state.control.monitors.lock().len() > 1 {
+        tracing::info!("[monitor] no writable clients left; restoring single head");
+        *state.control.monitor_request.lock() = Some(1);
+        state.control.notify_activity();
     }
 
     tracing::info!("{}#{}: WebSocket disconnected", peer, conn_id);
@@ -686,11 +722,15 @@ fn normalize_input_events(
             // Intercepted in the recv_task before reaching normalization.
             vec![]
         }
-        ClientEvent::RequestKeyframe => {
-            // Passed through directly to the input handler which sets the force_keyframe flag.
-            vec![ClientEvent::RequestKeyframe]
+        ClientEvent::RequestKeyframe { head } => {
+            // Passed through directly to the input handler which flags the head(s).
+            vec![ClientEvent::RequestKeyframe { head }]
         }
-        ClientEvent::Caps(_) | ClientEvent::Stats(_) | ClientEvent::Ping { .. } => {
+        ClientEvent::Caps(_)
+        | ClientEvent::Stats(_)
+        | ClientEvent::Ping { .. }
+        | ClientEvent::RequestAddMonitor
+        | ClientEvent::RequestRemoveMonitor => {
             // Intercepted in the recv_task before reaching normalization.
             vec![]
         }

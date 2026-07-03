@@ -19,6 +19,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 mod protocol;
 mod transport;
 mod decoder;
+mod decode_pipeline;
 #[cfg(windows)]
 mod decoder_mf;
 mod renderer;
@@ -29,6 +30,7 @@ mod files;
 
 use overlay::{OverlayAction, OverlayState};
 
+use decode_pipeline::DecodePipeline;
 use protocol::ServerMessage;
 use transport::TransportEvent;
 
@@ -67,10 +69,56 @@ struct Args {
     share_dir: Option<std::path::PathBuf>,
 }
 
-/// Payload sent through the decode channel: raw frame bytes + keyframe flag.
-struct DecodeJob {
-    data: Vec<u8>,
-    keyframe: bool,
+/// One monitor (head) and its pixel rect inside the captured framebuffer,
+/// parsed from MSG_MONITOR_LAYOUT.
+#[derive(serde::Deserialize, Clone, Default, PartialEq)]
+struct MonitorInfo {
+    #[serde(default)]
+    id: u32,
+    #[serde(default)]
+    x: u32,
+    #[serde(default)]
+    y: u32,
+    #[serde(default)]
+    width: u32,
+    #[serde(default)]
+    height: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct MonitorLayoutMsg {
+    #[serde(default)]
+    monitors: Vec<MonitorInfo>,
+}
+
+/// An extra-monitor window: its own OS window, GPU surface, decode pipeline
+/// and input map. Renders one extra head's independent stream.
+struct MonitorWindow {
+    /// The head's id, matched against incoming MonitorFrames.
+    id: u8,
+    window: Arc<Window>,
+    renderer: renderer::Renderer,
+    decode: DecodePipeline,
+    input: input::InputState,
+    /// False while minimized/occluded — decode and render are skipped then.
+    visible: bool,
+}
+
+impl MonitorWindow {
+    /// Point this window at a (possibly different) head: retitle it, and when
+    /// the head actually changed, restart the decoder on the new stream and
+    /// ask that stream for an IDR to sync onto.
+    fn assign_head(&mut self, head: &MonitorInfo, title: &str, codec: &str, hw: (bool, bool)) {
+        let id = head.id as u8;
+        if self.id != id {
+            self.id = id;
+            self.window.set_title(&format!("{} (monitor {})", title, head.id + 1));
+            self.decode = DecodePipeline::new(codec, hw);
+            self.input.send_raw(protocol::encode_request_keyframe_head(id));
+        }
+        self.input.set_remote_size(head.width, head.height);
+        self.input.set_remote_offset(head.x, head.y);
+    }
 }
 
 /// Application state.
@@ -78,10 +126,8 @@ struct App {
     args: Args,
     window: Option<Arc<Window>>,
     renderer: Option<renderer::Renderer>,
-    /// Sends raw frame bytes to the background decode thread.
-    decode_tx: Option<std::sync::mpsc::SyncSender<DecodeJob>>,
-    /// Latest frame decoded by the background thread; render loop takes it each tick.
-    frame_slot: Arc<std::sync::Mutex<Option<decoder::DecodedFrame>>>,
+    /// Primary head's decode pipeline (fed by VideoFrame). None until resumed().
+    decode: Option<DecodePipeline>,
     input_state: Option<input::InputState>,
     transport_rx: Option<tokio::sync::mpsc::UnboundedReceiver<TransportEvent>>,
     rt: tokio::runtime::Handle,
@@ -93,11 +139,6 @@ struct App {
     clipboard_last_set: Arc<std::sync::Mutex<Option<String>>>,
     /// False when window is minimized or fully occluded — skip decode and render.
     window_visible: bool,
-    /// Set to true by the decode thread when a new frame is stored in frame_slot.
-    /// Cleared by about_to_wait after requesting a redraw.
-    frame_ready: Arc<std::sync::atomic::AtomicBool>,
-    /// Set by the decode thread when the AV1 decoder self-reset and needs a keyframe.
-    needs_keyframe: Arc<std::sync::atomic::AtomicBool>,
     /// Egui overlay state.
     overlay: Option<OverlayState>,
     /// File transfer state (HTTP, talks to server's /files/* endpoints).
@@ -112,17 +153,23 @@ struct App {
     app_start: std::time::Instant,
     /// Last measured round-trip time in ms (0 until first pong).
     last_rtt_ms: f32,
-    /// Average decode time per frame in µs, written by the decode thread.
-    decode_us: Arc<std::sync::atomic::AtomicU32>,
-    /// After a decode-queue overflow the stream is corrupt until the next
-    /// keyframe — skip inter-frames instead of feeding garbage to the decoder.
-    skip_until_keyframe: bool,
     /// Hardware (GPU) decode support found at startup: (h264, av1).
     hw_decode: (bool, bool),
     /// Rolling per-second metric history for the F3 stats HUD.
     stats: overlay::StatsHistory,
     /// Wire bytes received since the last stats tick (all message types).
     stats_bytes: u64,
+    /// Current monitor layout from the server (one entry per head). Empty until
+    /// the first MSG_MONITOR_LAYOUT; treated as a single full-frame monitor then.
+    monitors: Vec<MonitorInfo>,
+    /// Set when `monitors` changed so `about_to_wait` reconciles windows (open
+    /// or close extra heads), since winit window creation needs the event loop.
+    layout_dirty: bool,
+    /// One window per extra head: `extras[i]` renders `monitors[i + 1]`.
+    /// Opened/closed/reassigned by `reconcile_windows` to match the layout.
+    extras: Vec<MonitorWindow>,
+    /// Clone of the transport sender, used to build extra windows' input maps.
+    transport_sender: Option<transport::TransportSender>,
 }
 
 impl ApplicationHandler for App {
@@ -178,7 +225,7 @@ impl ApplicationHandler for App {
             eprintln!("[init] --force-codec={} (server SessionInfo codec will be IGNORED)", fc);
         }
 
-        self.start_decode_thread(&startup_codec);
+        self.decode = Some(DecodePipeline::new(&startup_codec, self.hw_decode));
         self.codec = startup_codec;
 
         eprintln!("[init] Connecting to ws://{}...", self.args.server);
@@ -190,7 +237,8 @@ impl ApplicationHandler for App {
         let clipboard_last_set = clipboard::spawn_monitor(sender.clone());
         self.clipboard_last_set = clipboard_last_set;
 
-        let input_state = input::InputState::new(sender);
+        let input_state = input::InputState::new(sender.clone());
+        self.transport_sender = Some(sender);
 
         self.window = Some(window.clone());
         self.renderer = Some(renderer);
@@ -206,7 +254,13 @@ impl ApplicationHandler for App {
         tracing::info!("Window created, connecting to server...");
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // Route events for extra-monitor windows to their own handler.
+        if let Some(idx) = self.extras.iter().position(|s| s.window.id() == id) {
+            self.handle_extra_event(idx, event);
+            return;
+        }
+
         // Only let egui consume events while the overlay is actually visible.
         // Otherwise stale egui focus/capture state can swallow remote input.
         if let (Some(overlay), Some(window)) = (&mut self.overlay, &self.window) {
@@ -284,7 +338,14 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::Occluded(occluded) => {
+                let was_visible = self.window_visible;
                 self.window_visible = !occluded;
+                // Frames were skipped while hidden — resync on a fresh IDR.
+                if self.window_visible && !was_visible {
+                    if let Some(input) = &self.input_state {
+                        input.send_raw(protocol::encode_request_keyframe_head(0));
+                    }
+                }
             }
             WindowEvent::RedrawRequested => {
                 // Drain async file-transfer results.
@@ -296,14 +357,13 @@ impl ApplicationHandler for App {
                     return;
                 }
 
-                // Upload latest frame decoded by the background thread.
-                if let Some(frame) = self.frame_slot.lock().unwrap().take() {
-                    if let Some(input) = &mut self.input_state {
-                        input.set_remote_size(frame.width, frame.height);
-                    }
-                    if let Some(renderer) = &mut self.renderer {
-                        renderer.upload_frame(&frame);
-                    }
+                // (Decoded frames are uploaded to every monitor window in
+                // about_to_wait, so they stay in lockstep.)
+
+                // Mirror the current monitor count so the panel can show and
+                // gate the add/remove-monitor buttons.
+                if let Some(overlay) = &mut self.overlay {
+                    overlay.monitor_count = self.monitors.len().max(1);
                 }
 
                 // Run egui UI — only produces output when overlay is visible.
@@ -357,6 +417,16 @@ impl ApplicationHandler for App {
                             }
                         }
                     }
+                    OverlayAction::AddMonitor => {
+                        if let Some(input) = &self.input_state {
+                            input.send_raw(protocol::encode_request_add_monitor());
+                        }
+                    }
+                    OverlayAction::RemoveMonitor => {
+                        if let Some(input) = &self.input_state {
+                            input.send_raw(protocol::encode_request_remove_monitor());
+                        }
+                    }
                     OverlayAction::None => {}
                 }
 
@@ -370,14 +440,26 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         // Always drain transport events — this must not depend on rendering.
         self.process_transport_events();
 
-        // If the decoder reset itself, ask the server for a fresh keyframe immediately.
-        if self.needs_keyframe.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        // Open/close extra windows to match the latest layout (needs the
+        // event loop, so it can't run inside the message handler).
+        if self.layout_dirty {
+            self.reconcile_windows(event_loop);
+        }
+
+        // If a head's decoder reset itself, ask its stream (and only its
+        // stream) for a fresh keyframe.
+        if self.decode.as_ref().map_or(false, |d| d.take_needs_keyframe()) {
             if let Some(input) = &self.input_state {
-                input.send_keyframe_request();
+                input.send_raw(protocol::encode_request_keyframe_head(0));
+            }
+        }
+        for sec in &self.extras {
+            if sec.decode.take_needs_keyframe() {
+                sec.input.send_raw(protocol::encode_request_keyframe_head(sec.id));
             }
         }
 
@@ -386,8 +468,7 @@ impl ApplicationHandler for App {
         let stats_elapsed = self.last_stats_sent.elapsed();
         if stats_elapsed >= std::time::Duration::from_secs(1) {
             self.last_stats_sent = std::time::Instant::now();
-            let decode_ms =
-                self.decode_us.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0;
+            let decode_ms = self.decode.as_ref().map_or(0.0, |d| d.decode_ms());
             if let Some(input) = &self.input_state {
                 let now_ms = self.app_start.elapsed().as_millis() as u64;
                 input.send_raw(protocol::encode_ping(now_ms));
@@ -411,18 +492,45 @@ impl ApplicationHandler for App {
             self.stats_dropped = 0;
         }
 
-        if !self.window_visible {
-            return;
-        }
         let overlay_open = self
             .overlay
             .as_ref()
             .map_or(false, |o| o.visible || o.stats_visible);
-        let has_frame = self.frame_ready.load(std::sync::atomic::Ordering::Relaxed);
-        if has_frame || overlay_open {
-            self.frame_ready.store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // Primary head: upload its newest decoded frame, then redraw.
+        let primary_frame = self.decode.as_ref().map_or(false, |d| d.take_frame_ready());
+        if primary_frame {
+            if let Some(frame) = self.decode.as_ref().and_then(|d| d.take_frame()) {
+                // With 0 or 1 head the primary IS the whole framebuffer, so track
+                // the live frame size (this also follows resize-to-client). With
+                // 2+ heads reconcile_windows owns the input map.
+                if self.monitors.len() <= 1 {
+                    if let Some(input) = &mut self.input_state {
+                        input.set_remote_size(frame.width, frame.height);
+                        input.set_remote_offset(0, 0);
+                    }
+                }
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.upload_frame(&frame);
+                }
+            }
+        }
+        if (primary_frame || overlay_open) && self.window_visible {
             if let Some(window) = &self.window {
                 window.request_redraw();
+            }
+        }
+
+        // Extra heads: each an independent stream, uploaded and redrawn on
+        // its own schedule.
+        for sec in &mut self.extras {
+            if sec.decode.take_frame_ready() {
+                if let Some(frame) = sec.decode.take_frame() {
+                    sec.renderer.upload_frame(&frame);
+                }
+                if sec.visible {
+                    sec.window.request_redraw();
+                }
             }
         }
     }
@@ -520,37 +628,17 @@ impl App {
                         self.codec);
                 }
 
-                // Push to the background decode thread (non-blocking).
-                // Skip when the window is hidden — no point decoding frames nobody sees.
+                // Feed the primary head's decode pipeline. Skip only when the
+                // window is hidden (the second window has its own pipeline).
                 if self.window_visible {
-                    // After a dropped frame the bitstream is broken until the next
-                    // keyframe — discard inter-frames instead of decoding garbage.
-                    if self.skip_until_keyframe && !frame.keyframe {
-                        self.stats_dropped += 1;
-                        return;
-                    }
-                    if let Some(tx) = &self.decode_tx {
-                        let job = DecodeJob {
-                            data: frame.data.to_vec(),
-                            keyframe: frame.keyframe,
-                        };
-                        match tx.try_send(job) {
-                            Ok(()) => {
-                                self.skip_until_keyframe = false;
-                            }
-                            Err(_) => {
-                                // Decode thread is behind — drop, resync on next IDR.
-                                self.stats_dropped += 1;
-                                if !self.skip_until_keyframe {
-                                    self.skip_until_keyframe = true;
-                                    eprintln!(
-                                        "[frame #{}] decode backlog — dropping until next keyframe",
-                                        self.frame_count,
-                                    );
-                                    if let Some(input) = &self.input_state {
-                                        input.send_keyframe_request();
-                                    }
-                                }
+                    if let Some(decode) = &mut self.decode {
+                        let outcome = decode.submit(frame.data, frame.keyframe);
+                        if outcome.dropped {
+                            self.stats_dropped += 1;
+                        }
+                        if outcome.request_keyframe {
+                            if let Some(input) = &self.input_state {
+                                input.send_raw(protocol::encode_request_keyframe_head(0));
                             }
                         }
                     }
@@ -573,14 +661,57 @@ impl App {
                     }
 
                     if !info.codec.is_empty() && info.codec != self.codec {
-                        eprintln!("[session] switching decoder: {} → {}", self.codec, info.codec);
-                        self.start_decode_thread(&info.codec);
+                        eprintln!("[session] switching decoder: {} -> {}", self.codec, info.codec);
+                        if let Some(decode) = &mut self.decode {
+                            decode.set_codec(&info.codec);
+                        }
+                        // Extra heads share the codec; rebuild their pipelines too.
+                        for sec in &mut self.extras {
+                            sec.decode.set_codec(&info.codec);
+                        }
                         self.codec = info.codec.clone();
                     } else {
                         eprintln!("[session] codec unchanged ({})", self.codec);
                     }
                 } else {
                     eprintln!("[session] WARNING: failed to parse SessionInfo JSON");
+                }
+            }
+            ServerMessage::MonitorLayout(json_bytes) => {
+                if let Ok(layout) = serde_json::from_slice::<MonitorLayoutMsg>(json_bytes) {
+                    // Drop any malformed zero-size heads so we never open a black
+                    // window or divide by zero computing crops.
+                    let monitors: Vec<MonitorInfo> = layout
+                        .monitors
+                        .into_iter()
+                        .filter(|m| m.width > 0 && m.height > 0)
+                        .collect();
+                    if !monitors.is_empty() && monitors != self.monitors {
+                        eprintln!("[monitor] layout: {} head(s)", monitors.len());
+                        self.monitors = monitors;
+                        // Window reconciliation needs the event loop; defer it.
+                        self.layout_dirty = true;
+                    }
+                }
+            }
+            ServerMessage::MonitorFrame(frame) => {
+                // (Wire bytes were already counted above, like every message.)
+                if let Some(sec) =
+                    self.extras.iter_mut().find(|s| s.id == frame.monitor_id)
+                {
+                    if !sec.visible {
+                        return;
+                    }
+                    let outcome = sec.decode.submit(frame.data, frame.keyframe);
+                    if outcome.dropped {
+                        // Feeds the server's congestion controller like
+                        // primary-head drops do.
+                        self.stats_dropped += 1;
+                    }
+                    if outcome.request_keyframe {
+                        sec.input
+                            .send_raw(protocol::encode_request_keyframe_head(frame.monitor_id));
+                    }
                 }
             }
             ServerMessage::CursorUpdate(_cursor) => {
@@ -601,76 +732,139 @@ impl App {
         }
     }
 
-    /// Spawn a background decode thread for `codec`, replacing any previous one.
-    /// The old thread exits automatically when its channel sender is dropped.
-    fn start_decode_thread(&mut self, codec: &str) {
-        // Dropping the old sender closes the channel → old thread exits cleanly.
-        self.decode_tx = None;
+    /// Open, close or reassign extra windows and refresh each head's input
+    /// offset to match the layout. Each head shows its own stream, so no crop
+    /// is needed; input still carries the head's framebuffer offset. Needs the
+    /// event loop to create windows, so it runs from `about_to_wait`.
+    ///
+    /// Windows are positional: `extras[i]` shows `monitors[i + 1]`. When the
+    /// layout shrinks (or the user closed a middle window and the server
+    /// renumbered the heads), surviving windows are reassigned to their new
+    /// head instead of being torn down and reopened.
+    fn reconcile_windows(&mut self, event_loop: &ActiveEventLoop) {
+        self.layout_dirty = false;
+        if self.monitors.is_empty() {
+            return;
+        }
 
-        // Keep this queue shallow: every buffered frame is added display
-        // latency (the decoder must decode all of them — inter-frames can't
-        // be skipped without breaking the reference chain). 4 frames ≈ 66ms
-        // at 60fps before we drop + request an IDR resync.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<DecodeJob>(4);
-        self.decode_tx = Some(tx);
+        // Primary window shows head 0.
+        let m0 = self.monitors[0].clone();
+        if let Some(input) = &mut self.input_state {
+            input.set_remote_size(m0.width, m0.height);
+            input.set_remote_offset(m0.x, m0.y);
+        }
 
-        let slot = self.frame_slot.clone();
-        let frame_ready = self.frame_ready.clone();
-        let needs_keyframe = self.needs_keyframe.clone();
-        let decode_us = self.decode_us.clone();
-        let codec_str = codec.to_string();
-        let (hw_h264, hw_av1) = self.hw_decode;
-        let try_hw = if codec == "av1" { hw_av1 } else { hw_h264 };
-
-        std::thread::Builder::new()
-            .name(format!("decode-{}", codec_str))
-            .spawn(move || {
-                eprintln!("[decode] thread started, codec={} hw={}", codec_str, try_hw);
-                let mut dec = match decoder::VideoDecoder::for_codec(&codec_str, try_hw) {
-                    Ok(d) => d,
+        let target = self.monitors.len() - 1;
+        if self.extras.len() > target {
+            eprintln!("[monitor] closing {} extra window(s)", self.extras.len() - target);
+            self.extras.truncate(target);
+        }
+        for i in 0..target {
+            let head = self.monitors[i + 1].clone();
+            if self.extras.len() <= i {
+                eprintln!("[monitor] opening window for head {}", head.id);
+                match self.create_extra(event_loop, &head) {
+                    Ok(sec) => self.extras.push(sec),
                     Err(e) => {
-                        eprintln!("[decode] FATAL: {} decoder init failed: {}", codec_str, e);
-                        return;
-                    }
-                };
-                // A fresh decoder cannot parse inter-frames without a prior
-                // sequence header + keyframe; the same applies after a
-                // decoder self-reset.
-                let mut awaiting_keyframe = true;
-                // Exponential moving average of decode time, in µs.
-                let mut decode_ema_us: f32 = 0.0;
-
-                while let Ok(job) = rx.recv() {
-                    if awaiting_keyframe && !job.keyframe {
-                        continue; // discard until a keyframe arrives
-                    }
-                    if awaiting_keyframe && job.keyframe {
-                        eprintln!("[decode] got keyframe — starting/resuming");
-                        awaiting_keyframe = false;
-                    }
-
-                    let t0 = std::time::Instant::now();
-                    match dec.decode(&job.data) {
-                        Ok(Some(frame)) => {
-                            *slot.lock().unwrap() = Some(frame);
-                            frame_ready.store(true, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        Ok(None) => {}
-                        Err(e) => eprintln!("[decode] error: {}", e),
-                    }
-                    let us = t0.elapsed().as_micros() as f32;
-                    decode_ema_us = if decode_ema_us == 0.0 { us } else { decode_ema_us * 0.9 + us * 0.1 };
-                    decode_us.store(decode_ema_us as u32, std::sync::atomic::Ordering::Relaxed);
-
-                    if dec.take_needs_keyframe() {
-                        awaiting_keyframe = true;
-                        needs_keyframe.store(true, std::sync::atomic::Ordering::Relaxed);
+                        eprintln!("[monitor] failed to open window for head {}: {e:#}", head.id);
+                        break;
                     }
                 }
-                eprintln!("[decode] thread exiting");
-            })
-            .expect("failed to spawn decode thread");
+            }
+            let (title, codec, hw) = (self.args.title.clone(), self.codec.clone(), self.hw_decode);
+            self.extras[i].assign_head(&head, &title, &codec, hw);
+        }
     }
+
+    /// Create an extra-monitor window with its own surface, decoder and input.
+    fn create_extra(
+        &self,
+        event_loop: &ActiveEventLoop,
+        head: &MonitorInfo,
+    ) -> anyhow::Result<MonitorWindow> {
+        let attrs = WindowAttributes::default()
+            .with_title(format!("{} (monitor {})", self.args.title, head.id + 1))
+            .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
+        #[cfg(windows)]
+        let attrs = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attrs.with_drag_and_drop(false)
+        };
+        let window = Arc::new(event_loop.create_window(attrs)?);
+        let renderer = pollster::block_on(renderer::Renderer::new(window.clone()))?;
+        let sender = self
+            .transport_sender
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("transport sender not ready"))?;
+        let mut input = input::InputState::new(sender);
+        // Seed the window size so input scaling is correct before the first
+        // Resized event (which some platforms don't deliver on creation).
+        let size = window.inner_size();
+        input.set_window_size(size.width, size.height);
+        let decode = DecodePipeline::new(&self.codec, self.hw_decode);
+        // Ask this head's stream for an IDR: the layout-change IDR may have
+        // been broadcast before this window (and its fresh decoder) existed.
+        input.send_raw(protocol::encode_request_keyframe_head(head.id as u8));
+        Ok(MonitorWindow {
+            id: head.id as u8,
+            window,
+            renderer,
+            decode,
+            input,
+            visible: true,
+        })
+    }
+
+    /// Handle a window event for the extra-monitor window at `idx`.
+    fn handle_extra_event(&mut self, idx: usize, event: WindowEvent) {
+        let sec = &mut self.extras[idx];
+        match event {
+            WindowEvent::CloseRequested => {
+                sec.input.release_all();
+                // Closing any extra window unplugs one virtual monitor; the
+                // server's next layout broadcast renumbers the survivors.
+                if let Some(sender) = &self.transport_sender {
+                    sender.send(protocol::encode_request_remove_monitor());
+                }
+                self.extras.remove(idx);
+            }
+            WindowEvent::Resized(size) => {
+                sec.renderer.resize(size.width, size.height);
+                sec.input.set_window_size(size.width, size.height);
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                sec.input.on_cursor_moved(position.x, position.y);
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                sec.input.on_mouse_button(button, state);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                sec.input.on_scroll(delta);
+            }
+            WindowEvent::KeyboardInput { event: key_event, .. } => {
+                sec.input.on_key(key_event.physical_key, key_event.state);
+            }
+            WindowEvent::Focused(false) => {
+                sec.input.release_all();
+            }
+            WindowEvent::Occluded(occluded) => {
+                let was_visible = sec.visible;
+                sec.visible = !occluded;
+                // Frames were skipped while hidden, so the decoder needs a
+                // fresh IDR to sync back onto the stream.
+                if sec.visible && !was_visible {
+                    sec.input.send_raw(protocol::encode_request_keyframe_head(sec.id));
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                if let Err(e) = sec.renderer.render(None) {
+                    tracing::warn!("[monitor {}] render error: {}", sec.id, e);
+                }
+            }
+            _ => {}
+        }
+    }
+
 }
 
 fn main() {
@@ -705,8 +899,7 @@ fn main() {
         args,
         window: None,
         renderer: None,
-        decode_tx: None,
-        frame_slot: Arc::new(std::sync::Mutex::new(None)),
+        decode: None,
         input_state: None,
         transport_rx: None,
         rt: rt.handle().clone(),
@@ -715,8 +908,6 @@ fn main() {
         frame_count: 0,
         clipboard_last_set: Arc::new(std::sync::Mutex::new(None)),
         window_visible: true,
-        frame_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        needs_keyframe: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         overlay: None,
         files_state: None,
         stats_received: 0,
@@ -724,11 +915,13 @@ fn main() {
         last_stats_sent: std::time::Instant::now(),
         app_start: std::time::Instant::now(),
         last_rtt_ms: 0.0,
-        decode_us: Arc::new(std::sync::atomic::AtomicU32::new(0)),
-        skip_until_keyframe: false,
         hw_decode,
         stats: overlay::StatsHistory::new(),
         stats_bytes: 0,
+        monitors: Vec::new(),
+        layout_dirty: false,
+        extras: Vec::new(),
+        transport_sender: None,
     };
 
     if let Err(e) = event_loop.run_app(&mut app) {

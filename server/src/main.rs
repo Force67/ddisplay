@@ -10,6 +10,8 @@ mod protocol;
 mod capture;
 mod control;
 mod encoder;
+mod head_stream;
+mod monitor;
 mod transport;
 mod input;
 mod clipboard;
@@ -22,6 +24,8 @@ use capture::x11::X11Capturer;
 use capture::ScreenCapturer;
 use control::StreamControl;
 use encoder::Encoder;
+use head_stream::HeadStream;
+use protocol::MonitorRect;
 use input::x11::X11InputInjector;
 use input::InputInjector;
 use protocol::{ClientEvent, SessionInfo};
@@ -231,7 +235,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("ddisplay-server starting");
 
-    // --- Backend selection (X11 vs Wayland) ---
+    // Backend selection (X11 vs Wayland)
     let backend = match args.backend {
         BackendChoice::X11 => BackendKind::X11,
         BackendChoice::Wayland | BackendChoice::Portal => BackendKind::Wayland,
@@ -268,7 +272,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // --- Screen capturer + input injector ---
+    // Screen capturer + input injector
     let (capturer, mut injector): (Box<dyn ScreenCapturer>, Box<dyn InputInjector>) =
         match backend {
             BackendKind::X11 => (
@@ -303,7 +307,7 @@ async fn main() -> anyhow::Result<()> {
     let screen_h = capturer.height();
     tracing::info!("Screen: {}x{}", screen_w, screen_h);
 
-    // --- Encoder + codec selection ---
+    // Encoder + codec selection
     let setup = EncoderSetup::probe(args.encoder);
     let initial_codec = match args.codec {
         CodecChoice::Av1 => {
@@ -336,7 +340,7 @@ async fn main() -> anyhow::Result<()> {
         if user_bitrate.is_none() { " (auto)" } else { "" },
     );
 
-    // --- Shared stream control (codec switches, ABR, resize requests) ---
+    // Shared stream control (codec switches, ABR, resize requests)
     let session = SessionInfo {
         width: screen_w,
         height: screen_h,
@@ -348,10 +352,10 @@ async fn main() -> anyhow::Result<()> {
     let server_codecs = setup.supported_codecs(args.codec);
     tracing::info!("Server codecs (preference order): {:?}", server_codecs);
 
-    // --- Input sanity reset (releases keys left pressed by old sessions) ---
+    // Input sanity reset (releases keys left pressed by old sessions)
     injector.release_stuck_inputs()?;
 
-    // --- WebSocket transport ---
+    // WebSocket transport
     let client_dir = PathBuf::from(&args.client_dir);
     let shared_dir = if let Some(ref dir) = args.shared_dir {
         std::fs::create_dir_all(dir)?;
@@ -400,10 +404,10 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Listening on http://{}", args.bind);
 
-    // --- Input handler (dedicated blocking thread) ---
+    // Input handler (dedicated blocking thread)
     spawn_input_handler(injector, input_rx, stream_control.clone());
 
-    // --- Capture+encode loop (dedicated thread, zero-copy) ---
+    // Capture+encode loop (dedicated thread, zero-copy)
     let fps = args.fps;
     let loop_control = stream_control;
 
@@ -447,9 +451,9 @@ fn spawn_input_handler(
     tokio::task::spawn_blocking(move || {
         for event in sync_rx {
             match &event {
-                ClientEvent::RequestKeyframe => {
-                    tracing::debug!("[keyframe] client requested keyframe");
-                    control.force_keyframe.store(true, Ordering::Release);
+                ClientEvent::RequestKeyframe { head } => {
+                    tracing::debug!("[keyframe] client requested keyframe (head {:?})", head);
+                    control.request_keyframe(*head);
                     control.notify_activity();
                     continue;
                 }
@@ -472,10 +476,36 @@ fn spawn_input_handler(
 /// bitrate; live NVENC reconfigure when possible), display resizes, and X
 /// screen-size changes (encoder + capturer rebuild).
 #[allow(clippy::too_many_arguments)]
+/// Build one encoder per head. The primary head (index 0) uses the ABR-driven
+/// `primary_bitrate`; extra heads use a fixed per-resolution bitrate. All heads
+/// share one codec (the actual codec is whatever the encoder resolved to).
+fn build_heads(
+    setup: &EncoderSetup,
+    rects: &[MonitorRect],
+    codec: &str,
+    fps: u32,
+    user_bitrate: Option<u32>,
+    primary_bitrate: u32,
+) -> anyhow::Result<(Vec<HeadStream>, String)> {
+    let mut heads = Vec::with_capacity(rects.len());
+    let mut actual_codec = codec.to_string();
+    for (i, r) in rects.iter().enumerate() {
+        let bitrate = if i == 0 {
+            primary_bitrate
+        } else {
+            user_bitrate.unwrap_or_else(|| control::auto_bitrate(r.width, r.height, fps, codec))
+        };
+        let (enc, resolved) = setup.build(codec, r.width, r.height, fps, bitrate)?;
+        actual_codec = resolved;
+        heads.push(HeadStream::new(r.clone(), enc));
+    }
+    Ok((heads, actual_codec))
+}
+
 fn capture_encode_loop(
     mut capturer: Box<dyn ScreenCapturer>,
     backend: BackendKind,
-    mut encoder: Box<dyn Encoder + Send>,
+    encoder: Box<dyn Encoder + Send>,
     mut codec: String,
     setup: EncoderSetup,
     user_bitrate: Option<u32>,
@@ -492,6 +522,13 @@ fn capture_encode_loop(
     let mut screen_h = capturer.height();
     let mut applied_bitrate = control.target_bitrate.load(Ordering::Acquire);
 
+    // Each monitor head is encoded as its own stream. heads[0] is the primary
+    // (the whole framebuffer when single-monitor, keeping the zero-copy path);
+    // extra heads encode their sub-rect. head_rects tracks what heads reflect,
+    // so a layout change triggers a rebuild.
+    let mut head_rects: Vec<MonitorRect> = control.monitors.lock().clone();
+    let mut heads: Vec<HeadStream> = vec![HeadStream::new(head_rects[0].clone(), encoder)];
+
     let mut frame_count: u64 = 0;
     let mut last_tick = Instant::now();
     let mut fps_timer = Instant::now();
@@ -501,7 +538,7 @@ fn capture_encode_loop(
     let mut last_cursor: Option<(u16, u16, bool)> = None;
 
     loop {
-        // ---- Frame pacing ----
+        // Frame pacing
         // Two-phase wait. Phase 1 is the hard rate cap: never start two
         // captures closer than the active interval — a flood of mouse moves
         // must not outrun the target fps, or the client's decoder drowns and
@@ -526,16 +563,23 @@ fn capture_encode_loop(
             last_activity = last_tick;
         }
 
-        // ---- Reconfiguration checks (cheap; heavier X round-trips ~1/sec) ----
+        // Reconfiguration checks (cheap; heavier X round-trips ~1/sec)
         let mut rebuild = false; // encoder must be rebuilt
         let mut resolution_changed = false;
 
-        if last_recheck.elapsed() >= Duration::from_secs(1) {
+        // A pending monitor plug/unplug opens the recheck immediately (the
+        // transport wakes the loop via notify_activity) so it doesn't wait up to
+        // a second, otherwise add/remove feels sluggish.
+        let monitor_pending = control.monitor_request.lock().is_some();
+        if last_recheck.elapsed() >= Duration::from_secs(1) || monitor_pending {
             last_recheck = Instant::now();
 
-            // Client requested a display resize (--resize-to-client).
+            // Client requested a display resize (--resize-to-client). Skipped
+            // while more than one head is plugged in, since the monitor layout owns
+            // the framebuffer size then (resize-to-client would shrink it back).
             if let Some((rw, rh)) = control.resize_request.lock().take() {
-                if (rw, rh) != (screen_w, screen_h) {
+                let multi_monitor = control.monitors.lock().len() > 1;
+                if (rw, rh) != (screen_w, screen_h) && !multi_monitor {
                     if backend == BackendKind::Wayland {
                         // Dynamic resize is out of scope for the Wayland v1
                         // backend (the headless virtual monitor is fixed).
@@ -548,6 +592,41 @@ fn capture_encode_loop(
                         if let Err(e) = resize::resize_display(rw, rh) {
                             tracing::warn!("[resize] failed: {:#}", e);
                         }
+                    }
+                }
+            }
+
+            // Client plugged/unplugged a virtual monitor. Re-lay-out the heads;
+            // the framebuffer resize is picked up by the size_changed() check
+            // below (which rebuilds the capturer + encoder). The new layout is
+            // broadcast so every client opens/closes its extra windows.
+            if let Some(desired) = control.monitor_request.lock().take() {
+                let cur = control.monitors.lock().clone();
+                if backend == BackendKind::Wayland {
+                    tracing::info!(
+                        "[monitor] {} head(s) requested — ignored (wayland backend)",
+                        desired,
+                    );
+                } else if desired != cur.len() {
+                    // Every head keeps the primary head's current size, so the
+                    // layout doesn't drift across repeated add/remove cycles.
+                    let base_w = cur[0].width.max(2) & !1;
+                    let base_h = cur[0].height.max(2) & !1;
+                    tracing::info!(
+                        "[monitor] heads {} -> {} (base {}x{})",
+                        cur.len(), desired, base_w, base_h,
+                    );
+                    match monitor::apply_layout(desired, base_w, base_h) {
+                        Ok(rects) => {
+                            // Provisional layout (responsive); the size_changed
+                            // reconcile below corrects it to the real captured
+                            // size, which is what the client maps input against.
+                            *control.monitors.lock() = rects;
+                            let _ = frame_tx.send(protocol::encode_monitor_layout(
+                                &control.monitor_layout(),
+                            ));
+                        }
+                        Err(e) => tracing::warn!("[monitor] layout change failed: {:#}", e),
                     }
                 }
             }
@@ -565,14 +644,37 @@ fn capture_encode_loop(
                         screen_h = capturer.height();
                         rebuild = true;
                         resolution_changed = true;
+
+                        // Reconcile the broadcast layout to the ACTUAL captured
+                        // size (the driver may snap to a nearby mode). The client
+                        // crops and maps input against these rects, so they must
+                        // tile the real framebuffer exactly. Covers both
+                        // resize-to-client (single head) and a head add/remove.
+                        let count = control.monitors.lock().len().max(1);
+                        let rects = monitor::layout_rects(count, screen_w, screen_h);
+                        let mut mons = control.monitors.lock();
+                        if *mons != rects {
+                            *mons = rects;
+                            drop(mons);
+                            let _ = frame_tx.send(protocol::encode_monitor_layout(
+                                &control.monitor_layout(),
+                            ));
+                        }
                     }
                     Err(e) => tracing::error!("Failed to rebuild capturer after resize: {}", e),
                 }
             }
         }
 
+        // Monitor layout changed (head added/removed or a head resized) →
+        // rebuild every head's encoder.
+        let desired_rects = control.monitors.lock().clone();
+        if desired_rects != head_rects {
+            rebuild = true;
+        }
+
         // Codec switch requested by capability arbitration. The live codec
-        // only changes once the new encoder is actually built.
+        // only changes once the new encoders are actually built.
         let mut pending_codec: Option<String> = None;
         if let Some(new_codec) = control.desired_codec.lock().take() {
             if new_codec != codec {
@@ -582,10 +684,11 @@ fn capture_encode_loop(
             }
         }
 
-        // Adaptive bitrate target changed.
+        // Adaptive bitrate target changed. ABR drives the primary head live;
+        // extra heads use a fixed per-resolution bitrate (rebuilt on change).
         let target_bitrate = control.target_bitrate.load(Ordering::Acquire);
         if target_bitrate != applied_bitrate && !rebuild {
-            if encoder.set_bitrate(target_bitrate) {
+            if heads[0].encoder.set_bitrate(target_bitrate) {
                 applied_bitrate = target_bitrate;
                 control.session.lock().bitrate = target_bitrate;
             } else {
@@ -596,43 +699,44 @@ fn capture_encode_loop(
 
         if rebuild {
             let build_codec = pending_codec.unwrap_or_else(|| codec.clone());
-            // Recompute the ceiling for the (possibly new) resolution/codec.
-            let ceiling = user_bitrate
-                .unwrap_or_else(|| control::auto_bitrate(screen_w, screen_h, fps, &build_codec));
+            let primary = desired_rects[0].clone();
+            // Ceiling and ABR target track the primary head's resolution.
+            let ceiling = user_bitrate.unwrap_or_else(|| {
+                control::auto_bitrate(primary.width, primary.height, fps, &build_codec)
+            });
             control.bitrate_ceiling.store(ceiling, Ordering::Release);
-            // On a resolution change the old adaptive target is meaningless —
-            // restart from the ceiling and let ABR back off if needed.
-            let bitrate = if resolution_changed {
+            let primary_bitrate = if resolution_changed {
                 ceiling
             } else {
                 control.target_bitrate.load(Ordering::Acquire).min(ceiling)
             };
-            control.target_bitrate.store(bitrate, Ordering::Release);
+            control.target_bitrate.store(primary_bitrate, Ordering::Release);
 
-            match setup.build(&build_codec, screen_w, screen_h, fps, bitrate) {
-                Ok((new_enc, actual_codec)) => {
-                    encoder = new_enc;
+            match build_heads(&setup, &desired_rects, &build_codec, fps, user_bitrate, primary_bitrate) {
+                Ok((new_heads, actual_codec)) => {
+                    heads = new_heads;
+                    head_rects = desired_rects;
                     codec = actual_codec;
-                    applied_bitrate = bitrate;
+                    applied_bitrate = primary_bitrate;
 
                     let info = SessionInfo {
-                        width: screen_w,
-                        height: screen_h,
+                        width: primary.width,
+                        height: primary.height,
                         fps,
                         codec: codec.clone(),
-                        bitrate,
+                        bitrate: primary_bitrate,
                     };
                     *control.session.lock() = info.clone();
                     let _ = frame_tx.send(protocol::encode_session_info(&info));
-                    control.force_keyframe.store(true, Ordering::Release);
+                    control.request_keyframe_all();
                     last_activity = Instant::now();
                     tracing::info!(
-                        "Encoder rebuilt: {} @ {}x{}, {} bps",
-                        codec, screen_w, screen_h, bitrate,
+                        "Encoders rebuilt: {} head(s), {} @ primary {}x{}, {} bps",
+                        heads.len(), codec, primary.width, primary.height, primary_bitrate,
                     );
                 }
                 Err(e) => {
-                    tracing::error!("Encoder rebuild failed ({}); keeping old encoder", e);
+                    tracing::error!("Encoder rebuild failed ({}); keeping old encoders", e);
                 }
             }
         }
@@ -642,12 +746,16 @@ fn capture_encode_loop(
         // server broadcast lag), or after an encoder rebuild. Periodic IDRs
         // are pure quality loss with single-frame VBV (they show up as a
         // flash of pixelation) and the recovery paths above cover every
-        // resync case.
-        let requested_kf = control.force_keyframe.swap(false, Ordering::AcqRel);
-        let force_kf = frame_count == 0 || requested_kf;
-        if requested_kf {
-            tracing::debug!("[keyframe] forcing IDR frame on request");
+        // resync case. The mask is per head, so one stream's resync doesn't
+        // cost an IDR on every other head.
+        let mut kf_mask = control.take_kf_mask();
+        if frame_count == 0 {
+            kf_mask = u64::MAX;
         }
+        if kf_mask != 0 {
+            tracing::debug!("[keyframe] forcing IDR (head mask {:#x})", kf_mask);
+        }
+        let force_kf = kf_mask == u64::MAX;
         let has_damage = capturer.has_new_frame();
 
         // Damage counts as activity too (animations, video playback, etc.)
@@ -661,7 +769,7 @@ fn capture_encode_loop(
         if !capturer.embeds_cursor() {
             if let Some(ci) = capturer.cursor_info().ok() {
                 let cur = (ci.x.max(0) as u16, ci.y.max(0) as u16, ci.visible);
-                if force_kf || last_cursor != Some(cur) {
+                if kf_mask != 0 || last_cursor != Some(cur) {
                     last_cursor = Some(cur);
                     let _ = frame_tx.send(protocol::encode_cursor_update(cur.0, cur.1, cur.2));
                 }
@@ -670,11 +778,27 @@ fn capture_encode_loop(
 
         // Skip capture+encode if nothing changed (saves CPU, GPU, and bandwidth).
         // Always capture on the frame after input (app may have just responded).
-        if !force_kf && !has_damage && !input_arrived {
+        if kf_mask == 0 && !has_damage && !input_arrived {
             frame_count += 1;
             fps_frame_count += 1;
             continue;
         }
+
+        // What actually changed this frame (drained before frame_ref, which
+        // holds the capturer borrow). When damage reports a bounding box,
+        // heads it never touched skip encoding entirely — with many heads
+        // that is most of them, most frames (activity on one monitor doesn't
+        // burn encode time and bandwidth on the others). Without region info
+        // (or on the post-input hedge frame) every head encodes.
+        let damage_hint = if has_damage {
+            capturer.take_damage_hint()
+        } else if input_arrived {
+            capture::DamageHint::Unknown
+        } else {
+            // Here only because of a keyframe request: nothing on screen
+            // changed, so heads that weren't asked for an IDR stay silent.
+            capture::DamageHint::Bbox { x: 0, y: 0, width: 0, height: 0 }
+        };
 
         // Zero-copy capture: borrow SHM buffer directly.
         // Capture can fail transiently around display resizes (the SHM
@@ -690,32 +814,39 @@ fn capture_encode_loop(
             }
         };
 
-        // Encode directly from the SHM reference (no 8MB copy)
-        let packet = match encoder.encode(
-            frame.data,
-            frame.width,
-            frame.height,
-            frame.stride,
-            force_kf,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::warn!("Encode failed ({}); skipping frame", e);
-                control.force_keyframe.store(true, Ordering::Release);
+        // Encode each head from the shared capture (the primary head is
+        // zero-copy when it covers the whole frame). Head 0 goes out as a
+        // VideoFrame (web-compatible); extra heads as tagged MonitorFrames.
+        for head in heads.iter_mut() {
+            let r = &head.rect;
+            let head_kf = force_kf || (kf_mask >> r.id.min(63)) & 1 != 0;
+            if !head_kf && !damage_hint.intersects(r.x, r.y, r.width, r.height) {
                 continue;
             }
-        };
-
-        // Build wire message
-        let wire = protocol::encode_video_frame(
-            packet.keyframe,
-            packet.pts,
-            screen_w as u16,
-            screen_h as u16,
-            &packet.data,
-        );
-
-        let _ = frame_tx.send(wire);
+            let packet = match head.encode(
+                frame.data,
+                frame.width,
+                frame.height,
+                frame.stride,
+                head_kf,
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("Encode failed on head {} ({}); skipping", head.rect.id, e);
+                    control.request_keyframe(Some(head.rect.id as u8));
+                    continue;
+                }
+            };
+            let (w, h) = (head.rect.width as u16, head.rect.height as u16);
+            let wire = if head.rect.id == 0 {
+                protocol::encode_video_frame(packet.keyframe, packet.pts, w, h, &packet.data)
+            } else {
+                protocol::encode_monitor_frame(
+                    head.rect.id as u8, packet.keyframe, packet.pts, w, h, &packet.data,
+                )
+            };
+            let _ = frame_tx.send(wire);
+        }
 
         frame_count += 1;
         fps_frame_count += 1;

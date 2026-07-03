@@ -66,7 +66,7 @@ pub fn set_clipboard(text: &str, last_set: &Arc<Mutex<Option<String>>>) {
     unsafe { write_clipboard_text(text) };
 }
 
-// ---- Windows API wrappers ----
+// Windows API wrappers
 
 #[cfg(windows)]
 mod win {

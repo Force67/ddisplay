@@ -121,11 +121,15 @@ impl X11InputInjector {
                 // Handled by the WebSocket layer; never forwarded to the input injector.
                 return Ok(());
             }
-            ClientEvent::RequestKeyframe => {
+            ClientEvent::RequestKeyframe { .. } => {
                 // Handled by spawn_input_handler before reaching inject_event.
                 return Ok(());
             }
-            ClientEvent::Caps(_) | ClientEvent::Stats(_) | ClientEvent::Ping { .. } => {
+            ClientEvent::Caps(_)
+            | ClientEvent::Stats(_)
+            | ClientEvent::Ping { .. }
+            | ClientEvent::RequestAddMonitor
+            | ClientEvent::RequestRemoveMonitor => {
                 // Handled by the WebSocket layer; never forwarded to the input injector.
                 return Ok(());
             }
@@ -134,9 +138,9 @@ impl X11InputInjector {
         Ok(())
     }
 
-    // ------------------------------------------------------------------
+    // -
     // Private helpers
-    // ------------------------------------------------------------------
+    // -
 
     /// Send a motion event without flushing.
     fn send_move(&self, x: u16, y: u16) -> anyhow::Result<()> {

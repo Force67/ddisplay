@@ -237,9 +237,9 @@ impl VideoDecoder {
     }
 }
 
-// ---------------------------------------------------------------------------
+// -
 // H.264 decoder
-// ---------------------------------------------------------------------------
+// -
 
 pub struct H264Decoder {
     decoder: Decoder,
@@ -280,13 +280,13 @@ impl H264Decoder {
     }
 }
 
-// ---------------------------------------------------------------------------
+// -
 // AV1 decoder — calls rav1d's exported dav1d_* C functions directly.
 //
 // IMPORTANT: Dav1dContext in rav1d is PhantomData (zero-sized), so we must
 // NOT use Option<Dav1dContext> as a function parameter — it would be 1 byte,
 // not the 8-byte pointer C expects.  We use *mut c_void for the opaque handle.
-// ---------------------------------------------------------------------------
+// -
 
 use std::ffi::c_void;
 use std::ptr::NonNull;

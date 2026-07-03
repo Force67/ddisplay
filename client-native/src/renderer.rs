@@ -33,6 +33,10 @@ pub struct Renderer {
     scale_bind_group: wgpu::BindGroup,
     window_size: (u32, u32),
     remote_size: (u32, u32),
+    /// Sub-rect of the decoded frame to sample, in UV space
+    /// [u0, v0, u_width, v_height]. Currently always the full frame, since each
+    /// monitor head is its own stream.
+    crop_uv: [f32; 4],
     display_mode: DisplayMode,
     egui_renderer: egui_wgpu::Renderer,
     surface_format: wgpu::TextureFormat,
@@ -205,11 +209,15 @@ impl Renderer {
             ..Default::default()
         });
 
-        // Scale uniform: [scale_x, scale_y, srgb_flag, 0]
-        let scale_data = [1.0f32, 1.0, if surface_format.is_srgb() { 1.0 } else { 0.0 }, 0.0];
+        // Params uniform: vec4 scale [scale_x, scale_y, srgb_flag, 0] then
+        // vec4 crop [u0, v0, u_width, v_height].
+        let scale_data: [f32; 8] = [
+            1.0, 1.0, if surface_format.is_srgb() { 1.0 } else { 0.0 }, 0.0,
+            0.0, 0.0, 1.0, 1.0,
+        ];
         let scale_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("scale_uniform"),
-            size: 16,
+            label: Some("params_uniform"),
+            size: 32,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -250,6 +258,7 @@ impl Renderer {
             scale_bind_group,
             window_size: ws,
             remote_size: (0, 0),
+            crop_uv: [0.0, 0.0, 1.0, 1.0],
             display_mode: DisplayMode::default(),
             egui_renderer,
             surface_format,
@@ -492,25 +501,27 @@ impl Renderer {
         Ok(())
     }
 
-    /// Recompute the scale factors based on current display mode.
+    /// Recompute the scale factors based on current display mode + crop.
     fn update_scale(&mut self) {
         if self.remote_size.0 == 0 || self.remote_size.1 == 0 {
             return;
         }
 
         let srgb = if self.surface_format.is_srgb() { 1.0f32 } else { 0.0 };
-        let data = match self.display_mode {
-            DisplayMode::Stretch => [1.0f32, 1.0, srgb, 0.0],
+        let [u0, v0, uw, vh] = self.crop_uv;
+        // The visible content is the cropped region, so aspect is taken from
+        // its pixel size, not the whole framebuffer.
+        let scale = match self.display_mode {
+            DisplayMode::Stretch => [1.0f32, 1.0],
             DisplayMode::Letterbox => {
                 let (ww, wh) = (self.window_size.0 as f32, self.window_size.1 as f32);
-                let (rw, rh) = (self.remote_size.0 as f32, self.remote_size.1 as f32);
-
-                let scale = (ww / rw).min(wh / rh);
-                let sx = (rw * scale) / ww;
-                let sy = (rh * scale) / wh;
-                [sx, sy, srgb, 0.0]
+                let rw = self.remote_size.0 as f32 * uw;
+                let rh = self.remote_size.1 as f32 * vh;
+                let s = (ww / rw).min(wh / rh);
+                [(rw * s) / ww, (rh * s) / wh]
             }
         };
+        let data: [f32; 8] = [scale[0], scale[1], srgb, 0.0, u0, v0, uw, vh];
         self.queue.write_buffer(&self.scale_buffer, 0, bytemuck::cast_slice(&data));
     }
 }
@@ -529,7 +540,13 @@ struct VertexOutput {
     @location(0) uv: vec2<f32>,
 };
 
-@group(1) @binding(0) var<uniform> scale: vec4<f32>;
+struct Params {
+    // [scale_x, scale_y, srgb_flag, 0]
+    scale: vec4<f32>,
+    // [u0, v0, u_width, v_height], the sub-rect of the frame this window shows
+    crop: vec4<f32>,
+};
+@group(1) @binding(0) var<uniform> params: Params;
 
 @vertex
 fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
@@ -554,10 +571,11 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
     var out: VertexOutput;
     // Scale positions by aspect ratio correction
     var pos = positions[idx];
-    pos.x *= scale.x;
-    pos.y *= scale.y;
+    pos.x *= params.scale.x;
+    pos.y *= params.scale.y;
     out.position = vec4(pos, 0.0, 1.0);
-    out.uv = uvs[idx];
+    // Map the quad's [0,1] UVs into this window's crop sub-rect.
+    out.uv = params.crop.xy + uvs[idx] * params.crop.zw;
     return out;
 }
 
@@ -587,7 +605,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     rgb = clamp(rgb, vec3(0.0), vec3(1.0));
 
     // The decoded values are gamma-encoded; sRGB surfaces expect linear input.
-    if (scale.z > 0.5) {
+    if (params.scale.z > 0.5) {
         rgb = srgb_to_linear(rgb);
     }
     return vec4(rgb, 1.0);
@@ -602,7 +620,11 @@ struct VertexOutput {
     @location(0) uv: vec2<f32>,
 };
 
-@group(1) @binding(0) var<uniform> scale: vec4<f32>;
+struct Params {
+    scale: vec4<f32>,
+    crop: vec4<f32>,
+};
+@group(1) @binding(0) var<uniform> params: Params;
 
 @vertex
 fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
@@ -625,10 +647,10 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VertexOutput {
 
     var out: VertexOutput;
     var pos = positions[idx];
-    pos.x *= scale.x;
-    pos.y *= scale.y;
+    pos.x *= params.scale.x;
+    pos.y *= params.scale.y;
     out.position = vec4(pos, 0.0, 1.0);
-    out.uv = uvs[idx];
+    out.uv = params.crop.xy + uvs[idx] * params.crop.zw;
     return out;
 }
 
@@ -657,7 +679,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     );
     rgb = clamp(rgb, vec3(0.0), vec3(1.0));
 
-    if (scale.z > 0.5) {
+    if (params.scale.z > 0.5) {
         rgb = srgb_to_linear(rgb);
     }
     return vec4(rgb, 1.0);

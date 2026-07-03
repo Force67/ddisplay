@@ -10,6 +10,11 @@ pub struct InputState {
     sender: TransportSender,
     remote_width: u32,
     remote_height: u32,
+    /// This window's monitor offset within the server framebuffer. Added to the
+    /// scaled local coordinates so input from a second-monitor window lands on
+    /// the right head. (0,0) for the primary monitor.
+    remote_offset_x: u32,
+    remote_offset_y: u32,
     window_width: u32,
     window_height: u32,
     cursor_x: f64,
@@ -22,6 +27,8 @@ impl InputState {
             sender,
             remote_width: 0,
             remote_height: 0,
+            remote_offset_x: 0,
+            remote_offset_y: 0,
             window_width: 1,
             window_height: 1,
             cursor_x: 0.0,
@@ -32,6 +39,12 @@ impl InputState {
     pub fn set_remote_size(&mut self, w: u32, h: u32) {
         self.remote_width = w;
         self.remote_height = h;
+    }
+
+    /// Set this window's monitor offset within the server framebuffer.
+    pub fn set_remote_offset(&mut self, x: u32, y: u32) {
+        self.remote_offset_x = x;
+        self.remote_offset_y = y;
     }
 
     pub fn set_window_size(&mut self, w: u32, h: u32) {
@@ -108,11 +121,7 @@ impl InputState {
         self.sender.send(protocol::encode_client_ready());
     }
 
-    pub fn send_keyframe_request(&self) {
-        self.sender.send(protocol::encode_request_keyframe());
-    }
-
-    /// Send a pre-encoded protocol message (caps, stats, pings).
+    /// Send a pre-encoded protocol message (caps, stats, pings, keyframe requests).
     pub fn send_raw(&self, data: Vec<u8>) {
         self.sender.send(data);
     }
@@ -135,8 +144,11 @@ impl InputState {
         let offset_x = (ww - rw * scale) * 0.5;
         let offset_y = (wh - rh * scale) * 0.5;
 
-        let rx = ((x - offset_x) / scale).clamp(0.0, rw - 1.0) as u16;
-        let ry = ((y - offset_y) / scale).clamp(0.0, rh - 1.0) as u16;
+        let lx = ((x - offset_x) / scale).clamp(0.0, rw - 1.0) as u32;
+        let ly = ((y - offset_y) / scale).clamp(0.0, rh - 1.0) as u32;
+        // Translate into the server framebuffer by this monitor's offset.
+        let rx = (lx + self.remote_offset_x).min(u16::MAX as u32) as u16;
+        let ry = (ly + self.remote_offset_y).min(u16::MAX as u32) as u16;
         (rx, ry)
     }
 }

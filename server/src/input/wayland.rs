@@ -152,10 +152,12 @@ impl super::InputInjector for WaylandInputInjector {
                 tracing::debug!("[wayland] ClipboardData ignored (clipboard unsupported on wayland backend)");
             }
             ClientEvent::ClientReady
-            | ClientEvent::RequestKeyframe
+            | ClientEvent::RequestKeyframe { .. }
             | ClientEvent::Caps(_)
             | ClientEvent::Stats(_)
-            | ClientEvent::Ping { .. } => {}
+            | ClientEvent::Ping { .. }
+            | ClientEvent::RequestAddMonitor
+            | ClientEvent::RequestRemoveMonitor => {}
         }
         Ok(())
     }

@@ -21,7 +21,8 @@
 ///   0x17 ReleaseMouse
 ///   0x18 ReleaseAll
 ///   0x20 ClipboardData: [utf8 text...]   (bidirectional)
-///   0x21 RequestKeyframe: (no payload)
+///   0x21 RequestKeyframe: optional [monitor_id: u8] — with a payload only
+///        that head re-IDRs; without one every head does
 ///   0x22 ClientCaps: JSON {codecs, width, height}
 ///   0x23 ClientStats: JSON {received, dropped, decode_ms, rtt_ms}
 ///   0x24 Ping: [u64 LE timestamp]
@@ -29,6 +30,10 @@
 // Server message types
 pub const MSG_VIDEO_FRAME: u8 = 0x01;
 pub const MSG_CURSOR_UPDATE: u8 = 0x02;
+/// JSON {monitors:[{id,x,y,width,height}]}, the heads inside the captured frame.
+pub const MSG_MONITOR_LAYOUT: u8 = 0x08;
+/// A non-primary head's encoded frame: [monitor_id][keyframe][pts][w][h][data].
+pub const MSG_MONITOR_FRAME: u8 = 0x09;
 
 // Client message types
 pub const MSG_MOUSE_MOVE: u8 = 0x10;
@@ -48,6 +53,10 @@ pub const MSG_CLIENT_CAPS: u8 = 0x22;
 pub const MSG_CLIENT_STATS: u8 = 0x23;
 /// [u64 LE timestamp] — echoed back verbatim by the server (RTT probe).
 pub const MSG_PING: u8 = 0x24;
+/// Ask the server to plug in another virtual monitor.
+pub const MSG_REQUEST_ADD_MONITOR: u8 = 0x29;
+/// Ask the server to unplug the last virtual monitor.
+pub const MSG_REQUEST_REMOVE_MONITOR: u8 = 0x2a;
 
 /// Parsed video frame from the server.
 pub struct VideoFrame<'a> {
@@ -65,6 +74,16 @@ pub struct CursorUpdate {
     pub visible: bool,
 }
 
+/// A non-primary head's encoded frame (MSG_MONITOR_FRAME).
+pub struct MonitorFrame<'a> {
+    pub monitor_id: u8,
+    pub keyframe: bool,
+    pub pts: u64,
+    pub width: u16,
+    pub height: u16,
+    pub data: &'a [u8],
+}
+
 pub const MSG_SESSION_INFO: u8 = 0x03;
 
 /// Parse a server message.
@@ -72,6 +91,10 @@ pub enum ServerMessage<'a> {
     VideoFrame(VideoFrame<'a>),
     CursorUpdate(CursorUpdate),
     SessionInfo(&'a [u8]),
+    /// JSON monitor layout (MSG_MONITOR_LAYOUT).
+    MonitorLayout(&'a [u8]),
+    /// A non-primary head's encoded frame (MSG_MONITOR_FRAME).
+    MonitorFrame(MonitorFrame<'a>),
     ClipboardData(String),
     /// Echo of our MSG_PING — payload is the timestamp we sent.
     Pong(u64),
@@ -104,6 +127,24 @@ pub fn parse_server_message(data: &[u8]) -> Option<ServerMessage<'_>> {
         }
         MSG_SESSION_INFO if data.len() >= 2 => {
             Some(ServerMessage::SessionInfo(&data[1..]))
+        }
+        MSG_MONITOR_LAYOUT if data.len() >= 2 => {
+            Some(ServerMessage::MonitorLayout(&data[1..]))
+        }
+        MSG_MONITOR_FRAME if data.len() >= 15 => {
+            let monitor_id = data[1];
+            let keyframe = data[2] != 0;
+            let pts = u64::from_le_bytes(data[3..11].try_into().ok()?);
+            let width = u16::from_le_bytes(data[11..13].try_into().ok()?);
+            let height = u16::from_le_bytes(data[13..15].try_into().ok()?);
+            Some(ServerMessage::MonitorFrame(MonitorFrame {
+                monitor_id,
+                keyframe,
+                pts,
+                width,
+                height,
+                data: &data[15..],
+            }))
         }
         MSG_CLIPBOARD_DATA => {
             let text = String::from_utf8_lossy(data.get(1..).unwrap_or_default()).into_owned();
@@ -177,8 +218,19 @@ pub fn encode_clipboard_data(text: &str) -> Vec<u8> {
     buf
 }
 
-pub fn encode_request_keyframe() -> Vec<u8> {
-    vec![MSG_REQUEST_KEYFRAME]
+/// Ask one head's stream to re-IDR (that head's decoder lost sync).
+pub fn encode_request_keyframe_head(monitor_id: u8) -> Vec<u8> {
+    vec![MSG_REQUEST_KEYFRAME, monitor_id]
+}
+
+/// Ask the server to plug in another virtual monitor.
+pub fn encode_request_add_monitor() -> Vec<u8> {
+    vec![MSG_REQUEST_ADD_MONITOR]
+}
+
+/// Ask the server to unplug the last virtual monitor.
+pub fn encode_request_remove_monitor() -> Vec<u8> {
+    vec![MSG_REQUEST_REMOVE_MONITOR]
 }
 
 /// Capabilities + native resolution, sent once per connection.

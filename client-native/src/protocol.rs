@@ -21,7 +21,8 @@
 ///   0x17 ReleaseMouse
 ///   0x18 ReleaseAll
 ///   0x20 ClipboardData: [utf8 text...]   (bidirectional)
-///   0x21 RequestKeyframe: (no payload)
+///   0x21 RequestKeyframe: optional [monitor_id: u8] — with a payload only
+///        that head re-IDRs; without one every head does
 ///   0x22 ClientCaps: JSON {codecs, width, height}
 ///   0x23 ClientStats: JSON {received, dropped, decode_ms, rtt_ms}
 ///   0x24 Ping: [u64 LE timestamp]
@@ -52,7 +53,7 @@ pub const MSG_CLIENT_CAPS: u8 = 0x22;
 pub const MSG_CLIENT_STATS: u8 = 0x23;
 /// [u64 LE timestamp] — echoed back verbatim by the server (RTT probe).
 pub const MSG_PING: u8 = 0x24;
-/// Ask the server to plug in a virtual second monitor.
+/// Ask the server to plug in another virtual monitor.
 pub const MSG_REQUEST_ADD_MONITOR: u8 = 0x29;
 /// Ask the server to unplug the last virtual monitor.
 pub const MSG_REQUEST_REMOVE_MONITOR: u8 = 0x2a;
@@ -217,11 +218,12 @@ pub fn encode_clipboard_data(text: &str) -> Vec<u8> {
     buf
 }
 
-pub fn encode_request_keyframe() -> Vec<u8> {
-    vec![MSG_REQUEST_KEYFRAME]
+/// Ask one head's stream to re-IDR (that head's decoder lost sync).
+pub fn encode_request_keyframe_head(monitor_id: u8) -> Vec<u8> {
+    vec![MSG_REQUEST_KEYFRAME, monitor_id]
 }
 
-/// Ask the server to plug in a virtual second monitor.
+/// Ask the server to plug in another virtual monitor.
 pub fn encode_request_add_monitor() -> Vec<u8> {
     vec![MSG_REQUEST_ADD_MONITOR]
 }

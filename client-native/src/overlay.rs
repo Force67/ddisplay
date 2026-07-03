@@ -63,6 +63,10 @@ pub enum DisplayMode {
     Stretch,
 }
 
+/// Most virtual monitors a session supports (mirrors the server's
+/// `monitor::MAX_MONITORS`; requests beyond it would be clamped there anyway).
+pub const MAX_MONITORS: usize = 16;
+
 /// Actions triggered by the overlay UI that must be handled by the caller.
 #[derive(Default)]
 pub enum OverlayAction {
@@ -74,7 +78,7 @@ pub enum OverlayAction {
     Download(String),
     /// User clicked refresh.
     RefreshFiles,
-    /// User asked to plug in a virtual second monitor.
+    /// User asked to plug in another virtual monitor.
     AddMonitor,
     /// User asked to unplug the last virtual monitor.
     RemoveMonitor,
@@ -207,10 +211,10 @@ impl OverlayState {
                         ui.horizontal(|ui| {
                             if ui
                                 .add_enabled(
-                                    self.monitor_count < 2,
+                                    self.monitor_count < MAX_MONITORS,
                                     egui::Button::new("➕ Add monitor"),
                                 )
-                                .on_hover_text("Plug in a second virtual monitor")
+                                .on_hover_text("Plug in another virtual monitor")
                                 .clicked()
                             {
                                 action = OverlayAction::AddMonitor;

@@ -91,7 +91,7 @@ struct MonitorLayoutMsg {
     monitors: Vec<MonitorInfo>,
 }
 
-/// A secondary-monitor window: its own OS window, GPU surface, decode pipeline
+/// An extra-monitor window: its own OS window, GPU surface, decode pipeline
 /// and input map. Renders one extra head's independent stream.
 struct MonitorWindow {
     /// The head's id, matched against incoming MonitorFrames.
@@ -100,6 +100,25 @@ struct MonitorWindow {
     renderer: renderer::Renderer,
     decode: DecodePipeline,
     input: input::InputState,
+    /// False while minimized/occluded — decode and render are skipped then.
+    visible: bool,
+}
+
+impl MonitorWindow {
+    /// Point this window at a (possibly different) head: retitle it, and when
+    /// the head actually changed, restart the decoder on the new stream and
+    /// ask that stream for an IDR to sync onto.
+    fn assign_head(&mut self, head: &MonitorInfo, title: &str, codec: &str, hw: (bool, bool)) {
+        let id = head.id as u8;
+        if self.id != id {
+            self.id = id;
+            self.window.set_title(&format!("{} (monitor {})", title, head.id + 1));
+            self.decode = DecodePipeline::new(codec, hw);
+            self.input.send_raw(protocol::encode_request_keyframe_head(id));
+        }
+        self.input.set_remote_size(head.width, head.height);
+        self.input.set_remote_offset(head.x, head.y);
+    }
 }
 
 /// Application state.
@@ -144,11 +163,12 @@ struct App {
     /// the first MSG_MONITOR_LAYOUT; treated as a single full-frame monitor then.
     monitors: Vec<MonitorInfo>,
     /// Set when `monitors` changed so `about_to_wait` reconciles windows (open
-    /// or close the secondary head), since winit window creation needs the event loop.
+    /// or close extra heads), since winit window creation needs the event loop.
     layout_dirty: bool,
-    /// Extra-monitor window (second head). Phase 1 supports one beyond primary.
-    secondary: Option<MonitorWindow>,
-    /// Clone of the transport sender, used to build a second window's input map.
+    /// One window per extra head: `extras[i]` renders `monitors[i + 1]`.
+    /// Opened/closed/reassigned by `reconcile_windows` to match the layout.
+    extras: Vec<MonitorWindow>,
+    /// Clone of the transport sender, used to build extra windows' input maps.
     transport_sender: Option<transport::TransportSender>,
 }
 
@@ -235,9 +255,9 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
-        // Route events for the secondary-monitor window to its own handler.
-        if self.secondary.as_ref().map_or(false, |s| s.window.id() == id) {
-            self.handle_secondary_event(event);
+        // Route events for extra-monitor windows to their own handler.
+        if let Some(idx) = self.extras.iter().position(|s| s.window.id() == id) {
+            self.handle_extra_event(idx, event);
             return;
         }
 
@@ -318,7 +338,14 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::Occluded(occluded) => {
+                let was_visible = self.window_visible;
                 self.window_visible = !occluded;
+                // Frames were skipped while hidden — resync on a fresh IDR.
+                if self.window_visible && !was_visible {
+                    if let Some(input) = &self.input_state {
+                        input.send_raw(protocol::encode_request_keyframe_head(0));
+                    }
+                }
             }
             WindowEvent::RedrawRequested => {
                 // Drain async file-transfer results.
@@ -417,19 +444,22 @@ impl ApplicationHandler for App {
         // Always drain transport events — this must not depend on rendering.
         self.process_transport_events();
 
-        // Open/close the secondary window to match the latest layout (needs the
+        // Open/close extra windows to match the latest layout (needs the
         // event loop, so it can't run inside the message handler).
         if self.layout_dirty {
             self.reconcile_windows(event_loop);
         }
 
-        // If any head's decoder reset itself, ask for a fresh keyframe (it
-        // re-IDRs every head, which resyncs whichever one reset).
-        let primary_reset = self.decode.as_ref().map_or(false, |d| d.take_needs_keyframe());
-        let secondary_reset = self.secondary.as_ref().map_or(false, |s| s.decode.take_needs_keyframe());
-        if primary_reset || secondary_reset {
+        // If a head's decoder reset itself, ask its stream (and only its
+        // stream) for a fresh keyframe.
+        if self.decode.as_ref().map_or(false, |d| d.take_needs_keyframe()) {
             if let Some(input) = &self.input_state {
-                input.send_keyframe_request();
+                input.send_raw(protocol::encode_request_keyframe_head(0));
+            }
+        }
+        for sec in &self.extras {
+            if sec.decode.take_needs_keyframe() {
+                sec.input.send_raw(protocol::encode_request_keyframe_head(sec.id));
             }
         }
 
@@ -491,14 +521,16 @@ impl ApplicationHandler for App {
             }
         }
 
-        // Secondary head: its own independent stream, uploaded and redrawn on
+        // Extra heads: each an independent stream, uploaded and redrawn on
         // its own schedule.
-        if let Some(sec) = &mut self.secondary {
+        for sec in &mut self.extras {
             if sec.decode.take_frame_ready() {
                 if let Some(frame) = sec.decode.take_frame() {
                     sec.renderer.upload_frame(&frame);
                 }
-                sec.window.request_redraw();
+                if sec.visible {
+                    sec.window.request_redraw();
+                }
             }
         }
     }
@@ -606,7 +638,7 @@ impl App {
                         }
                         if outcome.request_keyframe {
                             if let Some(input) = &self.input_state {
-                                input.send_keyframe_request();
+                                input.send_raw(protocol::encode_request_keyframe_head(0));
                             }
                         }
                     }
@@ -634,7 +666,7 @@ impl App {
                             decode.set_codec(&info.codec);
                         }
                         // Extra heads share the codec; rebuild their pipelines too.
-                        if let Some(sec) = &mut self.secondary {
+                        for sec in &mut self.extras {
                             sec.decode.set_codec(&info.codec);
                         }
                         self.codec = info.codec.clone();
@@ -663,17 +695,22 @@ impl App {
                 }
             }
             ServerMessage::MonitorFrame(frame) => {
-                self.stats_bytes += frame.data.len() as u64;
-                if let Some(sec) = &mut self.secondary {
-                    if sec.id == frame.monitor_id {
-                        let outcome = sec.decode.submit(frame.data, frame.keyframe);
-                        // Keyframe requests are global (they re-IDR every head),
-                        // which is enough to resync this one.
-                        if outcome.request_keyframe {
-                            if let Some(input) = &self.input_state {
-                                input.send_keyframe_request();
-                            }
-                        }
+                // (Wire bytes were already counted above, like every message.)
+                if let Some(sec) =
+                    self.extras.iter_mut().find(|s| s.id == frame.monitor_id)
+                {
+                    if !sec.visible {
+                        return;
+                    }
+                    let outcome = sec.decode.submit(frame.data, frame.keyframe);
+                    if outcome.dropped {
+                        // Feeds the server's congestion controller like
+                        // primary-head drops do.
+                        self.stats_dropped += 1;
+                    }
+                    if outcome.request_keyframe {
+                        sec.input
+                            .send_raw(protocol::encode_request_keyframe_head(frame.monitor_id));
                     }
                 }
             }
@@ -695,10 +732,15 @@ impl App {
         }
     }
 
-    /// Open/close the secondary window and refresh each head's input offset to
-    /// match the layout. Each head shows its own stream, so no crop is needed;
-    /// input still carries the head's framebuffer offset. Needs the event loop
-    /// to create windows, so it runs from `about_to_wait`.
+    /// Open, close or reassign extra windows and refresh each head's input
+    /// offset to match the layout. Each head shows its own stream, so no crop
+    /// is needed; input still carries the head's framebuffer offset. Needs the
+    /// event loop to create windows, so it runs from `about_to_wait`.
+    ///
+    /// Windows are positional: `extras[i]` shows `monitors[i + 1]`. When the
+    /// layout shrinks (or the user closed a middle window and the server
+    /// renumbered the heads), surviving windows are reassigned to their new
+    /// head instead of being torn down and reopened.
     fn reconcile_windows(&mut self, event_loop: &ActiveEventLoop) {
         self.layout_dirty = false;
         if self.monitors.is_empty() {
@@ -712,34 +754,36 @@ impl App {
             input.set_remote_offset(m0.x, m0.y);
         }
 
-        if self.monitors.len() >= 2 {
-            let m1 = self.monitors[1].clone();
-            if self.secondary.is_none() {
-                eprintln!("[monitor] opening second window for head 1");
-                let created = self.create_secondary(event_loop, &m1);
-                match created {
-                    Ok(sec) => self.secondary = Some(sec),
-                    Err(e) => eprintln!("[monitor] failed to open second window: {e:#}"),
+        let target = self.monitors.len() - 1;
+        if self.extras.len() > target {
+            eprintln!("[monitor] closing {} extra window(s)", self.extras.len() - target);
+            self.extras.truncate(target);
+        }
+        for i in 0..target {
+            let head = self.monitors[i + 1].clone();
+            if self.extras.len() <= i {
+                eprintln!("[monitor] opening window for head {}", head.id);
+                match self.create_extra(event_loop, &head) {
+                    Ok(sec) => self.extras.push(sec),
+                    Err(e) => {
+                        eprintln!("[monitor] failed to open window for head {}: {e:#}", head.id);
+                        break;
+                    }
                 }
             }
-            if let Some(sec) = &mut self.secondary {
-                sec.input.set_remote_size(m1.width, m1.height);
-                sec.input.set_remote_offset(m1.x, m1.y);
-            }
-        } else if self.secondary.is_some() {
-            eprintln!("[monitor] closing second window");
-            self.secondary = None;
+            let (title, codec, hw) = (self.args.title.clone(), self.codec.clone(), self.hw_decode);
+            self.extras[i].assign_head(&head, &title, &codec, hw);
         }
     }
 
-    /// Create the secondary-monitor window with its own surface, decoder and input.
-    fn create_secondary(
+    /// Create an extra-monitor window with its own surface, decoder and input.
+    fn create_extra(
         &self,
         event_loop: &ActiveEventLoop,
         head: &MonitorInfo,
     ) -> anyhow::Result<MonitorWindow> {
         let attrs = WindowAttributes::default()
-            .with_title(format!("{} (monitor 2)", self.args.title))
+            .with_title(format!("{} (monitor {})", self.args.title, head.id + 1))
             .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
         #[cfg(windows)]
         let attrs = {
@@ -758,58 +802,63 @@ impl App {
         let size = window.inner_size();
         input.set_window_size(size.width, size.height);
         let decode = DecodePipeline::new(&self.codec, self.hw_decode);
-        Ok(MonitorWindow { id: head.id as u8, window, renderer, decode, input })
+        // Ask this head's stream for an IDR: the layout-change IDR may have
+        // been broadcast before this window (and its fresh decoder) existed.
+        input.send_raw(protocol::encode_request_keyframe_head(head.id as u8));
+        Ok(MonitorWindow {
+            id: head.id as u8,
+            window,
+            renderer,
+            decode,
+            input,
+            visible: true,
+        })
     }
 
-    /// Handle a window event for the secondary-monitor window.
-    fn handle_secondary_event(&mut self, event: WindowEvent) {
+    /// Handle a window event for the extra-monitor window at `idx`.
+    fn handle_extra_event(&mut self, idx: usize, event: WindowEvent) {
+        let sec = &mut self.extras[idx];
         match event {
             WindowEvent::CloseRequested => {
-                if let Some(sec) = &self.secondary {
-                    sec.input.release_all();
-                }
-                // Closing the second window unplugs the virtual monitor.
+                sec.input.release_all();
+                // Closing any extra window unplugs one virtual monitor; the
+                // server's next layout broadcast renumbers the survivors.
                 if let Some(sender) = &self.transport_sender {
                     sender.send(protocol::encode_request_remove_monitor());
                 }
-                self.secondary = None;
+                self.extras.remove(idx);
             }
             WindowEvent::Resized(size) => {
-                if let Some(sec) = &mut self.secondary {
-                    sec.renderer.resize(size.width, size.height);
-                    sec.input.set_window_size(size.width, size.height);
-                }
+                sec.renderer.resize(size.width, size.height);
+                sec.input.set_window_size(size.width, size.height);
             }
             WindowEvent::CursorMoved { position, .. } => {
-                if let Some(sec) = &mut self.secondary {
-                    sec.input.on_cursor_moved(position.x, position.y);
-                }
+                sec.input.on_cursor_moved(position.x, position.y);
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if let Some(sec) = &mut self.secondary {
-                    sec.input.on_mouse_button(button, state);
-                }
+                sec.input.on_mouse_button(button, state);
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                if let Some(sec) = &mut self.secondary {
-                    sec.input.on_scroll(delta);
-                }
+                sec.input.on_scroll(delta);
             }
             WindowEvent::KeyboardInput { event: key_event, .. } => {
-                if let Some(sec) = &mut self.secondary {
-                    sec.input.on_key(key_event.physical_key, key_event.state);
-                }
+                sec.input.on_key(key_event.physical_key, key_event.state);
             }
             WindowEvent::Focused(false) => {
-                if let Some(sec) = &self.secondary {
-                    sec.input.release_all();
+                sec.input.release_all();
+            }
+            WindowEvent::Occluded(occluded) => {
+                let was_visible = sec.visible;
+                sec.visible = !occluded;
+                // Frames were skipped while hidden, so the decoder needs a
+                // fresh IDR to sync back onto the stream.
+                if sec.visible && !was_visible {
+                    sec.input.send_raw(protocol::encode_request_keyframe_head(sec.id));
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let Some(sec) = &mut self.secondary {
-                    if let Err(e) = sec.renderer.render(None) {
-                        tracing::warn!("[monitor2] render error: {}", e);
-                    }
+                if let Err(e) = sec.renderer.render(None) {
+                    tracing::warn!("[monitor {}] render error: {}", sec.id, e);
                 }
             }
             _ => {}
@@ -871,7 +920,7 @@ fn main() {
         stats_bytes: 0,
         monitors: Vec::new(),
         layout_dirty: false,
-        secondary: None,
+        extras: Vec::new(),
         transport_sender: None,
     };
 

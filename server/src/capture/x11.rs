@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::ptr;
 use x11rb::connection::Connection;
 use x11rb::protocol::composite::ConnectionExt as _;
-use x11rb::protocol::damage::{self, ConnectionExt as _};
+use x11rb::protocol::damage;
 use x11rb::protocol::shm::{self, ConnectionExt as _};
 use x11rb::protocol::xfixes::{self};
 use x11rb::protocol::xproto::{self, ImageFormat};
@@ -33,6 +33,12 @@ pub struct X11Capturer {
     damage_id: Option<u32>,
     /// Whether the screen has been damaged since last capture.
     damaged: bool,
+    /// Union of DamageNotify areas since the last `take_damage_hint()`,
+    /// as (left, top, right, bottom) edges.
+    damage_bbox: Option<(u32, u32, u32, u32)>,
+    /// Set when a non-damage event arrived — region info is then unreliable
+    /// and the next hint falls back to "everything changed".
+    damage_unknown: bool,
 }
 
 // SAFETY: The shared memory pointer is only accessed from capture_frame()
@@ -169,6 +175,8 @@ impl X11Capturer {
             shm_size,
             damage_id,
             damaged: true, // assume damaged initially so first frame is captured
+            damage_bbox: None,
+            damage_unknown: true, // no region info for that first frame either
         })
     }
 
@@ -265,14 +273,29 @@ impl X11Capturer {
             return true; // no damage tracking, always capture
         }
 
-        // Drain all pending events to check for DamageNotify
+        // Drain all pending events. DamageNotify carries the damage region's
+        // bounding box (BOUNDING_BOX report level) — union them so the encode
+        // loop can skip heads whose rect the damage never touched.
         while let Ok(Some(event)) = self.conn.poll_for_event() {
-            // DamageNotify events have a specific response type.
-            // The damage extension's event base + 0 = DamageNotify.
-            // We set damaged=true for any event since DamageNotify is
-            // the primary event we subscribed to.
-            let _ = event;
-            self.damaged = true;
+            match event {
+                x11rb::protocol::Event::DamageNotify(e) => {
+                    self.damaged = true;
+                    let (ax, ay) = (e.area.x.max(0) as u32, e.area.y.max(0) as u32);
+                    let (ar, ab) = (ax + e.area.width as u32, ay + e.area.height as u32);
+                    self.damage_bbox = Some(match self.damage_bbox {
+                        None => (ax, ay, ar, ab),
+                        Some((x0, y0, x1, y1)) => {
+                            (x0.min(ax), y0.min(ay), x1.max(ar), y1.max(ab))
+                        }
+                    });
+                }
+                // Anything else is unexpected on this connection; be
+                // conservative and treat the whole frame as changed.
+                _ => {
+                    self.damaged = true;
+                    self.damage_unknown = true;
+                }
+            }
         }
 
         let was_damaged = self.damaged;
@@ -301,9 +324,10 @@ impl X11Capturer {
         let damage_id = conn.generate_id()
             .context("Failed to generate X11 ID for Damage")?;
 
-        // Report NonEmpty damage level: one event per
-        // transition from undamaged→damaged (not per-rect).
-        damage::create(conn, damage_id, window, damage::ReportLevel::NON_EMPTY)?
+        // BoundingBox report level: one event each time the damage region's
+        // bounding box grows (not per-rect), carrying the box — enough to
+        // tell which monitor heads a change touched without an event flood.
+        damage::create(conn, damage_id, window, damage::ReportLevel::BOUNDING_BOX)?
             .check()
             .context("Failed to create Damage object")?;
 
@@ -369,6 +393,23 @@ impl super::ScreenCapturer for X11Capturer {
 
     fn embeds_cursor(&self) -> bool {
         false
+    }
+
+    fn take_damage_hint(&mut self) -> super::DamageHint {
+        let unknown = self.damage_unknown || self.damage_id.is_none();
+        self.damage_unknown = false;
+        let bbox = self.damage_bbox.take();
+        match bbox {
+            Some((x0, y0, x1, y1)) if !unknown => super::DamageHint::Bbox {
+                x: x0,
+                y: y0,
+                width: x1 - x0,
+                height: y1 - y0,
+            },
+            // No region info (tracking unavailable, a foreign event, or a
+            // damaged flag set without events) — assume everything changed.
+            _ => super::DamageHint::Unknown,
+        }
     }
 }
 

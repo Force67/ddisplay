@@ -121,7 +121,7 @@ impl X11InputInjector {
                 // Handled by the WebSocket layer; never forwarded to the input injector.
                 return Ok(());
             }
-            ClientEvent::RequestKeyframe => {
+            ClientEvent::RequestKeyframe { .. } => {
                 // Handled by spawn_input_handler before reaching inject_event.
                 return Ok(());
             }

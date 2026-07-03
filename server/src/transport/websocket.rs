@@ -296,7 +296,7 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
     // the IDR arrives within a frame interval (the wake cuts idle pacing
     // short), so there's no value in caching stale keyframes.
     let mut frame_rx = state.frame_tx.subscribe();
-    state.control.force_keyframe.store(true, Ordering::Release);
+    state.control.request_keyframe_all();
     state.control.notify_activity();
     let input_tx = state.input_tx.clone();
     let recv_input_tx = input_tx.clone();
@@ -338,7 +338,7 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
                             // shows smeared/pixelated regions indefinitely (infinite
                             // GOP). Also tell the ABR controller to back off.
                             send_control.record_congestion();
-                            send_control.force_keyframe.store(true, Ordering::Release);
+                            send_control.request_keyframe_all();
                             send_control.notify_activity();
                         }
                         Err(broadcast::error::RecvError::Closed) => {
@@ -722,9 +722,9 @@ fn normalize_input_events(
             // Intercepted in the recv_task before reaching normalization.
             vec![]
         }
-        ClientEvent::RequestKeyframe => {
-            // Passed through directly to the input handler which sets the force_keyframe flag.
-            vec![ClientEvent::RequestKeyframe]
+        ClientEvent::RequestKeyframe { head } => {
+            // Passed through directly to the input handler which flags the head(s).
+            vec![ClientEvent::RequestKeyframe { head }]
         }
         ClientEvent::Caps(_)
         | ClientEvent::Stats(_)

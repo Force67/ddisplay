@@ -4,14 +4,18 @@
 /// between frames and publishes the live session info back.
 
 use parking_lot::{Condvar, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::protocol::{MonitorLayout, MonitorRect, SessionInfo};
 
 pub struct StreamControl {
-    /// Set by clients (keyframe request) or after a reconfiguration.
-    pub force_keyframe: AtomicBool,
+    /// Bitmask of heads that must produce an IDR on their next frame (bit i =
+    /// head i; `u64::MAX` = every head). Set by clients (keyframe requests)
+    /// or after a reconfiguration; drained by the encode loop. Per-head so a
+    /// single head's decoder reset doesn't force an expensive IDR on every
+    /// other stream.
+    kf_heads: AtomicU64,
     /// Activity flag: input arrived or a client connected since the encode
     /// loop last checked. Paired with the wake condvar so the loop can leave
     /// idle pacing immediately instead of finishing a (up to 100ms) sleep.
@@ -53,7 +57,7 @@ impl StreamControl {
             height: session.height,
         };
         Self {
-            force_keyframe: AtomicBool::new(false),
+            kf_heads: AtomicU64::new(0),
             input_pending: AtomicBool::new(false),
             wake_lock: Mutex::new(()),
             wake_cv: Condvar::new(),
@@ -71,6 +75,27 @@ impl StreamControl {
     /// Current monitor layout snapshot.
     pub fn monitor_layout(&self) -> MonitorLayout {
         MonitorLayout { monitors: self.monitors.lock().clone() }
+    }
+
+    /// Request an IDR from every head (reconfigurations, new clients).
+    pub fn request_keyframe_all(&self) {
+        self.kf_heads.store(u64::MAX, Ordering::Release);
+    }
+
+    /// Request an IDR from one head (a single stream's decoder lost sync).
+    /// `None` (a client without per-head addressing) means every head.
+    pub fn request_keyframe(&self, head: Option<u8>) {
+        match head {
+            Some(id) if (id as usize) < 64 => {
+                self.kf_heads.fetch_or(1 << id, Ordering::AcqRel);
+            }
+            _ => self.request_keyframe_all(),
+        }
+    }
+
+    /// Drain the pending keyframe requests (bit i = head i must IDR).
+    pub fn take_kf_mask(&self) -> u64 {
+        self.kf_heads.swap(0, Ordering::AcqRel)
     }
 
     /// Signal activity (input event, new client) to the encode loop: sets the

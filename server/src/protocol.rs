@@ -25,11 +25,12 @@
 ///   0x17 ReleaseMouse: (no payload)
 ///   0x18 ReleaseAll: (no payload)
 ///   0x20 ClipboardData: [utf8 text...]   (bidirectional)
-///   0x21 RequestKeyframe: (no payload)
+///   0x21 RequestKeyframe: optional [monitor_id: u8]. With a payload only
+///        that head re-IDRs; without one (older clients) every head does.
 ///   0x22 ClientCaps: JSON {codecs, width, height} — decoder capabilities + native resolution
 ///   0x23 ClientStats: JSON {received, dropped, decode_ms, rtt_ms} — periodic feedback
 ///   0x24 Ping: [u64 LE timestamp] — echoed back verbatim by the server (RTT probe)
-///   0x29 RequestAddMonitor: (no payload), plug in a virtual second monitor
+///   0x29 RequestAddMonitor: (no payload), plug in another virtual monitor
 ///   0x2a RequestRemoveMonitor: (no payload), unplug the last virtual monitor
 
 use serde::{Deserialize, Serialize};
@@ -59,7 +60,7 @@ pub const MSG_REQUEST_KEYFRAME: u8 = 0x21;
 pub const MSG_CLIENT_CAPS: u8 = 0x22;
 pub const MSG_CLIENT_STATS: u8 = 0x23;
 pub const MSG_PING: u8 = 0x24;
-/// Client asks the server to plug in a virtual second monitor.
+/// Client asks the server to plug in another virtual monitor.
 pub const MSG_REQUEST_ADD_MONITOR: u8 = 0x29;
 /// Client asks the server to unplug the last virtual monitor.
 pub const MSG_REQUEST_REMOVE_MONITOR: u8 = 0x2a;
@@ -210,14 +211,16 @@ pub enum ClientEvent {
     ReleaseMouse,
     ReleaseAll,
     ClipboardData { text: String },
-    RequestKeyframe,
+    /// Ask for a fresh IDR. `head` targets one monitor's stream; `None`
+    /// (no payload on the wire — older/web clients) re-IDRs every head.
+    RequestKeyframe { head: Option<u8> },
     /// Decoder capabilities (handled by the transport layer, never injected).
     Caps(ClientCaps),
     /// Periodic client feedback (handled by the transport layer, never injected).
     Stats(ClientStats),
     /// RTT probe — the transport layer echoes the raw payload back.
     Ping { payload: Vec<u8> },
-    /// Plug in a virtual second monitor (handled by the transport, never injected).
+    /// Plug in another virtual monitor (handled by the transport, never injected).
     RequestAddMonitor,
     /// Unplug the last virtual monitor (handled by the transport).
     RequestRemoveMonitor,
@@ -265,7 +268,9 @@ pub fn parse_client_message(data: &[u8]) -> Option<ClientEvent> {
             let text = String::from_utf8_lossy(data.get(1..).unwrap_or_default()).into_owned();
             Some(ClientEvent::ClipboardData { text })
         }
-        MSG_REQUEST_KEYFRAME => Some(ClientEvent::RequestKeyframe),
+        MSG_REQUEST_KEYFRAME => {
+            Some(ClientEvent::RequestKeyframe { head: data.get(1).copied() })
+        }
         MSG_CLIENT_CAPS => {
             let caps = serde_json::from_slice::<ClientCaps>(data.get(1..)?).ok()?;
             Some(ClientEvent::Caps(caps))

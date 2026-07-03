@@ -451,9 +451,9 @@ fn spawn_input_handler(
     tokio::task::spawn_blocking(move || {
         for event in sync_rx {
             match &event {
-                ClientEvent::RequestKeyframe => {
-                    tracing::debug!("[keyframe] client requested keyframe");
-                    control.force_keyframe.store(true, Ordering::Release);
+                ClientEvent::RequestKeyframe { head } => {
+                    tracing::debug!("[keyframe] client requested keyframe (head {:?})", head);
+                    control.request_keyframe(*head);
                     control.notify_activity();
                     continue;
                 }
@@ -601,26 +601,26 @@ fn capture_encode_loop(
             // below (which rebuilds the capturer + encoder). The new layout is
             // broadcast so every client opens/closes its extra windows.
             if let Some(desired) = control.monitor_request.lock().take() {
-                let cur_count = control.monitors.lock().len().max(1);
+                let cur = control.monitors.lock().clone();
                 if backend == BackendKind::Wayland {
                     tracing::info!(
                         "[monitor] {} head(s) requested — ignored (wayland backend)",
                         desired,
                     );
-                } else if desired != cur_count {
-                    let base_w = (screen_w / cur_count as u32).max(2) & !1;
-                    let base_h = screen_h;
+                } else if desired != cur.len() {
+                    // Every head keeps the primary head's current size, so the
+                    // layout doesn't drift across repeated add/remove cycles.
+                    let base_w = cur[0].width.max(2) & !1;
+                    let base_h = cur[0].height.max(2) & !1;
                     tracing::info!(
                         "[monitor] heads {} -> {} (base {}x{})",
-                        cur_count, desired, base_w, base_h,
+                        cur.len(), desired, base_w, base_h,
                     );
                     match monitor::apply_layout(desired, base_w, base_h) {
-                        Ok(_) => {
+                        Ok(rects) => {
                             // Provisional layout (responsive); the size_changed
                             // reconcile below corrects it to the real captured
-                            // size, which is what the client crops against.
-                            let rects =
-                                monitor::equal_columns(desired, base_w * desired as u32, base_h);
+                            // size, which is what the client maps input against.
                             *control.monitors.lock() = rects;
                             let _ = frame_tx.send(protocol::encode_monitor_layout(
                                 &control.monitor_layout(),
@@ -651,7 +651,7 @@ fn capture_encode_loop(
                         // tile the real framebuffer exactly. Covers both
                         // resize-to-client (single head) and a head add/remove.
                         let count = control.monitors.lock().len().max(1);
-                        let rects = monitor::equal_columns(count, screen_w, screen_h);
+                        let rects = monitor::layout_rects(count, screen_w, screen_h);
                         let mut mons = control.monitors.lock();
                         if *mons != rects {
                             *mons = rects;
@@ -728,7 +728,7 @@ fn capture_encode_loop(
                     };
                     *control.session.lock() = info.clone();
                     let _ = frame_tx.send(protocol::encode_session_info(&info));
-                    control.force_keyframe.store(true, Ordering::Release);
+                    control.request_keyframe_all();
                     last_activity = Instant::now();
                     tracing::info!(
                         "Encoders rebuilt: {} head(s), {} @ primary {}x{}, {} bps",
@@ -746,12 +746,16 @@ fn capture_encode_loop(
         // server broadcast lag), or after an encoder rebuild. Periodic IDRs
         // are pure quality loss with single-frame VBV (they show up as a
         // flash of pixelation) and the recovery paths above cover every
-        // resync case.
-        let requested_kf = control.force_keyframe.swap(false, Ordering::AcqRel);
-        let force_kf = frame_count == 0 || requested_kf;
-        if requested_kf {
-            tracing::debug!("[keyframe] forcing IDR frame on request");
+        // resync case. The mask is per head, so one stream's resync doesn't
+        // cost an IDR on every other head.
+        let mut kf_mask = control.take_kf_mask();
+        if frame_count == 0 {
+            kf_mask = u64::MAX;
         }
+        if kf_mask != 0 {
+            tracing::debug!("[keyframe] forcing IDR (head mask {:#x})", kf_mask);
+        }
+        let force_kf = kf_mask == u64::MAX;
         let has_damage = capturer.has_new_frame();
 
         // Damage counts as activity too (animations, video playback, etc.)
@@ -765,7 +769,7 @@ fn capture_encode_loop(
         if !capturer.embeds_cursor() {
             if let Some(ci) = capturer.cursor_info().ok() {
                 let cur = (ci.x.max(0) as u16, ci.y.max(0) as u16, ci.visible);
-                if force_kf || last_cursor != Some(cur) {
+                if kf_mask != 0 || last_cursor != Some(cur) {
                     last_cursor = Some(cur);
                     let _ = frame_tx.send(protocol::encode_cursor_update(cur.0, cur.1, cur.2));
                 }
@@ -774,11 +778,27 @@ fn capture_encode_loop(
 
         // Skip capture+encode if nothing changed (saves CPU, GPU, and bandwidth).
         // Always capture on the frame after input (app may have just responded).
-        if !force_kf && !has_damage && !input_arrived {
+        if kf_mask == 0 && !has_damage && !input_arrived {
             frame_count += 1;
             fps_frame_count += 1;
             continue;
         }
+
+        // What actually changed this frame (drained before frame_ref, which
+        // holds the capturer borrow). When damage reports a bounding box,
+        // heads it never touched skip encoding entirely — with many heads
+        // that is most of them, most frames (activity on one monitor doesn't
+        // burn encode time and bandwidth on the others). Without region info
+        // (or on the post-input hedge frame) every head encodes.
+        let damage_hint = if has_damage {
+            capturer.take_damage_hint()
+        } else if input_arrived {
+            capture::DamageHint::Unknown
+        } else {
+            // Here only because of a keyframe request: nothing on screen
+            // changed, so heads that weren't asked for an IDR stay silent.
+            capture::DamageHint::Bbox { x: 0, y: 0, width: 0, height: 0 }
+        };
 
         // Zero-copy capture: borrow SHM buffer directly.
         // Capture can fail transiently around display resizes (the SHM
@@ -798,17 +818,22 @@ fn capture_encode_loop(
         // zero-copy when it covers the whole frame). Head 0 goes out as a
         // VideoFrame (web-compatible); extra heads as tagged MonitorFrames.
         for head in heads.iter_mut() {
+            let r = &head.rect;
+            let head_kf = force_kf || (kf_mask >> r.id.min(63)) & 1 != 0;
+            if !head_kf && !damage_hint.intersects(r.x, r.y, r.width, r.height) {
+                continue;
+            }
             let packet = match head.encode(
                 frame.data,
                 frame.width,
                 frame.height,
                 frame.stride,
-                force_kf,
+                head_kf,
             ) {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!("Encode failed on head {} ({}); skipping", head.rect.id, e);
-                    control.force_keyframe.store(true, Ordering::Release);
+                    control.request_keyframe(Some(head.rect.id as u8));
                     continue;
                 }
             };

@@ -29,6 +29,33 @@ pub trait ScreenCapturer: Send {
     /// True when the cursor is composited into captured frames (Wayland
     /// EMBEDDED cursor mode) — separate cursor updates are skipped then.
     fn embeds_cursor(&self) -> bool;
+    /// What changed since the last call (cleared on read). Lets the encode
+    /// loop skip heads whose region is untouched. Backends without region
+    /// tracking keep the default: everything may have changed.
+    fn take_damage_hint(&mut self) -> DamageHint {
+        DamageHint::Unknown
+    }
+}
+
+/// Summary of which screen region changed since the previous captured frame.
+#[derive(Debug, Clone, Copy)]
+pub enum DamageHint {
+    /// No region information — treat the whole frame as dirty.
+    Unknown,
+    /// All changes fall inside this bounding box.
+    Bbox { x: u32, y: u32, width: u32, height: u32 },
+}
+
+impl DamageHint {
+    /// Whether the damaged region touches the given rectangle.
+    pub fn intersects(&self, rx: u32, ry: u32, rw: u32, rh: u32) -> bool {
+        match *self {
+            DamageHint::Unknown => true,
+            DamageHint::Bbox { x, y, width, height } => {
+                x < rx + rw && rx < x + width && y < ry + rh && ry < y + height
+            }
+        }
+    }
 }
 
 /// A captured frame from the display.

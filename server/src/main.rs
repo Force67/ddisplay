@@ -14,6 +14,7 @@ mod head_stream;
 mod monitor;
 mod transport;
 mod input;
+mod usb;
 mod clipboard;
 mod files;
 mod resize;

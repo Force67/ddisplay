@@ -26,6 +26,15 @@
 ///   0x22 ClientCaps: JSON {codecs, width, height}
 ///   0x23 ClientStats: JSON {received, dropped, decode_ms, rtt_ms}
 ///   0x24 Ping: [u64 LE timestamp]
+///
+/// USB forwarding (our device -> server session, usbip):
+///   0x30 UsbAttach (C->S): JSON {token, vendor_id, product_id, busnum,
+///        devnum, speed, product}
+///   0x31 UsbAttached (S->C): JSON {token, port}
+///   0x32 UsbDetach: [token: u32 LE]   (bidirectional teardown)
+///   0x33 UsbData: [token: u32 LE] [bytes...] — usbip URB stream chunks
+///        (bidirectional)
+///   0x34 UsbError (S->C): JSON {token, error}
 
 // Server message types
 pub const MSG_VIDEO_FRAME: u8 = 0x01;
@@ -57,6 +66,17 @@ pub const MSG_PING: u8 = 0x24;
 pub const MSG_REQUEST_ADD_MONITOR: u8 = 0x29;
 /// Ask the server to unplug the last virtual monitor.
 pub const MSG_REQUEST_REMOVE_MONITOR: u8 = 0x2a;
+
+/// Offer one of our USB devices for forwarding. JSON payload.
+pub const MSG_USB_ATTACH: u8 = 0x30;
+/// Server attached the device to a vhci port. JSON {token, port}.
+pub const MSG_USB_ATTACHED: u8 = 0x31;
+/// Tear down a forwarded device. [token: u32 LE]. Bidirectional.
+pub const MSG_USB_DETACH: u8 = 0x32;
+/// A chunk of a device's usbip URB byte stream. [token: u32 LE][bytes...].
+pub const MSG_USB_DATA: u8 = 0x33;
+/// Attach failed on the server. JSON {token, error}.
+pub const MSG_USB_ERROR: u8 = 0x34;
 
 /// Parsed video frame from the server.
 pub struct VideoFrame<'a> {
@@ -98,6 +118,14 @@ pub enum ServerMessage<'a> {
     ClipboardData(String),
     /// Echo of our MSG_PING — payload is the timestamp we sent.
     Pong(u64),
+    /// JSON {token, port}: a device we offered is now attached.
+    UsbAttached(&'a [u8]),
+    /// JSON {token, error}: attaching a device we offered failed.
+    UsbError(&'a [u8]),
+    /// The server tore down a forwarded device.
+    UsbDetach(u32),
+    /// A chunk of a forwarded device's usbip URB stream.
+    UsbData { token: u32, data: &'a [u8] },
     Unknown(u8),
 }
 
@@ -153,6 +181,16 @@ pub fn parse_server_message(data: &[u8]) -> Option<ServerMessage<'_>> {
         MSG_PING if data.len() >= 9 => {
             let ts = u64::from_le_bytes(data[1..9].try_into().ok()?);
             Some(ServerMessage::Pong(ts))
+        }
+        MSG_USB_ATTACHED if data.len() >= 2 => Some(ServerMessage::UsbAttached(&data[1..])),
+        MSG_USB_ERROR if data.len() >= 2 => Some(ServerMessage::UsbError(&data[1..])),
+        MSG_USB_DETACH if data.len() >= 5 => {
+            let token = u32::from_le_bytes(data[1..5].try_into().ok()?);
+            Some(ServerMessage::UsbDetach(token))
+        }
+        MSG_USB_DATA if data.len() >= 5 => {
+            let token = u32::from_le_bytes(data[1..5].try_into().ok()?);
+            Some(ServerMessage::UsbData { token, data: &data[5..] })
         }
         other => Some(ServerMessage::Unknown(other)),
     }
@@ -267,5 +305,30 @@ pub fn encode_ping(timestamp_ms: u64) -> Vec<u8> {
     let mut buf = Vec::with_capacity(9);
     buf.push(MSG_PING);
     buf.extend_from_slice(&timestamp_ms.to_le_bytes());
+    buf
+}
+
+/// Offer a USB device for forwarding (JSON payload built by the usb module).
+pub fn encode_usb_attach(json: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + json.len());
+    buf.push(MSG_USB_ATTACH);
+    buf.extend_from_slice(json);
+    buf
+}
+
+/// Send a chunk of a forwarded device's usbip stream to the server.
+pub fn encode_usb_data(token: u32, data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(5 + data.len());
+    buf.push(MSG_USB_DATA);
+    buf.extend_from_slice(&token.to_le_bytes());
+    buf.extend_from_slice(data);
+    buf
+}
+
+/// Tear down a forwarded device (unplugged or errored on our side).
+pub fn encode_usb_detach(token: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(5);
+    buf.push(MSG_USB_DETACH);
+    buf.extend_from_slice(&token.to_le_bytes());
     buf
 }

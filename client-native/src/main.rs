@@ -27,6 +27,7 @@ mod input;
 mod clipboard;
 mod overlay;
 mod files;
+mod usb;
 
 use overlay::{OverlayAction, OverlayState};
 
@@ -51,8 +52,8 @@ struct SessionInfo {
 #[command(name = "ddisplay-client", about = "Native remote display client")]
 struct Args {
     /// Server address (e.g., 192.168.1.100:9550)
-    #[arg(short, long)]
-    server: String,
+    #[arg(short, long, required_unless_present = "list_usb")]
+    server: Option<String>,
 
     /// Window title
     #[arg(long, default_value = "ddisplay")]
@@ -67,6 +68,23 @@ struct Args {
     /// All files in this directory are uploaded to the server's shared folder.
     #[arg(long)]
     share_dir: Option<std::path::PathBuf>,
+
+    /// Forward a local USB device to the server session (VID:PID in hex,
+    /// e.g. 046d:c52b). Repeatable. See --list-usb for what is connected.
+    #[arg(long = "share-usb", value_name = "VID:PID")]
+    share_usb: Vec<String>,
+
+    /// List connected USB devices and exit.
+    #[arg(long)]
+    list_usb: bool,
+}
+
+impl Args {
+    /// The server address; present whenever the app actually connects
+    /// (--list-usb is the only mode without one).
+    fn server(&self) -> &str {
+        self.server.as_deref().unwrap_or_default()
+    }
 }
 
 /// One monitor (head) and its pixel rect inside the captured framebuffer,
@@ -170,6 +188,10 @@ struct App {
     extras: Vec<MonitorWindow>,
     /// Clone of the transport sender, used to build extra windows' input maps.
     transport_sender: Option<transport::TransportSender>,
+    /// Parsed --share-usb specs, turned into a manager once connected.
+    usb_shares: Vec<(u16, u16)>,
+    /// USB forwarding state (None when nothing is shared).
+    usb: Option<usb::UsbManager>,
 }
 
 impl ApplicationHandler for App {
@@ -228,14 +250,18 @@ impl ApplicationHandler for App {
         self.decode = Some(DecodePipeline::new(&startup_codec, self.hw_decode));
         self.codec = startup_codec;
 
-        eprintln!("[init] Connecting to ws://{}...", self.args.server);
+        eprintln!("[init] Connecting to ws://{}...", self.args.server());
 
         // Start transport on the tokio runtime
-        let ws_url = format!("ws://{}/ws", self.args.server);
+        let ws_url = format!("ws://{}/ws", self.args.server());
         let (sender, rx) = self.rt.block_on(async { transport::spawn(ws_url) });
 
         let clipboard_last_set = clipboard::spawn_monitor(sender.clone());
         self.clipboard_last_set = clipboard_last_set;
+
+        if !self.usb_shares.is_empty() {
+            self.usb = Some(usb::UsbManager::new(sender.clone(), self.usb_shares.clone()));
+        }
 
         let input_state = input::InputState::new(sender.clone());
         self.transport_sender = Some(sender);
@@ -246,7 +272,7 @@ impl ApplicationHandler for App {
         self.transport_rx = Some(rx);
         self.overlay = Some(OverlayState::new(&window));
         self.files_state = Some(files::FileTransferState::new(
-            &self.args.server,
+            self.args.server(),
             self.rt.clone(),
         ));
 
@@ -371,7 +397,7 @@ impl ApplicationHandler for App {
                 let (egui_output, action) = if let (Some(overlay), Some(window), Some(files)) =
                     (&mut self.overlay, &self.window, &mut self.files_state)
                 {
-                    let server = &self.args.server;
+                    let server = self.args.server();
                     let codec = &self.codec;
                     let fps = self.session_fps;
                     let rtt = self.last_rtt_ms;
@@ -382,7 +408,7 @@ impl ApplicationHandler for App {
                     }
                     (egui_data, act)
                 } else if let (Some(overlay), Some(window)) = (&mut self.overlay, &self.window) {
-                    let server = &self.args.server;
+                    let server = self.args.server();
                     let codec = &self.codec;
                     let fps = self.session_fps;
                     let rtt = self.last_rtt_ms;
@@ -595,9 +621,17 @@ impl App {
                     {
                         files.upload_dir(dir.clone());
                     }
+                    // Offer --share-usb devices (per connection: a reconnect
+                    // voids all server-side USB state).
+                    if let Some(usb) = &mut self.usb {
+                        usb.on_connected();
+                    }
                 }
                 TransportEvent::Disconnected => {
                     tracing::warn!("Disconnected from server");
+                    if let Some(usb) = &mut self.usb {
+                        usb.on_disconnected();
+                    }
                 }
                 TransportEvent::Data(data) => {
                     self.handle_server_message(&data);
@@ -725,6 +759,26 @@ impl App {
             }
             ServerMessage::ClipboardData(text) => {
                 clipboard::set_clipboard(&text, &self.clipboard_last_set);
+            }
+            ServerMessage::UsbData { token, data } => {
+                if let Some(usb) = &mut self.usb {
+                    usb.on_data(token, data);
+                }
+            }
+            ServerMessage::UsbAttached(json) => {
+                if let Some(usb) = &self.usb {
+                    usb.on_attached(json);
+                }
+            }
+            ServerMessage::UsbError(json) => {
+                if let Some(usb) = &mut self.usb {
+                    usb.on_error(json);
+                }
+            }
+            ServerMessage::UsbDetach(token) => {
+                if let Some(usb) = &mut self.usb {
+                    usb.on_detach(token);
+                }
             }
             ServerMessage::Unknown(t) => {
                 eprintln!("[proto] unknown message type 0x{:02x}", t);
@@ -870,6 +924,22 @@ impl App {
 fn main() {
     let args = Args::parse();
 
+    if args.list_usb {
+        usb::list_devices();
+        return;
+    }
+
+    let usb_shares: Vec<(u16, u16)> = args
+        .share_usb
+        .iter()
+        .map(|spec| {
+            usb::parse_share_spec(spec).unwrap_or_else(|e| {
+                eprintln!("--share-usb: {e}");
+                std::process::exit(2);
+            })
+        })
+        .collect();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
@@ -879,7 +949,7 @@ fn main() {
         .init();
 
     eprintln!("ddisplay-client v{}", env!("CARGO_PKG_VERSION"));
-    eprintln!("Server: {}", args.server);
+    eprintln!("Server: {}", args.server());
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -922,6 +992,8 @@ fn main() {
         layout_dirty: false,
         extras: Vec::new(),
         transport_sender: None,
+        usb_shares,
+        usb: None,
     };
 
     if let Err(e) = event_loop.run_app(&mut app) {

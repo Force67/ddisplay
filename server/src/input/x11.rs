@@ -129,7 +129,10 @@ impl X11InputInjector {
             | ClientEvent::Stats(_)
             | ClientEvent::Ping { .. }
             | ClientEvent::RequestAddMonitor
-            | ClientEvent::RequestRemoveMonitor => {
+            | ClientEvent::RequestRemoveMonitor
+            | ClientEvent::TermOpen(_)
+            | ClientEvent::TermData { .. }
+            | ClientEvent::TermResize { .. } => {
                 // Handled by the WebSocket layer; never forwarded to the input injector.
                 return Ok(());
             }

@@ -26,6 +26,12 @@
 ///   0x22 ClientCaps: JSON {codecs, width, height}
 ///   0x23 ClientStats: JSON {received, dropped, decode_ms, rtt_ms}
 ///   0x24 Ping: [u64 LE timestamp]
+///
+/// Terminal channel (docs/terminal.md):
+///   0x30 TermOpen (client -> server): JSON {cols, rows, term}
+///   0x31 TermData: [bytes...]   (bidirectional; keystrokes up, PTY output down)
+///   0x32 TermResize (client -> server): [cols: u16 LE] [rows: u16 LE]
+///   0x33 TermExit (server -> client): [exit_code: u8]
 
 // Server message types
 pub const MSG_VIDEO_FRAME: u8 = 0x01;
@@ -57,6 +63,15 @@ pub const MSG_PING: u8 = 0x24;
 pub const MSG_REQUEST_ADD_MONITOR: u8 = 0x29;
 /// Ask the server to unplug the last virtual monitor.
 pub const MSG_REQUEST_REMOVE_MONITOR: u8 = 0x2a;
+
+/// Ask the server for a PTY: JSON {cols, rows, term}. One per connection.
+pub const MSG_TERM_OPEN: u8 = 0x30;
+/// Raw terminal bytes (bidirectional).
+pub const MSG_TERM_DATA: u8 = 0x31;
+/// Our terminal grid was resized: [cols: u16 LE] [rows: u16 LE].
+pub const MSG_TERM_RESIZE: u8 = 0x32;
+/// The PTY child exited (or the open was refused): [exit_code: u8].
+pub const MSG_TERM_EXIT: u8 = 0x33;
 
 /// Parsed video frame from the server.
 pub struct VideoFrame<'a> {
@@ -98,6 +113,10 @@ pub enum ServerMessage<'a> {
     ClipboardData(String),
     /// Echo of our MSG_PING — payload is the timestamp we sent.
     Pong(u64),
+    /// PTY output for the terminal window (MSG_TERM_DATA).
+    TermData(&'a [u8]),
+    /// The remote shell exited (MSG_TERM_EXIT).
+    TermExit(u8),
     Unknown(u8),
 }
 
@@ -154,6 +173,8 @@ pub fn parse_server_message(data: &[u8]) -> Option<ServerMessage<'_>> {
             let ts = u64::from_le_bytes(data[1..9].try_into().ok()?);
             Some(ServerMessage::Pong(ts))
         }
+        MSG_TERM_DATA => Some(ServerMessage::TermData(data.get(1..).unwrap_or_default())),
+        MSG_TERM_EXIT if data.len() >= 2 => Some(ServerMessage::TermExit(data[1])),
         other => Some(ServerMessage::Unknown(other)),
     }
 }
@@ -259,6 +280,33 @@ pub fn encode_client_stats(received: u32, dropped: u32, decode_ms: f32, rtt_ms: 
     let mut buf = Vec::with_capacity(1 + payload.len());
     buf.push(MSG_CLIENT_STATS);
     buf.extend_from_slice(&payload);
+    buf
+}
+
+/// Ask the server for a PTY of the given size.
+pub fn encode_term_open(cols: u16, rows: u16, term: &str) -> Vec<u8> {
+    let json = serde_json::json!({ "cols": cols, "rows": rows, "term": term });
+    let payload = serde_json::to_vec(&json).unwrap();
+    let mut buf = Vec::with_capacity(1 + payload.len());
+    buf.push(MSG_TERM_OPEN);
+    buf.extend_from_slice(&payload);
+    buf
+}
+
+/// Keystrokes for the remote PTY.
+pub fn encode_term_data(data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + data.len());
+    buf.push(MSG_TERM_DATA);
+    buf.extend_from_slice(data);
+    buf
+}
+
+/// Tell the server the terminal grid changed size.
+pub fn encode_term_resize(cols: u16, rows: u16) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(5);
+    buf.push(MSG_TERM_RESIZE);
+    buf.extend_from_slice(&cols.to_le_bytes());
+    buf.extend_from_slice(&rows.to_le_bytes());
     buf
 }
 

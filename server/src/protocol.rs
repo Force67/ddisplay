@@ -32,6 +32,12 @@
 ///   0x24 Ping: [u64 LE timestamp] — echoed back verbatim by the server (RTT probe)
 ///   0x29 RequestAddMonitor: (no payload), plug in another virtual monitor
 ///   0x2a RequestRemoveMonitor: (no payload), unplug the last virtual monitor
+///
+/// Terminal channel (docs/terminal.md):
+///   0x30 TermOpen (client -> server): JSON {cols, rows, term}
+///   0x31 TermData: [bytes...]   (bidirectional; keystrokes up, PTY output down)
+///   0x32 TermResize (client -> server): [cols: u16 LE] [rows: u16 LE]
+///   0x33 TermExit (server -> client): [exit_code: u8]
 
 use serde::{Deserialize, Serialize};
 
@@ -65,11 +71,42 @@ pub const MSG_REQUEST_ADD_MONITOR: u8 = 0x29;
 /// Client asks the server to unplug the last virtual monitor.
 pub const MSG_REQUEST_REMOVE_MONITOR: u8 = 0x2a;
 
+/// Client asks for a PTY: JSON {cols, rows, term}. One terminal per connection.
+pub const MSG_TERM_OPEN: u8 = 0x30;
+/// Raw terminal bytes (bidirectional).
+pub const MSG_TERM_DATA: u8 = 0x31;
+/// Client's terminal was resized: [cols: u16 LE] [rows: u16 LE].
+pub const MSG_TERM_RESIZE: u8 = 0x32;
+/// The PTY child exited (or the open was refused): [exit_code: u8].
+pub const MSG_TERM_EXIT: u8 = 0x33;
+
 pub fn encode_clipboard_data(text: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(1 + text.len());
     buf.push(MSG_CLIPBOARD_DATA);
     buf.extend_from_slice(text.as_bytes());
     buf
+}
+
+/// Encode PTY output for the client.
+pub fn encode_term_data(data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + data.len());
+    buf.push(MSG_TERM_DATA);
+    buf.extend_from_slice(data);
+    buf
+}
+
+/// Encode the PTY child's exit code.
+pub fn encode_term_exit(exit_code: u8) -> Vec<u8> {
+    vec![MSG_TERM_EXIT, exit_code]
+}
+
+/// Requested PTY geometry and terminal type from a client's TermOpen.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TermOpen {
+    pub cols: u16,
+    pub rows: u16,
+    #[serde(default)]
+    pub term: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -224,6 +261,12 @@ pub enum ClientEvent {
     RequestAddMonitor,
     /// Unplug the last virtual monitor (handled by the transport).
     RequestRemoveMonitor,
+    /// Open a PTY on this connection (handled by the transport, never injected).
+    TermOpen(TermOpen),
+    /// Keystrokes for this connection's PTY (handled by the transport).
+    TermData { data: Vec<u8> },
+    /// Resize this connection's PTY (handled by the transport).
+    TermResize { cols: u16, rows: u16 },
 }
 
 /// Parse a binary message from the client.
@@ -282,6 +325,18 @@ pub fn parse_client_message(data: &[u8]) -> Option<ClientEvent> {
         MSG_PING => Some(ClientEvent::Ping { payload: data.to_vec() }),
         MSG_REQUEST_ADD_MONITOR => Some(ClientEvent::RequestAddMonitor),
         MSG_REQUEST_REMOVE_MONITOR => Some(ClientEvent::RequestRemoveMonitor),
+        MSG_TERM_OPEN => {
+            let open = serde_json::from_slice::<TermOpen>(data.get(1..)?).ok()?;
+            Some(ClientEvent::TermOpen(open))
+        }
+        MSG_TERM_DATA => Some(ClientEvent::TermData {
+            data: data.get(1..).unwrap_or_default().to_vec(),
+        }),
+        MSG_TERM_RESIZE if data.len() >= 5 => {
+            let cols = u16::from_le_bytes([data[1], data[2]]);
+            let rows = u16::from_le_bytes([data[3], data[4]]);
+            Some(ClientEvent::TermResize { cols, rows })
+        }
         _ => None,
     }
 }

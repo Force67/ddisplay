@@ -56,6 +56,9 @@ egui = "0.34.1"
 egui-wgpu = "0.34.1"
 egui-winit = { version = "0.34.1", default-features = false }
 
+# Terminal emulation for the in-client terminal window (F4)
+vt100 = "0.15"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

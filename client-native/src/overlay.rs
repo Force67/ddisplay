@@ -144,15 +144,22 @@ impl OverlayState {
         stats: &StatsHistory,
         window: &winit::window::Window,
         files: Option<&mut FileTransferState>,
+        term: Option<&mut crate::term::TermUi>,
     ) -> (Option<EguiRenderData>, OverlayAction) {
         // Always drain accumulated winit input so it doesn't pile up while hidden.
         let raw_input = self.winit_state.take_egui_input(window);
 
-        if !self.visible && !self.stats_visible {
+        let term_visible = term.as_ref().map_or(false, |t| t.visible);
+        if !self.visible && !self.stats_visible && !term_visible {
             return (None, OverlayAction::None);
         }
 
         self.ctx.begin_pass(raw_input);
+
+        // Terminal window (F4) — lives alongside the video, not modal like the menu.
+        if let Some(term) = term {
+            term.ui(&self.ctx);
+        }
 
         let screen = self.ctx.screen_rect();
         let panel_w = 380.0f32;

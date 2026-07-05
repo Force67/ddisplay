@@ -16,6 +16,7 @@ mod transport;
 mod input;
 mod clipboard;
 mod files;
+mod terminal;
 mod resize;
 mod wayland_session;
 mod portal_session;

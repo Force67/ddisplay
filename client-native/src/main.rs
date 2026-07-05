@@ -27,6 +27,7 @@ mod input;
 mod clipboard;
 mod overlay;
 mod files;
+mod term;
 
 use overlay::{OverlayAction, OverlayState};
 
@@ -141,6 +142,8 @@ struct App {
     window_visible: bool,
     /// Egui overlay state.
     overlay: Option<OverlayState>,
+    /// In-client terminal window (F4), a PTY on the server.
+    term: Option<term::TermUi>,
     /// File transfer state (HTTP, talks to server's /files/* endpoints).
     files_state: Option<files::FileTransferState>,
     /// Frames received since the last stats report.
@@ -238,6 +241,7 @@ impl ApplicationHandler for App {
         self.clipboard_last_set = clipboard_last_set;
 
         let input_state = input::InputState::new(sender.clone());
+        self.term = Some(term::TermUi::new(sender.clone()));
         self.transport_sender = Some(sender);
 
         self.window = Some(window.clone());
@@ -261,10 +265,32 @@ impl ApplicationHandler for App {
             return;
         }
 
-        // Only let egui consume events while the overlay is actually visible.
-        // Otherwise stale egui focus/capture state can swallow remote input.
+        // F4 toggles the terminal window. Intercepted before egui, which would
+        // otherwise swallow it while the terminal grid has keyboard focus.
+        // Repeats and the release are swallowed too so no F4 leaks to the
+        // remote desktop.
+        if let WindowEvent::KeyboardInput { event: ref key_event, .. } = event {
+            if matches!(
+                key_event.physical_key,
+                winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::F4)
+            ) {
+                if key_event.state == winit::event::ElementState::Pressed && !key_event.repeat {
+                    if let Some(term) = &mut self.term {
+                        term.toggle();
+                    }
+                }
+                return;
+            }
+        }
+
+        // Only let egui consume events while the overlay or terminal is actually
+        // visible. Otherwise stale egui focus/capture state can swallow remote
+        // input. Unlike the modal overlay, the terminal only consumes what egui
+        // claims (clicks on its window, keys while its grid is focused); the
+        // rest keeps flowing to the remote desktop below.
+        let term_visible = self.term.as_ref().map_or(false, |t| t.visible);
         if let (Some(overlay), Some(window)) = (&mut self.overlay, &self.window) {
-            if overlay.visible {
+            if overlay.visible || term_visible {
                 let resp = overlay.winit_state.on_window_event(window, &event);
                 if resp.consumed {
                     return;
@@ -375,8 +401,10 @@ impl ApplicationHandler for App {
                     let codec = &self.codec;
                     let fps = self.session_fps;
                     let rtt = self.last_rtt_ms;
-                    let (egui_data, act) =
-                        overlay.run_ui(server, codec, fps, rtt, &self.stats, window, Some(files));
+                    let (egui_data, act) = overlay.run_ui(
+                        server, codec, fps, rtt, &self.stats, window, Some(files),
+                        self.term.as_mut(),
+                    );
                     if let Some(renderer) = &mut self.renderer {
                         renderer.set_display_mode(overlay.display_mode);
                     }
@@ -386,8 +414,10 @@ impl ApplicationHandler for App {
                     let codec = &self.codec;
                     let fps = self.session_fps;
                     let rtt = self.last_rtt_ms;
-                    let (egui_data, act) =
-                        overlay.run_ui(server, codec, fps, rtt, &self.stats, window, None);
+                    let (egui_data, act) = overlay.run_ui(
+                        server, codec, fps, rtt, &self.stats, window, None,
+                        self.term.as_mut(),
+                    );
                     if let Some(renderer) = &mut self.renderer {
                         renderer.set_display_mode(overlay.display_mode);
                     }
@@ -495,7 +525,8 @@ impl ApplicationHandler for App {
         let overlay_open = self
             .overlay
             .as_ref()
-            .map_or(false, |o| o.visible || o.stats_visible);
+            .map_or(false, |o| o.visible || o.stats_visible)
+            || self.term.as_ref().map_or(false, |t| t.visible);
 
         // Primary head: upload its newest decoded frame, then redraw.
         let primary_frame = self.decode.as_ref().map_or(false, |d| d.take_frame_ready());
@@ -598,6 +629,10 @@ impl App {
                 }
                 TransportEvent::Disconnected => {
                     tracing::warn!("Disconnected from server");
+                    // The server-side PTY died with the connection.
+                    if let Some(term) = &mut self.term {
+                        term.on_disconnect();
+                    }
                 }
                 TransportEvent::Data(data) => {
                     self.handle_server_message(&data);
@@ -725,6 +760,16 @@ impl App {
             }
             ServerMessage::ClipboardData(text) => {
                 clipboard::set_clipboard(&text, &self.clipboard_last_set);
+            }
+            ServerMessage::TermData(bytes) => {
+                if let Some(term) = &mut self.term {
+                    term.on_data(bytes);
+                }
+            }
+            ServerMessage::TermExit(code) => {
+                if let Some(term) = &mut self.term {
+                    term.on_exit(code);
+                }
             }
             ServerMessage::Unknown(t) => {
                 eprintln!("[proto] unknown message type 0x{:02x}", t);
@@ -909,6 +954,7 @@ fn main() {
         clipboard_last_set: Arc::new(std::sync::Mutex::new(None)),
         window_visible: true,
         overlay: None,
+        term: None,
         files_state: None,
         stats_received: 0,
         stats_dropped: 0,

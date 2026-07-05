@@ -29,7 +29,7 @@ NVENC is optional and loaded at runtime, so building needs no CUDA toolkit. CI c
 ./target/release/ddisplay-client --server <host>:9550
 ```
 
-The web client is served at `http://<host>:9550`. Without `--display` the server looks for a Wayland session, and `scripts/` can start headless GNOME or KDE sessions to capture. In the native client, F2 opens the overlay and F3 the stats HUD.
+The web client is served at `http://<host>:9550`. Without `--display` the server looks for a Wayland session, and `scripts/` can start headless GNOME or KDE sessions to capture. In the native client, F2 opens the overlay, F3 the stats HUD, and F4 a terminal on the server, rendered alongside the video stream (`docs/terminal.md`).
 
 | Flag | Default | Purpose |
 |------|---------|---------|

@@ -353,6 +353,9 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
 
     // Task: this WebSocket client -> input channel
     let mut recv_task = tokio::spawn(async move {
+        // This connection's PTY session, if a terminal is open. Dropped with
+        // the task, which hangs up on the shell (docs/terminal.md).
+        let mut term_session: Option<crate::terminal::TermSession> = None;
         while let Some(Ok(msg)) = ws_receiver.next().await {
             match msg {
                 Message::Binary(data) => {
@@ -389,6 +392,41 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
                                     peer, conn_id, stats.dropped,
                                 );
                                 recv_state.control.record_congestion();
+                            }
+                        }
+                        // Terminal channel: owned by this connection, never
+                        // forwarded to the input injector.
+                        ClientEvent::TermOpen(open) => {
+                            if readonly {
+                                let _ = direct_tx.try_send(protocol::encode_term_exit(1));
+                                continue;
+                            }
+                            // One live terminal per connection. Opening over a
+                            // running shell would let the dying session's last
+                            // TermData/TermExit corrupt the new one, so ignore.
+                            if term_session.as_ref().is_some_and(|t| !t.exited()) {
+                                tracing::warn!(
+                                    "{}#{}: TermOpen while a terminal is open; ignored",
+                                    peer, conn_id,
+                                );
+                                continue;
+                            }
+                            match crate::terminal::spawn(&open, direct_tx.clone()) {
+                                Ok(session) => term_session = Some(session),
+                                Err(e) => {
+                                    tracing::warn!("{}#{}: terminal open failed: {}", peer, conn_id, e);
+                                    let _ = direct_tx.try_send(protocol::encode_term_exit(1));
+                                }
+                            }
+                        }
+                        ClientEvent::TermData { data } => {
+                            if let Some(term) = &term_session {
+                                term.send(crate::terminal::TermInput::Data(data));
+                            }
+                        }
+                        ClientEvent::TermResize { cols, rows } => {
+                            if let Some(term) = &term_session {
+                                term.send(crate::terminal::TermInput::Resize { cols, rows });
                             }
                         }
                         // Clipboard data is handled locally; never forwarded to the input injector.
@@ -730,7 +768,10 @@ fn normalize_input_events(
         | ClientEvent::Stats(_)
         | ClientEvent::Ping { .. }
         | ClientEvent::RequestAddMonitor
-        | ClientEvent::RequestRemoveMonitor => {
+        | ClientEvent::RequestRemoveMonitor
+        | ClientEvent::TermOpen(_)
+        | ClientEvent::TermData { .. }
+        | ClientEvent::TermResize { .. } => {
             // Intercepted in the recv_task before reaching normalization.
             vec![]
         }

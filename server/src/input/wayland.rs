@@ -157,7 +157,10 @@ impl super::InputInjector for WaylandInputInjector {
             | ClientEvent::Stats(_)
             | ClientEvent::Ping { .. }
             | ClientEvent::RequestAddMonitor
-            | ClientEvent::RequestRemoveMonitor => {}
+            | ClientEvent::RequestRemoveMonitor
+            | ClientEvent::TermOpen(_)
+            | ClientEvent::TermData { .. }
+            | ClientEvent::TermResize { .. } => {}
         }
         Ok(())
     }

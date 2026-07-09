@@ -4,7 +4,7 @@
 //! Mirrors what gnome-remote-desktop does (no portal, no permission dialogs):
 //!   1. org.gnome.Mutter.RemoteDesktop.CreateSession() → RemoteDesktop session
 //!   2. org.gnome.Mutter.ScreenCast.CreateSession({remote-desktop-session-id})
-//!   3. ScreenCast session .RecordMonitor(connector, {cursor-mode: EMBEDDED})
+//!   3. ScreenCast session .RecordMonitor(connector, {cursor-mode}) (see cursor_mode)
 //!   4. RemoteDesktop session .Start() → Stream emits PipeWireStreamAdded(node)
 //!
 //! The server must run with DBUS_SESSION_BUS_ADDRESS pointing at the headless
@@ -38,8 +38,24 @@ const DC_DEST: &str = "org.gnome.Mutter.DisplayConfig";
 const DC_PATH: &str = "/org/gnome/Mutter/DisplayConfig";
 const DC_IFACE: &str = "org.gnome.Mutter.DisplayConfig";
 
-/// Mutter ScreenCast cursor mode: cursor composited into the frames.
+// Mutter ScreenCast cursor modes.
+const CURSOR_MODE_HIDDEN: u32 = 0;
 const CURSOR_MODE_EMBEDDED: u32 = 1;
+const CURSOR_MODE_METADATA: u32 = 2;
+
+/// Cursor mode for the recorded streams. Default HIDDEN: the OS cursor is left
+/// out of the stream so it does not lag a round-trip behind the client's own
+/// local cursor (the two-cursor artifact). The client draws its cursor and
+/// `WaylandCapturer::embeds_cursor` stays true, so the server sends no cursor
+/// of its own. DDISPLAY_CURSOR=embedded composites the OS cursor into the
+/// frames instead (for a client that draws no local cursor).
+fn cursor_mode() -> u32 {
+    match std::env::var("DDISPLAY_CURSOR").as_deref() {
+        Ok("embedded") => CURSOR_MODE_EMBEDDED,
+        Ok("metadata") => CURSOR_MODE_METADATA,
+        _ => CURSOR_MODE_HIDDEN,
+    }
+}
 
 // GetCurrentState return shape (org.gnome.Mutter.DisplayConfig).
 type MonitorSpec = (String, String, String, String);
@@ -189,16 +205,19 @@ fn build_session(conn: &Connection, connector: &str, count: usize) -> Result<Inn
     let sc_session = Proxy::new(conn, SC_DEST, sc_session_path.clone(), SC_SESSION_IFACE)?;
 
     // Record head 0 (the real primary monitor) + count-1 virtual monitors.
+    let cmode = cursor_mode();
+    tracing::info!("[wayland] cursor-mode {} ({})", cmode,
+        match cmode { 0 => "hidden", 1 => "embedded", _ => "metadata" });
     let mut stream_paths: Vec<OwnedObjectPath> = Vec::with_capacity(count);
     let mut rec: HashMap<&str, Value> = HashMap::new();
-    rec.insert("cursor-mode", Value::from(CURSOR_MODE_EMBEDDED));
+    rec.insert("cursor-mode", Value::from(cmode));
     let primary: OwnedObjectPath = sc_session
         .call("RecordMonitor", &(connector, rec))
         .with_context(|| format!("ScreenCast RecordMonitor({connector}) failed"))?;
     stream_paths.push(primary);
     for i in 1..count {
         let mut vp: HashMap<&str, Value> = HashMap::new();
-        vp.insert("cursor-mode", Value::from(CURSOR_MODE_EMBEDDED));
+        vp.insert("cursor-mode", Value::from(cmode));
         let v: OwnedObjectPath = sc_session
             .call("RecordVirtual", &(vp,))
             .with_context(|| format!("ScreenCast RecordVirtual (head {i}) failed"))?;

@@ -9,9 +9,11 @@
 //! copied into a shared double buffer that the capture loop reads through the
 //! `ScreenCapturer` trait.
 //!
-//! The cursor is composited into the frames by the compositor (EMBEDDED
-//! cursor mode), so `embeds_cursor()` is true and no separate cursor updates
-//! are sent.
+//! `embeds_cursor()` is always true here, so the server never sends a cursor
+//! of its own and the client draws its local one. With the default HIDDEN
+//! cursor mode the OS cursor is left out of the stream (no two-cursor lag);
+//! with DDISPLAY_CURSOR=embedded the compositor composites it into the frames.
+//! Either way the server adds nothing on top.
 
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -168,7 +170,8 @@ impl ScreenCapturer for WaylandCapturer {
     }
 
     fn cursor_info(&mut self) -> Result<CursorInfo> {
-        // Cursor is embedded in the frames; never broadcast separately.
+        // The server never broadcasts a cursor on this backend (embeds_cursor
+        // is true); the client uses its own local cursor.
         Ok(CursorInfo { x: 0, y: 0, visible: false })
     }
 

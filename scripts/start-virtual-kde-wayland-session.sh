@@ -82,8 +82,6 @@ if [[ "${1:-}" == "--inner" ]]; then
     export XDG_SESSION_DESKTOP="KDE"
     export DESKTOP_SESSION="plasma"
     export KDE_FULL_SESSION="true"
-    # Software rendering keeps kwin alive on GPU-less/headless boxes; drop
-    # this if you want kwin to use the real GPU.
     export QT_QPA_PLATFORM="wayland"
 
     PIDS=()
@@ -104,34 +102,71 @@ if [[ "${1:-}" == "--inner" ]]; then
     done
 
     # ── Start the compositor + Plasma shell ──────────────────────────
-    # Two known-good invocations, tried in order:
-    #   (a) startplasma-wayland with KWIN args via KWIN_WAYLAND_VIRTUAL —
-    #       on recent Plasma, startplasma-wayland spawns kwin_wayland itself
-    #       and forwards $KDEWM-style options poorly, so instead:
-    #   (b) kwin_wayland --virtual ... --exit-with-session startplasma-waylandsession
-    #       (kwin spawns the plasma session as its child; this is what
-    #       plasma's own kwin_wayland_wrapper does on some distros).
-    # If only kwin (no full plasma shell) is needed for portal screencast,
-    # plain kwin_wayland --virtual is enough — xdg-desktop-portal-kde talks
-    # to kwin's own org.kde.KWin.ScreenShot2/RemoteDesktop interfaces.
+    # Backend selection (DDISPLAY_KWIN_BACKEND=auto|drm|virtual):
+    #   drm     — real GPU output via the DRM/KMS backend. Needs a logind SEAT
+    #             (XDG_SEAT set) so kwin can take the card, and needs at least
+    #             one connected connector. This is the ONLY backend whose
+    #             PipeWire screencast reliably exports frames on NVIDIA — the
+    #             virtual backend renders on the GPU but its screencast copy
+    #             fails ("Failed to fetch DRM device"), so it streams 0 frames.
+    #   virtual — headless virtual framebuffer. No seat/GPU output needed; good
+    #             for a shell without a seat, but see the screencast caveat above.
+    #   auto    — drm when we are on a seat (XDG_SEAT set), else virtual.
+    # Run this script inside a seat session (e.g. via systemd-run with
+    # PAMName=login + TTYPath) to get the drm backend headlessly.
+    KWIN_BACKEND="${DDISPLAY_KWIN_BACKEND:-auto}"
+    if [[ "$KWIN_BACKEND" == "auto" ]]; then
+        if [[ -n "${XDG_SEAT:-}" ]]; then KWIN_BACKEND="drm"; else KWIN_BACKEND="virtual"; fi
+    fi
     COMP_PID=""
     if command -v kwin_wayland >/dev/null 2>&1; then
-        echo "Starting kwin_wayland --virtual (${SCREEN_W}x${SCREEN_H})..." >&2
-        KWIN_ARGS=(
-            --virtual
-            --width "$SCREEN_W" --height "$SCREEN_H"
-            --no-lockscreen
-            --xwayland
-        )
-        if command -v startplasma-waylandsession >/dev/null 2>&1; then
-            # (b) kwin owns the session and starts the plasma shell.
+        KWIN_ARGS=(--no-lockscreen)
+        if [[ "$KWIN_BACKEND" == "drm" ]]; then
+            echo "Starting kwin_wayland (DRM backend, seat=${XDG_SEAT:-?})..." >&2
+            # DRM uses the connector's own mode; --width/--height don't apply.
+        else
+            echo "Starting kwin_wayland --virtual (${SCREEN_W}x${SCREEN_H})..." >&2
+            KWIN_ARGS+=(--virtual --width "$SCREEN_W" --height "$SCREEN_H")
+        fi
+        # Xwayland is opt-in: on the virtual backend it can segfault ("Failed to
+        # fetch DRM device"). ddisplay captures through the portal/PipeWire, so
+        # X11-app support is not needed for the stream. DDISPLAY_KWIN_XWAYLAND=1
+        # re-adds it (fine on the drm backend).
+        [[ "${DDISPLAY_KWIN_XWAYLAND:-0}" == "1" ]] && KWIN_ARGS+=(--xwayland)
+
+        # Session launcher run *inside* our single virtual compositor.
+        #   shell (default): our lean launcher — plasmashell + KDE daemons and
+        #                    NO second kwin. plasma_session/ksmserver would
+        #                    spawn their own kwin_wayland, giving a nested
+        #                    duplicate compositor at the default 1024x768 that
+        #                    the portal then captures instead of our virtual
+        #                    output.
+        #   full:            plasma_session (spawns its own kwin) — kept as a
+        #                    fallback for debugging a full session startup.
+        SESSION_LAUNCH=""
+        SHELL_LAUNCHER="$(dirname "$(readlink -f "$0")")/ddisplay-plasma-wayland-session.sh"
+        case "${DDISPLAY_KDE_SESSION_MODE:-shell}" in
+            full)
+                if command -v plasma_session >/dev/null 2>&1; then
+                    SESSION_LAUNCH="$(command -v plasma_session)"
+                elif command -v startplasma-waylandsession >/dev/null 2>&1; then
+                    SESSION_LAUNCH="$(command -v startplasma-waylandsession)"
+                fi
+                ;;
+            *)
+                [[ -x "$SHELL_LAUNCHER" ]] && SESSION_LAUNCH="$SHELL_LAUNCHER"
+                ;;
+        esac
+        if [[ -n "$SESSION_LAUNCH" ]]; then
+            echo "  session: kwin --exit-with-session $SESSION_LAUNCH" >&2
             kwin_wayland "${KWIN_ARGS[@]}" \
-                --exit-with-session startplasma-waylandsession \
+                --exit-with-session "$SESSION_LAUNCH" \
                 >"$LOG_FILE" 2>&1 &
             COMP_PID=$!
         else
             # Plain kwin; portals can still screencast/inject without the
             # full plasma shell (no panel/desktop, just a black root).
+            echo "  (no plasma session launcher found — bare compositor)" >&2
             kwin_wayland "${KWIN_ARGS[@]}" >"$LOG_FILE" 2>&1 &
             COMP_PID=$!
         fi
@@ -170,6 +205,25 @@ if [[ "${1:-}" == "--inner" ]]; then
     export WAYLAND_DISPLAY="$WL_DISPLAY"
     export DDISPLAY_WAYLAND=1
 
+    # ── Wait for kwin's screencast interface before the portal starts ─
+    # xdg-desktop-portal-kde binds the kwin Wayland global
+    # `zkde_screencast_unstable_v1` ONCE at startup. If it launches before
+    # kwin has advertised it (the wayland socket appears well before kwin has
+    # finished initializing — more so on the drm backend), the portal logs
+    # "zkde_screencast_unstable_v1 does not seem to be available" and every
+    # RemoteDesktop CreateSession then fails with response code 2. kwin's
+    # org.kde.KWin.ScreenShot2 D-Bus name lands together with that global, so
+    # gate the portal on it (plus a short settle).
+    for _ in $(seq 1 60); do
+        if dbus-send --session --print-reply --dest=org.freedesktop.DBus \
+            /org/freedesktop/DBus org.freedesktop.DBus.GetNameOwner \
+            string:org.kde.KWin.ScreenShot2 >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.5
+    done
+    sleep 2
+
     # ── Pre-seed KDE portal pre-authorization (Plasma >= 6.3) ─────────
     # Writes the kde-authorized/remote-desktop record for the empty app id
     # so the headless Start() does not block on an unclickable dialog.
@@ -196,20 +250,40 @@ if [[ "${1:-}" == "--inner" ]]; then
     # when the frontend starts resolving portals.
     PORTAL_KDE=""
     for p in /usr/libexec/xdg-desktop-portal-kde \
-             /usr/lib/x86_64-linux-gnu/libexec/xdg-desktop-portal-kde \
+             /usr/lib/*/libexec/xdg-desktop-portal-kde \
              /usr/lib/xdg-desktop-portal-kde; do
         [[ -x "$p" ]] && PORTAL_KDE="$p" && break
     done
     if [[ -n "$PORTAL_KDE" ]]; then
-        "$PORTAL_KDE" >"$STATE_DIR/xdg-desktop-portal-kde.log" 2>&1 &
-        PIDS+=("$!")
-        sleep 1
+        # Start portal-kde with a retry: it binds kwin's screencast global
+        # `zkde_screencast_unstable_v1` ONCE at launch and never retries. If
+        # kwin hasn't advertised it yet the portal logs "... does not seem to
+        # be available" and every RemoteDesktop CreateSession fails (code 2).
+        # kwin can take a while (esp. on the drm backend), so if we see that
+        # message we kill this portal-kde and start a fresh one, up to a few
+        # times with an increasing settle.
+        PKDE_LOG="$STATE_DIR/xdg-desktop-portal-kde.log"
+        for attempt in 1 2 3 4 5; do
+            : > "$PKDE_LOG"
+            "$PORTAL_KDE" >"$PKDE_LOG" 2>&1 &
+            PKDE_PID=$!
+            PIDS+=("$PKDE_PID")
+            sleep $((attempt + 2))
+            if ! grep -q "zkde_screencast_unstable_v1 does not seem to be available" "$PKDE_LOG"; then
+                echo "xdg-desktop-portal-kde bound the screencast global (attempt $attempt)." >&2
+                break
+            fi
+            echo "portal-kde missed zkde_screencast (attempt $attempt) — restarting after kwin settles." >&2
+            kill "$PKDE_PID" 2>/dev/null || true
+            PKDE_PID=""
+        done
     else
         echo "WARN: xdg-desktop-portal-kde binary not found — relying on D-Bus activation." >&2
     fi
     PORTAL_FRONT=""
     for p in /usr/libexec/xdg-desktop-portal \
-             /usr/lib/x86_64-linux-gnu/xdg-desktop-portal \
+             /usr/lib/*/libexec/xdg-desktop-portal \
+             /usr/lib/*/xdg-desktop-portal \
              /usr/lib/xdg-desktop-portal; do
         [[ -x "$p" ]] && PORTAL_FRONT="$p" && break
     done

@@ -453,20 +453,38 @@ fn spawn_input_handler(
     });
 
     tokio::task::spawn_blocking(move || {
-        for event in sync_rx {
-            match &event {
-                ClientEvent::RequestKeyframe { head } => {
+        // Coalesce pointer motion. Each MouseMove is a D-Bus round-trip to the
+        // compositor, so under a fast drag they can arrive faster than they
+        // inject and back up, making the window trail the cursor and only catch
+        // up once you stop. Draining the backlog each pass and dropping every
+        // MouseMove that is immediately followed by another keeps only the
+        // latest position per run, so the pointer tracks the real one. Buttons,
+        // scroll and keys are never dropped and stay in order.
+        loop {
+            let Ok(first) = sync_rx.recv() else { break };
+            let mut batch = vec![first];
+            while let Ok(ev) = sync_rx.try_recv() {
+                batch.push(ev);
+            }
+            for i in 0..batch.len() {
+                if matches!(batch[i], ClientEvent::MouseMove { .. })
+                    && batch
+                        .get(i + 1)
+                        .is_some_and(|n| matches!(n, ClientEvent::MouseMove { .. }))
+                {
+                    continue; // superseded by a newer move in this batch
+                }
+                if let ClientEvent::RequestKeyframe { head } = &batch[i] {
                     tracing::debug!("[keyframe] client requested keyframe (head {:?})", head);
                     control.request_keyframe(*head);
                     control.notify_activity();
                     continue;
                 }
-                _ => {}
+                if let Err(e) = injector.inject_event(&batch[i]) {
+                    tracing::error!("Failed to inject input event: {}", e);
+                }
+                control.notify_activity();
             }
-            if let Err(e) = injector.inject_event(&event) {
-                tracing::error!("Failed to inject input event: {}", e);
-            }
-            control.notify_activity();
         }
         tracing::info!("Input handler shutting down");
     });

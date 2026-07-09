@@ -272,7 +272,9 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Screen capturer + input injector
+    // Screen capturer + input injector. On the Wayland backend the session is
+    // kept so the capture loop can add/remove heads (Mutter virtual monitors).
+    let mut wl_session: Option<Arc<dyn wayland_session::RemoteSessionApi>> = None;
     let (capturer, mut injector): (Box<dyn ScreenCapturer>, Box<dyn InputInjector>) =
         match backend {
             BackendKind::X11 => (
@@ -297,6 +299,7 @@ async fn main() -> anyhow::Result<()> {
                         );
                         Arc::new(portal_session::PortalRemoteSession::new()?)
                     };
+                wl_session = Some(Arc::clone(&session));
                 (
                     Box::new(capture::wayland::WaylandCapturer::new(Arc::clone(&session))?),
                     Box::new(input::wayland::WaylandInputInjector::new(session)),
@@ -414,6 +417,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || {
         if let Err(e) = capture_encode_loop(
             capturer,
+            wl_session,
             backend,
             enc,
             codec_name,
@@ -502,8 +506,63 @@ fn build_heads(
     Ok((heads, actual_codec))
 }
 
+/// Recreate the per-head Wayland capturers after a Mutter session rebuild:
+/// head 0 uses the first PipeWire node, the rest become extra capturers.
+fn rebuild_wayland_capturers(
+    session: &Arc<dyn wayland_session::RemoteSessionApi>,
+    node_ids: &[u32],
+) -> anyhow::Result<(Box<dyn ScreenCapturer>, Vec<Box<dyn ScreenCapturer>>)> {
+    anyhow::ensure!(!node_ids.is_empty(), "session rebuild returned no heads");
+    let head0: Box<dyn ScreenCapturer> =
+        Box::new(capture::wayland::WaylandCapturer::for_node(Arc::clone(session), node_ids[0])?);
+    let mut extras: Vec<Box<dyn ScreenCapturer>> = Vec::new();
+    for &node in &node_ids[1..] {
+        extras.push(Box::new(capture::wayland::WaylandCapturer::for_node(
+            Arc::clone(session),
+            node,
+        )?));
+    }
+    Ok((head0, extras))
+}
+
+/// Client-space layout for Wayland heads: a horizontal row, each head at its
+/// own captured size (Mutter picks each virtual monitor's resolution).
+fn wayland_layout(head0: &dyn ScreenCapturer, extras: &[Box<dyn ScreenCapturer>]) -> Vec<MonitorRect> {
+    let mut rects = Vec::with_capacity(1 + extras.len());
+    let mut x = 0u32;
+    for (i, (w, h)) in std::iter::once((head0.width(), head0.height()))
+        .chain(extras.iter().map(|c| (c.width(), c.height())))
+        .enumerate()
+    {
+        rects.push(MonitorRect { id: i as u32, x, y: 0, width: w, height: h });
+        x += w;
+    }
+    rects
+}
+
+/// Per-head ENCODE rects (what each `HeadStream` slices out). X11 heads are
+/// sub-rects of one shared framebuffer (`control.monitors`); each Wayland head
+/// captures its own stream and encodes the whole frame at (0,0,w,h).
+fn head_encode_rects(
+    backend: BackendKind,
+    head0: &dyn ScreenCapturer,
+    extras: &[Box<dyn ScreenCapturer>],
+    control: &StreamControl,
+) -> Vec<MonitorRect> {
+    if backend == BackendKind::Wayland {
+        std::iter::once((head0.width(), head0.height()))
+            .chain(extras.iter().map(|c| (c.width(), c.height())))
+            .enumerate()
+            .map(|(i, (w, h))| MonitorRect { id: i as u32, x: 0, y: 0, width: w, height: h })
+            .collect()
+    } else {
+        control.monitors.lock().clone()
+    }
+}
+
 fn capture_encode_loop(
     mut capturer: Box<dyn ScreenCapturer>,
+    wl_session: Option<Arc<dyn wayland_session::RemoteSessionApi>>,
     backend: BackendKind,
     encoder: Box<dyn Encoder + Send>,
     mut codec: String,
@@ -513,6 +572,10 @@ fn capture_encode_loop(
     fps: u32,
     control: Arc<StreamControl>,
 ) -> anyhow::Result<()> {
+    // Wayland extra heads (heads 1+) each capture their own Mutter virtual
+    // monitor stream; head 0 stays on `capturer`. Empty on X11 and single-head
+    // Wayland, where all heads share `capturer` (sub-rects of one framebuffer).
+    let mut extra_capturers: Vec<Box<dyn ScreenCapturer>> = Vec::new();
     let active_interval = Duration::from_secs_f64(1.0 / fps as f64);
     let idle_interval = Duration::from_secs_f64(1.0 / 10.0); // 10 fps when idle
     // After this much silence we drop to idle FPS.
@@ -601,13 +664,35 @@ fn capture_encode_loop(
             // below (which rebuilds the capturer + encoder). The new layout is
             // broadcast so every client opens/closes its extra windows.
             if let Some(desired) = control.monitor_request.lock().take() {
-                let cur = control.monitors.lock().clone();
-                if backend == BackendKind::Wayland {
-                    tracing::info!(
-                        "[monitor] {} head(s) requested — ignored (wayland backend)",
-                        desired,
-                    );
-                } else if desired != cur.len() {
+                let cur_len = control.monitors.lock().len();
+                let desired = desired.clamp(1, monitor::MAX_MONITORS);
+                if let Some(sess) = wl_session.as_ref() {
+                    // Wayland: each head is a Mutter virtual monitor. Mutter only
+                    // accepts Record* before Start(), so add/remove rebuilds the
+                    // session with `desired` streams and reconnects the capturers.
+                    if desired != cur_len {
+                        tracing::info!("[monitor] wayland heads {} -> {}", cur_len, desired);
+                        match sess
+                            .set_head_count(desired)
+                            .and_then(|node_ids| rebuild_wayland_capturers(sess, &node_ids))
+                        {
+                            Ok((cap0, extras)) => {
+                                capturer = cap0;
+                                extra_capturers = extras;
+                                let rects = wayland_layout(capturer.as_ref(), &extra_capturers);
+                                sess.set_head_layout(
+                                    rects.iter().map(|r| (r.x, r.y, r.width, r.height)).collect(),
+                                );
+                                *control.monitors.lock() = rects;
+                                let _ = frame_tx.send(protocol::encode_monitor_layout(
+                                    &control.monitor_layout(),
+                                ));
+                            }
+                            Err(e) => tracing::error!("[monitor] wayland head change failed: {:#}", e),
+                        }
+                    }
+                } else if desired != cur_len {
+                    let cur = control.monitors.lock().clone();
                     // Every head keeps the primary head's current size, so the
                     // layout doesn't drift across repeated add/remove cycles.
                     let base_w = cur[0].width.max(2) & !1;
@@ -648,17 +733,20 @@ fn capture_encode_loop(
                         // Reconcile the broadcast layout to the ACTUAL captured
                         // size (the driver may snap to a nearby mode). The client
                         // crops and maps input against these rects, so they must
-                        // tile the real framebuffer exactly. Covers both
-                        // resize-to-client (single head) and a head add/remove.
-                        let count = control.monitors.lock().len().max(1);
-                        let rects = monitor::layout_rects(count, screen_w, screen_h);
-                        let mut mons = control.monitors.lock();
-                        if *mons != rects {
-                            *mons = rects;
-                            drop(mons);
-                            let _ = frame_tx.send(protocol::encode_monitor_layout(
-                                &control.monitor_layout(),
-                            ));
+                        // tile the real framebuffer exactly. X11 only: Wayland
+                        // heads are independent streams whose layout is owned by
+                        // wayland_layout() (a shared-framebuffer grid is wrong).
+                        if backend != BackendKind::Wayland {
+                            let count = control.monitors.lock().len().max(1);
+                            let rects = monitor::layout_rects(count, screen_w, screen_h);
+                            let mut mons = control.monitors.lock();
+                            if *mons != rects {
+                                *mons = rects;
+                                drop(mons);
+                                let _ = frame_tx.send(protocol::encode_monitor_layout(
+                                    &control.monitor_layout(),
+                                ));
+                            }
                         }
                     }
                     Err(e) => tracing::error!("Failed to rebuild capturer after resize: {}", e),
@@ -667,8 +755,9 @@ fn capture_encode_loop(
         }
 
         // Monitor layout changed (head added/removed or a head resized) →
-        // rebuild every head's encoder.
-        let desired_rects = control.monitors.lock().clone();
+        // rebuild every head's encoder. Uses ENCODE rects (Wayland heads each
+        // encode their own whole frame; X11 heads slice the shared framebuffer).
+        let desired_rects = head_encode_rects(backend, capturer.as_ref(), &extra_capturers, &control);
         if desired_rects != head_rects {
             rebuild = true;
         }
@@ -758,8 +847,13 @@ fn capture_encode_loop(
         let force_kf = kf_mask == u64::MAX;
         let has_damage = capturer.has_new_frame();
 
+        // Wayland extra heads capture independently; poll each once per loop so
+        // activity on any head keeps the stream awake and gates its own encode.
+        let extra_new: Vec<bool> = extra_capturers.iter_mut().map(|c| c.has_new_frame()).collect();
+        let any_extra_new = extra_new.iter().any(|&b| b);
+
         // Damage counts as activity too (animations, video playback, etc.)
-        if has_damage {
+        if has_damage || any_extra_new {
             last_activity = Instant::now();
         }
 
@@ -778,7 +872,7 @@ fn capture_encode_loop(
 
         // Skip capture+encode if nothing changed (saves CPU, GPU, and bandwidth).
         // Always capture on the frame after input (app may have just responded).
-        if kf_mask == 0 && !has_damage && !input_arrived {
+        if kf_mask == 0 && !has_damage && !any_extra_new && !input_arrived {
             frame_count += 1;
             fps_frame_count += 1;
             continue;
@@ -800,52 +894,78 @@ fn capture_encode_loop(
             capture::DamageHint::Bbox { x: 0, y: 0, width: 0, height: 0 }
         };
 
-        // Zero-copy capture: borrow SHM buffer directly.
-        // Capture can fail transiently around display resizes (the SHM
-        // segment no longer matches the root geometry) — force a recheck and
-        // keep the loop alive instead of killing the stream.
-        let frame = match capturer.frame_ref() {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!("Capture failed ({}); rechecking display geometry", e);
-                last_recheck = Instant::now() - Duration::from_secs(1);
-                std::thread::sleep(Duration::from_millis(50));
-                continue;
-            }
-        };
+        // Helper: encode one head's packet and send it as VideoFrame (head 0)
+        // or a tagged MonitorFrame (heads 1+).
+        let send_head =
+            |head: &mut HeadStream, data: &[u8], w: u32, h: u32, stride: u32, head_kf: bool| {
+                match head.encode(data, w, h, stride, head_kf) {
+                    Ok(packet) => {
+                        let (rw, rh) = (head.rect.width as u16, head.rect.height as u16);
+                        let wire = if head.rect.id == 0 {
+                            protocol::encode_video_frame(packet.keyframe, packet.pts, rw, rh, &packet.data)
+                        } else {
+                            protocol::encode_monitor_frame(
+                                head.rect.id as u8, packet.keyframe, packet.pts, rw, rh, &packet.data,
+                            )
+                        };
+                        let _ = frame_tx.send(wire);
+                        true
+                    }
+                    Err(e) => {
+                        tracing::warn!("Encode failed on head {} ({}); skipping", head.rect.id, e);
+                        false
+                    }
+                }
+            };
 
-        // Encode each head from the shared capture (the primary head is
-        // zero-copy when it covers the whole frame). Head 0 goes out as a
-        // VideoFrame (web-compatible); extra heads as tagged MonitorFrames.
-        for head in heads.iter_mut() {
-            let r = &head.rect;
-            let head_kf = force_kf || (kf_mask >> r.id.min(63)) & 1 != 0;
-            if !head_kf && !damage_hint.intersects(r.x, r.y, r.width, r.height) {
-                continue;
-            }
-            let packet = match head.encode(
-                frame.data,
-                frame.width,
-                frame.height,
-                frame.stride,
-                head_kf,
-            ) {
-                Ok(p) => p,
+        if extra_capturers.is_empty() {
+            // Shared-framebuffer path (X11 any head count; Wayland single head).
+            // Zero-copy: borrow the SHM/PipeWire buffer directly. Capture can
+            // fail transiently around resizes — recheck and keep the loop alive.
+            let frame = match capturer.frame_ref() {
+                Ok(f) => f,
                 Err(e) => {
-                    tracing::warn!("Encode failed on head {} ({}); skipping", head.rect.id, e);
-                    control.request_keyframe(Some(head.rect.id as u8));
+                    tracing::warn!("Capture failed ({}); rechecking display geometry", e);
+                    last_recheck = Instant::now() - Duration::from_secs(1);
+                    std::thread::sleep(Duration::from_millis(50));
                     continue;
                 }
             };
-            let (w, h) = (head.rect.width as u16, head.rect.height as u16);
-            let wire = if head.rect.id == 0 {
-                protocol::encode_video_frame(packet.keyframe, packet.pts, w, h, &packet.data)
-            } else {
-                protocol::encode_monitor_frame(
-                    head.rect.id as u8, packet.keyframe, packet.pts, w, h, &packet.data,
-                )
-            };
-            let _ = frame_tx.send(wire);
+            for head in heads.iter_mut() {
+                let (id, rx, ry, rw, rh) = {
+                    let r = &head.rect;
+                    (r.id, r.x, r.y, r.width, r.height)
+                };
+                let head_kf = force_kf || (kf_mask >> id.min(63)) & 1 != 0;
+                if !head_kf && !damage_hint.intersects(rx, ry, rw, rh) {
+                    continue;
+                }
+                if !send_head(head, frame.data, frame.width, frame.height, frame.stride, head_kf) {
+                    control.request_keyframe(Some(id as u8));
+                }
+            }
+        } else {
+            // Wayland multi-head: each head captures its own Mutter virtual
+            // monitor stream and encodes the whole frame.
+            for (i, head) in heads.iter_mut().enumerate() {
+                let head_kf = force_kf || (kf_mask >> (i as u32).min(63)) & 1 != 0;
+                let head_new = if i == 0 { has_damage } else { extra_new.get(i - 1).copied().unwrap_or(false) };
+                if !head_kf && !head_new {
+                    continue;
+                }
+                let cap: &mut Box<dyn ScreenCapturer> =
+                    if i == 0 { &mut capturer } else { &mut extra_capturers[i - 1] };
+                let frame = match cap.frame_ref() {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!("Capture failed on head {} ({}); skipping", i, e);
+                        continue;
+                    }
+                };
+                if !send_head(head, frame.data, frame.width, frame.height, frame.stride, head_kf) {
+                    control.request_keyframe(Some(i as u8));
+                }
+            }
         }
 
         frame_count += 1;

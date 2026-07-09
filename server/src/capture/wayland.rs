@@ -65,10 +65,16 @@ pub struct WaylandCapturer {
 
 impl WaylandCapturer {
     pub fn new(session: Arc<dyn RemoteSessionApi>) -> Result<Self> {
+        let node_id = session.node_id();
+        Self::for_node(session, node_id)
+    }
+
+    /// Capture a specific PipeWire node (one head). Head 0 uses the session's
+    /// primary node (`new`); extra heads pass their own node id here.
+    pub fn for_node(session: Arc<dyn RemoteSessionApi>, node_id: u32) -> Result<Self> {
         let shared = Arc::new(Shared::default());
         let (quit_tx, quit_rx) = pw::channel::channel::<()>();
 
-        let node_id = session.node_id();
         // Portal sessions hand us a dedicated PipeWire remote fd; Mutter
         // sessions use the default per-user socket (None).
         let remote_fd = session.take_pipewire_fd();

@@ -75,6 +75,22 @@ pub trait RemoteSessionApi: Send + Sync {
     /// Discrete scroll. axis: 0 = vertical, 1 = horizontal.
     /// Positive vertical steps scroll down (libinput convention).
     fn notify_pointer_axis_discrete(&self, axis: u32, steps: i32) -> Result<()>;
+
+    // ── Multi-head (Wayland/Mutter virtual monitors) ─────────────────────
+    // Defaults make single-head backends (XDG portal) a no-op.
+
+    /// Rebuild the session to drive `count` heads (head 0 + count-1 virtual
+    /// monitors), returning the new per-head PipeWire node ids. Backends that
+    /// can't add virtual monitors return an error (the caller keeps the
+    /// current layout). `count >= 1`.
+    fn set_head_count(&self, count: usize) -> Result<Vec<u32>> {
+        anyhow::bail!("multi-head not supported on this backend (requested {count})")
+    }
+
+    /// Tell the session the client-space rectangle of each head so pointer
+    /// motion in absolute (whole-layout) coordinates can be routed to the head
+    /// it lands on. Single-head backends ignore this.
+    fn set_head_layout(&self, _rects: Vec<(u32, u32, u32, u32)>) {}
 }
 
 /// Probe whether the Mutter ScreenCast/RemoteDesktop D-Bus services are
@@ -95,22 +111,36 @@ pub fn mutter_available() -> bool {
     has(SC_DEST) && has(RD_DEST)
 }
 
-/// A live Mutter RemoteDesktop + ScreenCast session.
-///
-/// Shared (via `Arc`) between the Wayland capturer (which consumes the
-/// PipeWire stream) and the Wayland input injector (which calls the
-/// RemoteDesktop Notify* methods).
-pub struct MutterRemoteSession {
+/// One head's ScreenCast stream. Head 0 is a RecordMonitor of the primary
+/// virtual monitor; heads 1+ are RecordVirtual monitors.
+struct Head {
+    stream_path: OwnedObjectPath,
+    node_id: u32,
+}
+
+/// Mutable session state, replaced wholesale when the head count changes
+/// (Mutter only accepts Record* before Start(), so add/remove rebuilds the
+/// RemoteDesktop + ScreenCast sessions).
+struct Inner {
     rd_session: Proxy<'static>,
     #[allow(dead_code)]
     sc_session: Proxy<'static>,
-    /// ScreenCast stream object path (needed by NotifyPointerMotionAbsolute).
-    stream_path: OwnedObjectPath,
-    /// PipeWire node id of the screen-cast stream.
-    pub node_id: u32,
-    /// Size of the recorded monitor at session start (from DisplayConfig).
-    #[allow(dead_code)]
-    pub initial_size: Option<(u32, u32)>,
+    heads: Vec<Head>,
+    /// Client-space rect (x,y,w,h) of each head, for pointer routing.
+    layout: Vec<(u32, u32, u32, u32)>,
+}
+
+/// A live Mutter RemoteDesktop + ScreenCast session, possibly driving several
+/// heads (the primary monitor plus RecordVirtual virtual monitors).
+///
+/// Shared (via `Arc`) between the Wayland capturer(s) and the input injector.
+/// The head set is behind a `Mutex` so [`set_head_count`](Self::set_head_count)
+/// can rebuild it while the shared `Arc` stays valid for both consumers.
+pub struct MutterRemoteSession {
+    conn: Connection,
+    /// Connector of the primary (real) virtual monitor, e.g. "Meta-0".
+    primary_connector: String,
+    inner: parking_lot::Mutex<Inner>,
 }
 
 impl MutterRemoteSession {
@@ -119,56 +149,66 @@ impl MutterRemoteSession {
             "connect to session D-Bus failed — run inside the headless GNOME session \
              (DBUS_SESSION_BUS_ADDRESS from wayland-session.env)",
         )?;
-
-        // 1. RemoteDesktop session
-        let rd = Proxy::new(&conn, RD_DEST, RD_PATH, RD_IFACE)
-            .context("create org.gnome.Mutter.RemoteDesktop proxy")?;
-        let rd_session_path: OwnedObjectPath = rd
-            .call("CreateSession", &())
-            .context("RemoteDesktop.CreateSession failed (is gnome-shell running on this bus?)")?;
-        let rd_session = Proxy::new(
-            &conn,
-            RD_DEST,
-            rd_session_path.clone(),
-            RD_SESSION_IFACE,
-        )?;
-        let session_id: String = rd_session
-            .get_property("SessionId")
-            .context("read RemoteDesktop session SessionId")?;
-        tracing::info!("[wayland] RemoteDesktop session {} ({})", session_id, rd_session_path);
-
-        // 2. ScreenCast session linked to the RemoteDesktop session
-        let sc = Proxy::new(&conn, SC_DEST, SC_PATH, SC_IFACE)?;
-        let mut props: HashMap<&str, Value> = HashMap::new();
-        props.insert("remote-desktop-session-id", Value::from(session_id.as_str()));
-        props.insert("disable-animations", Value::from(true));
-        let sc_session_path: OwnedObjectPath = sc
-            .call("CreateSession", &(props,))
-            .context("ScreenCast.CreateSession failed")?;
-        let sc_session = Proxy::new(
-            &conn,
-            SC_DEST,
-            sc_session_path.clone(),
-            SC_SESSION_IFACE,
-        )?;
-
-        // 3. Record the (virtual) monitor — find its connector name.
         let (connector, initial_size) = current_monitor(&conn)
             .context("DisplayConfig.GetCurrentState: no monitor found")?;
-        tracing::info!(
-            "[wayland] recording monitor '{}' ({:?})",
-            connector,
-            initial_size
-        );
-        let mut rec_props: HashMap<&str, Value> = HashMap::new();
-        rec_props.insert("cursor-mode", Value::from(CURSOR_MODE_EMBEDDED));
-        let stream_path: OwnedObjectPath = sc_session
-            .call("RecordMonitor", &(connector.as_str(), rec_props))
-            .with_context(|| format!("ScreenCast RecordMonitor({}) failed", connector))?;
-        let stream = Proxy::new(&conn, SC_DEST, stream_path.clone(), SC_STREAM_IFACE)?;
+        tracing::info!("[wayland] primary monitor '{}' ({:?})", connector, initial_size);
+        let inner = build_session(&conn, &connector, 1)?;
+        Ok(Self {
+            conn,
+            primary_connector: connector,
+            inner: parking_lot::Mutex::new(inner),
+        })
+    }
+}
 
-        // 4. Subscribe for PipeWireStreamAdded BEFORE Start() so the signal
-        //    can't be missed, then start the (linked) sessions.
+/// Build a fresh RemoteDesktop + ScreenCast session driving `count` heads
+/// (head 0 = RecordMonitor(primary), heads 1.. = RecordVirtual). All streams
+/// are recorded and their PipeWireStreamAdded subscribed BEFORE Start(),
+/// because Mutter rejects Record* after Start and would otherwise race the
+/// node-id signal.
+fn build_session(conn: &Connection, connector: &str, count: usize) -> Result<Inner> {
+    let count = count.max(1);
+
+    let rd = Proxy::new(conn, RD_DEST, RD_PATH, RD_IFACE)
+        .context("create org.gnome.Mutter.RemoteDesktop proxy")?;
+    let rd_session_path: OwnedObjectPath = rd
+        .call("CreateSession", &())
+        .context("RemoteDesktop.CreateSession failed (is gnome-shell running on this bus?)")?;
+    let rd_session = Proxy::new(conn, RD_DEST, rd_session_path.clone(), RD_SESSION_IFACE)?;
+    let session_id: String = rd_session
+        .get_property("SessionId")
+        .context("read RemoteDesktop session SessionId")?;
+
+    let sc = Proxy::new(conn, SC_DEST, SC_PATH, SC_IFACE)?;
+    let mut props: HashMap<&str, Value> = HashMap::new();
+    props.insert("remote-desktop-session-id", Value::from(session_id.as_str()));
+    props.insert("disable-animations", Value::from(true));
+    let sc_session_path: OwnedObjectPath = sc
+        .call("CreateSession", &(props,))
+        .context("ScreenCast.CreateSession failed")?;
+    let sc_session = Proxy::new(conn, SC_DEST, sc_session_path.clone(), SC_SESSION_IFACE)?;
+
+    // Record head 0 (the real primary monitor) + count-1 virtual monitors.
+    let mut stream_paths: Vec<OwnedObjectPath> = Vec::with_capacity(count);
+    let mut rec: HashMap<&str, Value> = HashMap::new();
+    rec.insert("cursor-mode", Value::from(CURSOR_MODE_EMBEDDED));
+    let primary: OwnedObjectPath = sc_session
+        .call("RecordMonitor", &(connector, rec))
+        .with_context(|| format!("ScreenCast RecordMonitor({connector}) failed"))?;
+    stream_paths.push(primary);
+    for i in 1..count {
+        let mut vp: HashMap<&str, Value> = HashMap::new();
+        vp.insert("cursor-mode", Value::from(CURSOR_MODE_EMBEDDED));
+        let v: OwnedObjectPath = sc_session
+            .call("RecordVirtual", &(vp,))
+            .with_context(|| format!("ScreenCast RecordVirtual (head {i}) failed"))?;
+        stream_paths.push(v);
+    }
+
+    // Subscribe PipeWireStreamAdded for every stream BEFORE Start().
+    let mut receivers = Vec::with_capacity(count);
+    for path in &stream_paths {
+        let stream = Proxy::new(conn, SC_DEST, path.clone(), SC_STREAM_IFACE)?;
         let added = stream
             .receive_signal("PipeWireStreamAdded")
             .context("subscribe PipeWireStreamAdded")?;
@@ -178,35 +218,34 @@ impl MutterRemoteSession {
             .spawn(move || {
                 let mut added = added;
                 if let Some(msg) = added.next() {
-                    let _ = tx.send(msg);
+                    let node: u32 = msg.body().deserialize().unwrap_or(0);
+                    let _ = tx.send(node);
                 }
             })
             .context("spawn signal-wait thread")?;
-
-        let _: () = rd_session
-            .call("Start", &())
-            .context("RemoteDesktop session Start failed")?;
-
-        let msg = rx
-            .recv_timeout(Duration::from_secs(15))
-            .context("timed out waiting for PipeWireStreamAdded after Start()")?;
-        let node_id: u32 = msg
-            .body()
-            .deserialize()
-            .context("decode PipeWireStreamAdded body")?;
-        tracing::info!("[wayland] PipeWire stream node id {}", node_id);
-
-        Ok(Self {
-            rd_session,
-            sc_session,
-            stream_path,
-            node_id,
-            initial_size,
-        })
+        receivers.push(rx);
     }
 
+    let _: () = rd_session
+        .call("Start", &())
+        .context("RemoteDesktop session Start failed")?;
+
+    let mut heads = Vec::with_capacity(count);
+    for (i, (path, rx)) in stream_paths.into_iter().zip(receivers).enumerate() {
+        let node_id = rx
+            .recv_timeout(Duration::from_secs(15))
+            .with_context(|| format!("timed out waiting for PipeWireStreamAdded (head {i})"))?;
+        tracing::info!("[wayland] head {} stream node {} ({})", i, node_id, path);
+        heads.push(Head { stream_path: path, node_id });
+    }
+
+    Ok(Inner { rd_session, sc_session, heads, layout: Vec::new() })
+}
+
+impl MutterRemoteSession {
     fn stop(&self) {
-        if let Err(e) = self.rd_session.call::<_, _, ()>("Stop", &()) {
+        let inner = self.inner.lock();
+        if let Err(e) = inner.rd_session.call::<_, _, ()>("Stop", &()) {
             tracing::debug!("[wayland] session Stop failed (already gone?): {}", e);
         } else {
             tracing::info!("[wayland] Mutter remote session stopped");
@@ -223,11 +262,33 @@ impl Drop for MutterRemoteSession {
 // Input injection goes through the RemoteDesktop session's Notify* methods.
 impl RemoteSessionApi for MutterRemoteSession {
     fn node_id(&self) -> u32 {
-        self.node_id
+        self.inner.lock().heads[0].node_id
+    }
+
+    fn set_head_layout(&self, rects: Vec<(u32, u32, u32, u32)>) {
+        self.inner.lock().layout = rects;
+    }
+
+    fn set_head_count(&self, count: usize) -> Result<Vec<u32>> {
+        let count = count.max(1);
+        // Tear down the current session first; Mutter only allows one Record*
+        // set per session and rejects Record* after Start().
+        {
+            let inner = self.inner.lock();
+            let _ = inner.rd_session.call::<_, _, ()>("Stop", &());
+        }
+        let new_inner = build_session(&self.conn, &self.primary_connector, count)
+            .with_context(|| format!("rebuild Mutter session for {count} head(s)"))?;
+        let node_ids: Vec<u32> = new_inner.heads.iter().map(|h| h.node_id).collect();
+        *self.inner.lock() = new_inner;
+        tracing::info!("[wayland] session rebuilt for {} head(s): {:?}", count, node_ids);
+        Ok(node_ids)
     }
 
     fn notify_keyboard_keycode(&self, keycode: u32, pressed: bool) -> Result<()> {
         let _: () = self
+            .inner
+            .lock()
             .rd_session
             .call("NotifyKeyboardKeycode", &(keycode, pressed))?;
         Ok(())
@@ -235,27 +296,55 @@ impl RemoteSessionApi for MutterRemoteSession {
 
     fn notify_pointer_button(&self, button: i32, pressed: bool) -> Result<()> {
         let _: () = self
+            .inner
+            .lock()
             .rd_session
             .call("NotifyPointerButton", &(button, pressed))?;
         Ok(())
     }
 
     fn notify_pointer_motion_absolute(&self, x: f64, y: f64) -> Result<()> {
-        // Mutter wants the ScreenCast stream OBJECT PATH (the portal flavor
-        // takes the PipeWire node id instead).
-        let _: () = self.rd_session.call(
+        // Route whole-layout absolute coordinates to the head whose client-space
+        // rect contains them, then translate to that head's local coordinates.
+        // Mutter's NotifyPointerMotionAbsolute is per-stream (per virtual
+        // monitor); the portal flavor takes a node id instead.
+        let inner = self.inner.lock();
+        let (idx, lx, ly) = route_to_head(&inner.layout, x, y);
+        let stream_path = inner
+            .heads
+            .get(idx)
+            .unwrap_or(&inner.heads[0])
+            .stream_path
+            .clone();
+        let _: () = inner.rd_session.call(
             "NotifyPointerMotionAbsolute",
-            &(self.stream_path.as_str(), x, y),
+            &(stream_path.as_str(), lx, ly),
         )?;
         Ok(())
     }
 
     fn notify_pointer_axis_discrete(&self, axis: u32, steps: i32) -> Result<()> {
         let _: () = self
+            .inner
+            .lock()
             .rd_session
             .call("NotifyPointerAxisDiscrete", &(axis, steps))?;
         Ok(())
     }
+}
+
+/// Pick the head whose client-space rect contains `(x, y)` and return its
+/// index plus head-local coordinates. Falls back to head 0 when no layout is
+/// set (single head) or the point is outside every rect (clamped to the
+/// nearest by leaving it on head 0's global coords).
+fn route_to_head(layout: &[(u32, u32, u32, u32)], x: f64, y: f64) -> (usize, f64, f64) {
+    for (i, &(rx, ry, rw, rh)) in layout.iter().enumerate() {
+        let (rx, ry, rw, rh) = (rx as f64, ry as f64, rw as f64, rh as f64);
+        if x >= rx && x < rx + rw && y >= ry && y < ry + rh {
+            return (i, x - rx, y - ry);
+        }
+    }
+    (0, x, y)
 }
 
 /// First monitor's connector name + current mode size from

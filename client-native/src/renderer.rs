@@ -5,12 +5,19 @@
 /// letterboxed quad that preserves the remote desktop's aspect ratio.
 /// Compared to CPU conversion + RGBA upload this saves a full-frame CPU
 /// pass and 62% of the per-frame upload bandwidth.
-
 use anyhow::{Context, Result};
 use std::sync::Arc;
 
+#[cfg(windows)]
+use crate::decoder::PlaneStorage;
 use crate::decoder::{DecodedFrame, FrameFormat};
 use crate::overlay::{DisplayMode, EguiRenderData};
+
+#[cfg(windows)]
+struct SharedDx12Textures {
+    imported: crate::dx12_interop::ImportedNv12Generation,
+    bind_groups: Vec<wgpu::BindGroup>,
+}
 
 pub struct Renderer {
     device: wgpu::Device,
@@ -40,16 +47,46 @@ pub struct Renderer {
     display_mode: DisplayMode,
     egui_renderer: egui_wgpu::Renderer,
     surface_format: wgpu::TextureFormat,
+    #[cfg(windows)]
+    dx12: Option<crate::dx12_interop::Dx12RenderInterop>,
+    #[cfg(windows)]
+    dx12_decode_config: Option<crate::dx12_interop::Dx12DecodeConfig>,
+    #[cfg(windows)]
+    shared_dx12: Option<SharedDx12Textures>,
+    #[cfg(windows)]
+    current_shared_frame: Option<crate::dx12_interop::SharedNv12Frame>,
 }
 
 impl Renderer {
     pub async fn new(window: Arc<winit::window::Window>) -> Result<Self> {
+        #[cfg(windows)]
+        if std::env::var("DDISPLAY_NO_DX12")
+            .map(|v| v != "1")
+            .unwrap_or(true)
+        {
+            match Self::new_with_backends(window.clone(), wgpu::Backends::DX12, true).await {
+                Ok(renderer) => return Ok(renderer),
+                Err(e) => eprintln!(
+                    "[dx12-video] DX12 renderer unavailable ({e:#}); using standard wgpu path"
+                ),
+            }
+        }
+
+        Self::new_with_backends(window, wgpu::Backends::all(), false).await
+    }
+
+    async fn new_with_backends(
+        window: Arc<winit::window::Window>,
+        backends: wgpu::Backends,
+        request_dx12_video: bool,
+    ) -> Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+            backends,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
-        let surface = instance.create_surface(window.clone())
+        let surface = instance
+            .create_surface(window.clone())
             .context("Failed to create wgpu surface")?;
 
         let adapter = instance
@@ -64,27 +101,72 @@ impl Renderer {
         eprintln!("[gpu] Adapter: {}", adapter.get_info().name);
         eprintln!("[gpu] Backend: {:?}", adapter.get_info().backend);
 
+        let nv12_format = adapter.get_texture_format_features(wgpu::TextureFormat::NV12);
+        let dx12_video_supported = request_dx12_video
+            && adapter
+                .features()
+                .contains(wgpu::Features::TEXTURE_FORMAT_NV12)
+            && nv12_format
+                .allowed_usages
+                .contains(wgpu::TextureUsages::TEXTURE_BINDING)
+            && nv12_format
+                .flags
+                .contains(wgpu::TextureFormatFeatureFlags::FILTERABLE);
+        if request_dx12_video && !dx12_video_supported {
+            eprintln!("[dx12-video] adapter lacks shared NV12 texture support");
+        }
+        let required_features = if dx12_video_supported {
+            wgpu::Features::TEXTURE_FORMAT_NV12
+        } else {
+            wgpu::Features::empty()
+        };
+
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("ddisplay"),
+                required_features,
                 ..Default::default()
             })
             .await
             .context("Failed to create wgpu device")?;
 
+        #[cfg(windows)]
+        let (dx12, dx12_decode_config) = if dx12_video_supported {
+            match crate::dx12_interop::Dx12RenderInterop::new(&device, &queue) {
+                Ok((interop, config)) => {
+                    eprintln!("[dx12-video] shared NV12 interop candidate initialized");
+                    (Some(interop), Some(config))
+                }
+                Err(e) => {
+                    eprintln!("[dx12-video] interop initialization failed: {e:#}");
+                    (None, None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+
         let size = window.inner_size();
         let surface_caps = surface.get_capabilities(&adapter);
-        let surface_format = surface_caps.formats.iter()
+        let surface_format = surface_caps
+            .formats
+            .iter()
             .find(|f| f.is_srgb())
             .copied()
             .unwrap_or(surface_caps.formats[0]);
 
         // Prefer Mailbox (triple-buffered, low latency, GPU-paced by display) over
         // Immediate (uncapped, spins GPU at 100%). Fall back through FifoRelaxed to Fifo.
-        let present_mode = if surface_caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+        let present_mode = if surface_caps
+            .present_modes
+            .contains(&wgpu::PresentMode::Mailbox)
+        {
             eprintln!("[gpu] Present mode: Mailbox (low latency, GPU-paced)");
             wgpu::PresentMode::Mailbox
-        } else if surface_caps.present_modes.contains(&wgpu::PresentMode::FifoRelaxed) {
+        } else if surface_caps
+            .present_modes
+            .contains(&wgpu::PresentMode::FifoRelaxed)
+        {
             eprintln!("[gpu] Present mode: FifoRelaxed");
             wgpu::PresentMode::FifoRelaxed
         } else {
@@ -163,12 +245,11 @@ impl Renderer {
         let make_pipeline = |label: &str,
                              layout: &wgpu::BindGroupLayout,
                              module: &wgpu::ShaderModule| {
-            let pipeline_layout =
-                device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some(label),
-                    bind_group_layouts: &[Some(layout), Some(&scale_bg_layout)],
-                    immediate_size: 0,
-                });
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[Some(layout), Some(&scale_bg_layout)],
+                immediate_size: 0,
+            });
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(&pipeline_layout),
@@ -199,8 +280,11 @@ impl Renderer {
             })
         };
         let pipeline = make_pipeline("render_pipeline_i420", &bind_group_layout, &shader);
-        let pipeline_nv12 =
-            make_pipeline("render_pipeline_nv12", &bind_group_layout_nv12, &shader_nv12);
+        let pipeline_nv12 = make_pipeline(
+            "render_pipeline_nv12",
+            &bind_group_layout_nv12,
+            &shader_nv12,
+        );
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("frame_sampler"),
@@ -212,8 +296,14 @@ impl Renderer {
         // Params uniform: vec4 scale [scale_x, scale_y, srgb_flag, 0] then
         // vec4 crop [u0, v0, u_width, v_height].
         let scale_data: [f32; 8] = [
-            1.0, 1.0, if surface_format.is_srgb() { 1.0 } else { 0.0 }, 0.0,
-            0.0, 0.0, 1.0, 1.0,
+            1.0,
+            1.0,
+            if surface_format.is_srgb() { 1.0 } else { 0.0 },
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
         ];
         let scale_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("params_uniform"),
@@ -262,7 +352,20 @@ impl Renderer {
             display_mode: DisplayMode::default(),
             egui_renderer,
             surface_format,
+            #[cfg(windows)]
+            dx12,
+            #[cfg(windows)]
+            dx12_decode_config,
+            #[cfg(windows)]
+            shared_dx12: None,
+            #[cfg(windows)]
+            current_shared_frame: None,
         })
+    }
+
+    #[cfg(windows)]
+    pub fn dx12_decode_config(&self) -> Option<crate::dx12_interop::Dx12DecodeConfig> {
+        self.dx12_decode_config
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -276,10 +379,128 @@ impl Renderer {
         self.update_scale();
     }
 
+    #[cfg(windows)]
+    fn upload_shared_nv12(&mut self, frame: &crate::dx12_interop::SharedNv12Frame) {
+        let Some(dx12) = &self.dx12 else {
+            frame.mark_failed();
+            return;
+        };
+
+        let needs_import = self.shared_dx12.as_ref().map_or(true, |generation| {
+            generation.imported.id() != frame.generation_id()
+        });
+        if needs_import {
+            // HAL imports return normal handles while wgpu validation reports
+            // through error scopes. Capture both channels so a driver-specific
+            // import failure falls back instead of invoking the panic handler.
+            let internal_scope = self.device.push_error_scope(wgpu::ErrorFilter::Internal);
+            let oom_scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+            let validation_scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let candidate: Result<SharedDx12Textures> = (|| {
+                let imported = dx12.import_generation(&self.device, frame)?;
+                let mut bind_groups = Vec::with_capacity(imported.textures().len());
+                for texture in imported.textures() {
+                    let y = texture.create_view(&wgpu::TextureViewDescriptor {
+                        label: Some("mf_shared_y"),
+                        format: Some(wgpu::TextureFormat::R8Unorm),
+                        dimension: Some(wgpu::TextureViewDimension::D2),
+                        aspect: wgpu::TextureAspect::Plane0,
+                        ..Default::default()
+                    });
+                    let uv = texture.create_view(&wgpu::TextureViewDescriptor {
+                        label: Some("mf_shared_uv"),
+                        format: Some(wgpu::TextureFormat::Rg8Unorm),
+                        dimension: Some(wgpu::TextureViewDimension::D2),
+                        aspect: wgpu::TextureAspect::Plane1,
+                        ..Default::default()
+                    });
+                    bind_groups.push(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("mf_shared_nv12_bind_group"),
+                        layout: &self.bind_group_layout_nv12,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&y),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(&uv),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::Sampler(&self.sampler),
+                            },
+                        ],
+                    }));
+                }
+                Ok(SharedDx12Textures {
+                    imported,
+                    bind_groups,
+                })
+            })();
+            let validation_error = pollster::block_on(validation_scope.pop());
+            let oom_error = pollster::block_on(oom_scope.pop());
+            let internal_error = pollster::block_on(internal_scope.pop());
+            if let Some(error) = validation_error.or(oom_error).or(internal_error) {
+                eprintln!("[dx12-video] wgpu import failed: {error}");
+                frame.mark_failed();
+                return;
+            }
+            match candidate {
+                Ok(generation) => {
+                    eprintln!("[dx12-video] shared NV12 presentation active");
+                    self.shared_dx12 = Some(generation);
+                }
+                Err(e) => {
+                    eprintln!("[dx12-video] texture import failed: {e:#}");
+                    frame.mark_failed();
+                    return;
+                }
+            };
+        }
+
+        let generation = self.shared_dx12.as_ref().unwrap();
+        if let Err(e) = dx12.wait_ready(&generation.imported, frame) {
+            eprintln!("[dx12-video] ready wait failed: {e:#}");
+            frame.mark_failed();
+            return;
+        }
+
+        let (allocation_w, allocation_h) = frame.allocation_size();
+        self.current_bind_group = Some(generation.bind_groups[frame.slot()].clone());
+        self.current_shared_frame = Some(frame.clone());
+        self.plane_textures.clear();
+        self.current_format = FrameFormat::Nv12;
+        self.texture_size = (allocation_w, allocation_h);
+        // update_scale derives visible aspect from allocation size * crop.
+        self.remote_size = (allocation_w, allocation_h);
+        self.crop_uv = [
+            0.0,
+            0.0,
+            frame.visible_width as f32 / allocation_w as f32,
+            frame.visible_height as f32 / allocation_h as f32,
+        ];
+        self.update_scale();
+    }
+
     /// Upload a decoded frame to the GPU — three R8 planes for I420
     /// (software decoders) or R8 + Rg8 for NV12 (hardware decode). The
     /// YUV→RGB conversion always runs in the fragment shader.
     pub fn upload_frame(&mut self, frame: &DecodedFrame) {
+        #[cfg(windows)]
+        if let PlaneStorage::Dx12(shared) = &frame.storage {
+            self.upload_shared_nv12(shared);
+            return;
+        }
+
+        #[cfg(windows)]
+        if self.current_shared_frame.take().is_some() {
+            self.current_bind_group = None;
+            self.shared_dx12 = None;
+            self.texture_size = (0, 0);
+        }
+        self.crop_uv = [0.0, 0.0, 1.0, 1.0];
+
         let (width, height) = (frame.width, frame.height);
         if width == 0 || height == 0 {
             return;
@@ -297,7 +518,11 @@ impl Renderer {
             let plane = |label, w, h, fmt| {
                 self.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some(label),
-                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
@@ -314,7 +539,12 @@ impl Renderer {
                 ],
                 FrameFormat::Nv12 => vec![
                     plane("frame_y", width, height, wgpu::TextureFormat::R8Unorm),
-                    plane("frame_uv", chroma_w, chroma_h, wgpu::TextureFormat::Rg8Unorm),
+                    plane(
+                        "frame_uv",
+                        chroma_w,
+                        chroma_h,
+                        wgpu::TextureFormat::Rg8Unorm,
+                    ),
                 ],
             };
             let views: Vec<wgpu::TextureView> = textures
@@ -367,7 +597,11 @@ impl Renderer {
                     bytes_per_row: Some(stride),
                     rows_per_image: Some(h),
                 },
-                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
             );
         };
         match format {
@@ -407,8 +641,11 @@ impl Renderer {
         }
 
         let output = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
+            wgpu::CurrentSurfaceTexture::Success(t)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(())
+            }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.surface_config);
                 return Ok(());
@@ -417,11 +654,15 @@ impl Renderer {
                 return Err(anyhow::anyhow!("wgpu validation error on surface"));
             }
         };
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("render_encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("render_encoder"),
+            });
 
         // Video frame pass
         {
@@ -461,7 +702,8 @@ impl Renderer {
                 pixels_per_point: egui_data.pixels_per_point,
             };
             for (id, delta) in &egui_data.textures_delta.set {
-                self.egui_renderer.update_texture(&self.device, &self.queue, *id, delta);
+                self.egui_renderer
+                    .update_texture(&self.device, &self.queue, *id, delta);
             }
             for id in &egui_data.textures_delta.free {
                 self.egui_renderer.free_texture(id);
@@ -474,27 +716,46 @@ impl Renderer {
                 &screen_descriptor,
             );
             {
-                let mut egui_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("egui_pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        resolve_target: None,
-                        depth_slice: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                }).forget_lifetime();
-                self.egui_renderer.render(&mut egui_pass, &egui_data.clipped, &screen_descriptor);
+                let mut egui_pass = encoder
+                    .begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("egui_pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            depth_slice: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    })
+                    .forget_lifetime();
+                self.egui_renderer
+                    .render(&mut egui_pass, &egui_data.clipped, &screen_descriptor);
             }
-            self.queue.submit(extra_cmds.into_iter().chain(std::iter::once(encoder.finish())));
+            self.queue.submit(
+                extra_cmds
+                    .into_iter()
+                    .chain(std::iter::once(encoder.finish())),
+            );
         } else {
             self.queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        #[cfg(windows)]
+        if let (Some(dx12), Some(generation), Some(frame)) = (
+            &mut self.dx12,
+            &self.shared_dx12,
+            &self.current_shared_frame,
+        ) {
+            if let Err(e) = dx12.signal_done(&generation.imported, frame) {
+                frame.mark_failed();
+                return Err(e.context("DX12 shared-video completion"));
+            }
         }
         output.present();
 
@@ -507,7 +768,11 @@ impl Renderer {
             return;
         }
 
-        let srgb = if self.surface_format.is_srgb() { 1.0f32 } else { 0.0 };
+        let srgb = if self.surface_format.is_srgb() {
+            1.0f32
+        } else {
+            0.0
+        };
         let [u0, v0, uw, vh] = self.crop_uv;
         // The visible content is the cropped region, so aspect is taken from
         // its pixel size, not the whole framebuffer.
@@ -522,13 +787,15 @@ impl Renderer {
             }
         };
         let data: [f32; 8] = [scale[0], scale[1], srgb, 0.0, u0, v0, uw, vh];
-        self.queue.write_buffer(&self.scale_buffer, 0, bytemuck::cast_slice(&data));
+        self.queue
+            .write_buffer(&self.scale_buffer, 0, bytemuck::cast_slice(&data));
     }
 }
 
 impl Drop for Renderer {
     fn drop(&mut self) {
-        // Flush all pending GPU/presentation work before the Vulkan swapchain is torn down.
+        // Flush pending GPU/presentation work before the swapchain and any
+        // imported shared textures are torn down.
         // wgpu 29 panics if a SwapchainAcquireSemaphore is still in-flight when Surface drops.
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
     }
@@ -666,9 +933,15 @@ fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    let crop_min = params.crop.xy;
+    let crop_max = params.crop.xy + params.crop.zw;
+    let y_texel = 1.0 / vec2<f32>(textureDimensions(tex_y));
+    let uv_texel = 1.0 / vec2<f32>(textureDimensions(tex_uv));
+    let y_uv = clamp(in.uv, crop_min + 0.5 * y_texel, crop_max - 0.5 * y_texel);
+    let chroma_uv = clamp(in.uv, crop_min + 0.5 * uv_texel, crop_max - 0.5 * uv_texel);
     // BT.601 limited-range YUV -> RGB (matches the server's encode matrix).
-    let y = (textureSample(tex_y, frame_sampler, in.uv).r - 16.0 / 255.0) * (255.0 / 219.0);
-    let chroma = textureSample(tex_uv, frame_sampler, in.uv).rg - vec2(0.5);
+    let y = (textureSample(tex_y, frame_sampler, y_uv).r - 16.0 / 255.0) * (255.0 / 219.0);
+    let chroma = textureSample(tex_uv, frame_sampler, chroma_uv).rg - vec2(0.5);
     let u = chroma.x;
     let v = chroma.y;
 

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex};
 
-use crate::decoder::{self, DecodedFrame};
+use crate::decoder::{self, DecodedFrame, DecoderOptions};
 
 struct DecodeJob {
     data: Vec<u8>,
@@ -28,12 +28,12 @@ pub struct DecodePipeline {
     decode_us: Arc<AtomicU32>,
     /// After a dropped frame the bitstream is broken until the next keyframe.
     skip_until_keyframe: bool,
-    hw: (bool, bool),
+    options: DecoderOptions,
     pub codec: String,
 }
 
 impl DecodePipeline {
-    pub fn new(codec: &str, hw: (bool, bool)) -> Self {
+    pub fn new(codec: &str, options: DecoderOptions) -> Self {
         let mut pipeline = Self {
             decode_tx: None,
             frame_slot: Arc::new(Mutex::new(None)),
@@ -41,7 +41,7 @@ impl DecodePipeline {
             needs_keyframe: Arc::new(AtomicBool::new(false)),
             decode_us: Arc::new(AtomicU32::new(0)),
             skip_until_keyframe: false,
-            hw,
+            options,
             codec: codec.to_string(),
         };
         pipeline.start(codec);
@@ -72,14 +72,12 @@ impl DecodePipeline {
         let needs_keyframe = self.needs_keyframe.clone();
         let decode_us = self.decode_us.clone();
         let codec = codec.to_string();
-        let (hw_h264, hw_av1) = self.hw;
-        let try_hw = if codec == "av1" { hw_av1 } else { hw_h264 };
+        let options = self.options.clone();
 
         std::thread::Builder::new()
             .name(format!("decode-{codec}"))
             .spawn(move || {
-                eprintln!("[decode] thread started, codec={codec} hw={try_hw}");
-                let mut dec = match decoder::VideoDecoder::for_codec(&codec, try_hw) {
+                let mut dec = match decoder::VideoDecoder::for_codec(&codec, &options) {
                     Ok(d) => d,
                     Err(e) => {
                         eprintln!("[decode] FATAL: {codec} decoder init failed: {e}");
@@ -107,8 +105,11 @@ impl DecodePipeline {
                         Err(e) => eprintln!("[decode] error: {e}"),
                     }
                     let us = t0.elapsed().as_micros() as f32;
-                    decode_ema_us =
-                        if decode_ema_us == 0.0 { us } else { decode_ema_us * 0.9 + us * 0.1 };
+                    decode_ema_us = if decode_ema_us == 0.0 {
+                        us
+                    } else {
+                        decode_ema_us * 0.9 + us * 0.1
+                    };
                     decode_us.store(decode_ema_us as u32, Ordering::Relaxed);
 
                     if dec.take_needs_keyframe() {
@@ -127,8 +128,13 @@ impl DecodePipeline {
             outcome.dropped = true;
             return outcome;
         }
-        let Some(tx) = &self.decode_tx else { return outcome };
-        match tx.try_send(DecodeJob { data: data.to_vec(), keyframe }) {
+        let Some(tx) = &self.decode_tx else {
+            return outcome;
+        };
+        match tx.try_send(DecodeJob {
+            data: data.to_vec(),
+            keyframe,
+        }) {
             Ok(()) => self.skip_until_keyframe = false,
             Err(_) => {
                 // Decode thread is behind: drop and resync on the next IDR.

@@ -59,6 +59,10 @@ egui = "0.34.1"
 egui-wgpu = "0.34.1"
 egui-winit = { version = "0.34.1", default-features = false }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Vulkan Video hardware decode (NVDEC/VCN/QuickSync), zero-copy NV12 wgpu textures
+gpu-video = "0.4"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

@@ -25,7 +25,9 @@ use windows::Win32::Graphics::Dxgi::{
     IDXGIResource1, DXGI_SHARED_RESOURCE_READ, DXGI_SHARED_RESOURCE_WRITE,
 };
 
-const SLOT_COUNT: usize = 3;
+// Displayed frame, mailbox frame, and a drain pass holding one decoded frame
+// while copying the next, so a newer frame never finds the ring full.
+const SLOT_COUNT: usize = 4;
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Adapter identity copied from the renderer's actual DX12 device.
@@ -312,6 +314,9 @@ impl SharedNv12Producer {
                 self.generation.leases[slot].store(0, Ordering::Release);
                 return Err(e).context("signal shared NV12 ready fence");
             }
+            // Submit now: the DX12 queue waits on this fence value, and D3D11
+            // would otherwise hold the signal until its next implicit flush.
+            self.context.Flush();
         }
         self.next_slot = (slot + 1) % SLOT_COUNT;
 

@@ -11,6 +11,8 @@ use std::sync::Arc;
 #[cfg(windows)]
 use crate::decoder::PlaneStorage;
 use crate::decoder::{DecodedFrame, FrameFormat};
+#[cfg(target_os = "linux")]
+use crate::decoder::PlaneStorage;
 use crate::overlay::{DisplayMode, EguiRenderData};
 
 #[cfg(windows)]
@@ -55,6 +57,10 @@ pub struct Renderer {
     shared_dx12: Option<SharedDx12Textures>,
     #[cfg(windows)]
     current_shared_frame: Option<crate::dx12_interop::SharedNv12Frame>,
+    /// Vulkan Video context when this renderer's device came from gpu-video;
+    /// decode threads share it so decoded textures live on this device.
+    #[cfg(target_os = "linux")]
+    vk_video: Option<Arc<crate::decoder_vk::VkVideoContext>>,
 }
 
 impl Renderer {
@@ -68,6 +74,21 @@ impl Renderer {
                 Ok(renderer) => return Ok(renderer),
                 Err(e) => eprintln!(
                     "[dx12-video] DX12 renderer unavailable ({e:#}); using standard wgpu path"
+                ),
+            }
+        }
+
+        // On Linux, prefer a device created through gpu-video: same wgpu
+        // renderer, but with Vulkan Video decode extensions enabled so H.264
+        // decodes GPU-side straight into sampleable NV12 textures. Any init
+        // failure (no Vulkan, no video queues, DDISPLAY_NO_VKVIDEO=1) uses
+        // the standard wgpu path with software decode, as before.
+        #[cfg(target_os = "linux")]
+        if !crate::decoder_vk::VkVideoContext::disabled() {
+            match Self::new_vulkan_video(window.clone()) {
+                Ok(renderer) => return Ok(renderer),
+                Err(e) => eprintln!(
+                    "[vk-video] Vulkan Video unavailable ({e:#}); using standard wgpu path"
                 ),
             }
         }
@@ -146,6 +167,49 @@ impl Renderer {
             (None, None)
         };
 
+        #[allow(unused_mut)]
+        let mut renderer = Self::init(window, surface, adapter, device, queue)?;
+        #[cfg(windows)]
+        {
+            renderer.dx12 = dx12;
+            renderer.dx12_decode_config = dx12_decode_config;
+        }
+        Ok(renderer)
+    }
+
+    /// Build the renderer on a gpu-video Vulkan device: adapter selection is
+    /// restricted to video-decode-capable GPUs that can present to `window`.
+    #[cfg(target_os = "linux")]
+    fn new_vulkan_video(window: Arc<winit::window::Window>) -> Result<Self> {
+        let vk_instance = crate::decoder_vk::create_instance()?;
+        let surface = vk_instance
+            .wgpu_instance()
+            .create_surface(window.clone())
+            .context("Failed to create wgpu surface")?;
+        let ctx = crate::decoder_vk::create_context(&surface, vk_instance)?;
+
+        let adapter = ctx.device.wgpu_adapter();
+        eprintln!("[gpu] Backend: Vulkan (video decode enabled)");
+        let device = ctx.device.wgpu_device();
+        let queue = ctx.device.wgpu_queue();
+
+        let mut renderer = Self::init(window, surface, adapter, device, queue)?;
+        renderer.vk_video = Some(ctx);
+        Ok(renderer)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn vk_video(&self) -> Option<Arc<crate::decoder_vk::VkVideoContext>> {
+        self.vk_video.clone()
+    }
+
+    fn init(
+        window: Arc<winit::window::Window>,
+        surface: wgpu::Surface<'static>,
+        adapter: wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+    ) -> Result<Self> {
         let size = window.inner_size();
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps
@@ -353,13 +417,15 @@ impl Renderer {
             egui_renderer,
             surface_format,
             #[cfg(windows)]
-            dx12,
+            dx12: None,
             #[cfg(windows)]
-            dx12_decode_config,
+            dx12_decode_config: None,
             #[cfg(windows)]
             shared_dx12: None,
             #[cfg(windows)]
             current_shared_frame: None,
+            #[cfg(target_os = "linux")]
+            vk_video: None,
         })
     }
 
@@ -483,10 +549,65 @@ impl Renderer {
         self.update_scale();
     }
 
+    /// Bind a decoded NV12 texture straight off the Vulkan Video decoder:
+    /// no CPU upload, just plane views into the existing NV12 pipeline.
+    #[cfg(target_os = "linux")]
+    fn bind_vk_frame(&mut self, texture: &wgpu::Texture, width: u32, height: u32) {
+        if self.texture_size != (width, height) || self.current_format != FrameFormat::Nv12 {
+            self.texture_size = (width, height);
+            self.remote_size = (width, height);
+            self.current_format = FrameFormat::Nv12;
+            // The decoder owns frame textures; drop any upload-path planes.
+            self.plane_textures.clear();
+            self.update_scale();
+        }
+
+        let plane_view = |aspect, format, label| {
+            texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some(label),
+                format: Some(format),
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                aspect,
+                ..Default::default()
+            })
+        };
+        let y = plane_view(wgpu::TextureAspect::Plane0, wgpu::TextureFormat::R8Unorm, "vk_video_y");
+        let uv = plane_view(wgpu::TextureAspect::Plane1, wgpu::TextureFormat::Rg8Unorm, "vk_video_uv");
+
+        // A fresh texture arrives every frame, so the bind group is rebuilt
+        // per frame; it also keeps the texture alive until the GPU is done.
+        self.current_bind_group =
+            Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("vk_video_bind_group"),
+                layout: &self.bind_group_layout_nv12,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&y),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&uv),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            }));
+    }
+
     /// Upload a decoded frame to the GPU — three R8 planes for I420
     /// (software decoders) or R8 + Rg8 for NV12 (hardware decode). The
-    /// YUV→RGB conversion always runs in the fragment shader.
+    /// YUV→RGB conversion always runs in the fragment shader. Vulkan Video
+    /// frames skip the upload entirely and bind the decoder's texture.
     pub fn upload_frame(&mut self, frame: &DecodedFrame) {
+        #[cfg(target_os = "linux")]
+        if let PlaneStorage::VkTexture(texture) = &frame.storage {
+            self.bind_vk_frame(texture, frame.width, frame.height);
+            return;
+        }
+
         #[cfg(windows)]
         if let PlaneStorage::Dx12(shared) = &frame.storage {
             self.upload_shared_nv12(shared);

@@ -6,13 +6,16 @@ use openh264::formats::YUVSource;
 // dav1d uses POSIX errno values even on Windows
 const DAV1D_EAGAIN: i32 = -11;
 
-/// Per-window decoder configuration. On Windows the renderer contributes its
-/// actual DX12 adapter identity so MF decode and presentation share one GPU.
+/// Per-window decoder configuration. The renderer contributes its GPU
+/// identity (the DX12 adapter on Windows, the Vulkan Video context on Linux)
+/// so hardware decode output and presentation share one device.
 #[derive(Clone)]
 pub struct DecoderOptions {
     hardware: (bool, bool),
     #[cfg(windows)]
     dx12: Option<crate::dx12_interop::Dx12DecodeConfig>,
+    #[cfg(target_os = "linux")]
+    vk: Option<std::sync::Arc<crate::decoder_vk::VkVideoContext>>,
 }
 
 impl DecoderOptions {
@@ -21,12 +24,23 @@ impl DecoderOptions {
             hardware,
             #[cfg(windows)]
             dx12: None,
+            #[cfg(target_os = "linux")]
+            vk: None,
         }
     }
 
     #[cfg(windows)]
     pub fn with_dx12(mut self, config: Option<crate::dx12_interop::Dx12DecodeConfig>) -> Self {
         self.dx12 = config;
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn with_vulkan(
+        mut self,
+        ctx: Option<std::sync::Arc<crate::decoder_vk::VkVideoContext>>,
+    ) -> Self {
+        self.vk = ctx;
         self
     }
 
@@ -113,6 +127,9 @@ pub enum PlaneStorage {
     /// D3D11 decode output copied into a shared texture and imported by DX12.
     #[cfg(windows)]
     Dx12(crate::dx12_interop::SharedNv12Frame),
+    /// Vulkan Video decode output: an NV12 texture that never left the GPU.
+    #[cfg(target_os = "linux")]
+    VkTexture(wgpu::Texture),
 }
 
 impl DecodedFrame {
@@ -121,6 +138,8 @@ impl DecodedFrame {
             PlaneStorage::Nv12 { .. } => FrameFormat::Nv12,
             #[cfg(windows)]
             PlaneStorage::Dx12(_) => FrameFormat::Nv12,
+            #[cfg(target_os = "linux")]
+            PlaneStorage::VkTexture(_) => FrameFormat::Nv12,
             _ => FrameFormat::I420,
         }
     }
@@ -133,6 +152,8 @@ impl DecodedFrame {
             PlaneStorage::Nv12 { y, stride, .. } => (y, *stride),
             #[cfg(windows)]
             PlaneStorage::Dx12(_) => unreachable!("DX12 frames have no CPU planes"),
+            #[cfg(target_os = "linux")]
+            PlaneStorage::VkTexture(_) => unreachable!("GPU frames have no CPU planes"),
         }
     }
 
@@ -140,9 +161,7 @@ impl DecodedFrame {
         match &self.storage {
             PlaneStorage::Packed { u, .. } => (u, (self.width as usize).div_ceil(2)),
             PlaneStorage::Dav1d(g) => (g.u(), g.uv_stride),
-            PlaneStorage::Nv12 { .. } => unreachable!("use uv_plane() for NV12"),
-            #[cfg(windows)]
-            PlaneStorage::Dx12(_) => unreachable!("DX12 frames have no CPU planes"),
+            _ => unreachable!("use uv_plane() for NV12"),
         }
     }
 
@@ -150,9 +169,7 @@ impl DecodedFrame {
         match &self.storage {
             PlaneStorage::Packed { v, .. } => (v, (self.width as usize).div_ceil(2)),
             PlaneStorage::Dav1d(g) => (g.v(), g.uv_stride),
-            PlaneStorage::Nv12 { .. } => unreachable!("use uv_plane() for NV12"),
-            #[cfg(windows)]
-            PlaneStorage::Dx12(_) => unreachable!("DX12 frames have no CPU planes"),
+            _ => unreachable!("use uv_plane() for NV12"),
         }
     }
 
@@ -221,12 +238,15 @@ pub enum VideoDecoder {
     /// Hardware decode via Media Foundation + D3D11 (Windows only).
     #[cfg(windows)]
     Mf(crate::decoder_mf::MfHwDecoder),
+    /// Hardware decode via Vulkan Video (Linux only).
+    #[cfg(target_os = "linux")]
+    Vk(crate::decoder_vk::VkHwDecoder),
 }
 
 impl VideoDecoder {
-    /// Build a decoder for `codec`. When `try_hw` is set (the startup probe
-    /// found a GPU decode block for this codec), the hardware path is tried
-    /// first and any init failure falls back to software with a log line.
+    /// Build a decoder for `codec`. When the startup probe found a GPU decode
+    /// block for this codec, the hardware path is tried first and any init
+    /// failure falls back to software with a log line.
     pub fn for_codec(codec: &str, options: &DecoderOptions) -> Result<Self> {
         let try_hw = options.try_hardware(codec);
         #[cfg(windows)]
@@ -241,7 +261,20 @@ impl VideoDecoder {
                 }
             }
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        if try_hw && codec != "av1" {
+            if let Some(ctx) = &options.vk {
+                match crate::decoder_vk::VkHwDecoder::new(ctx.clone()) {
+                    Ok(d) => return Ok(Self::Vk(d)),
+                    Err(e) => {
+                        eprintln!(
+                            "[decode] Vulkan Video H.264 decoder init failed ({e:#}); using software"
+                        );
+                    }
+                }
+            }
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         let _ = try_hw;
 
         match codec {
@@ -265,6 +298,23 @@ impl VideoDecoder {
                     Err(e)
                 }
             },
+            #[cfg(target_os = "linux")]
+            Self::Vk(d) => match d.decode(data) {
+                Ok(f) => Ok(f),
+                Err(e) => {
+                    if d.is_dead() {
+                        // Unrecoverable (e.g. the driver can't decode this
+                        // profile) — drop to software and resync on an IDR.
+                        eprintln!(
+                            "[vk-video] hardware decode gave up ({e:#}); switching to software"
+                        );
+                        let mut sw = H264Decoder::new()?;
+                        sw.needs_keyframe = true;
+                        *self = Self::H264(sw);
+                    }
+                    Err(e)
+                }
+            },
         }
     }
 
@@ -282,7 +332,17 @@ impl VideoDecoder {
                 d.needs_keyframe = false;
                 v
             }
-            Self::H264(_) => false,
+            #[cfg(target_os = "linux")]
+            Self::Vk(d) => {
+                let v = d.needs_keyframe;
+                d.needs_keyframe = false;
+                v
+            }
+            Self::H264(d) => {
+                let v = d.needs_keyframe;
+                d.needs_keyframe = false;
+                v
+            }
         }
     }
 }
@@ -293,12 +353,15 @@ impl VideoDecoder {
 
 pub struct H264Decoder {
     decoder: Decoder,
+    /// Set when this decoder replaced a failed hardware decoder mid-stream
+    /// and needs a fresh IDR to start producing frames.
+    pub needs_keyframe: bool,
 }
 
 impl H264Decoder {
     pub fn new() -> Result<Self> {
         let decoder = Decoder::new().context("Failed to create OpenH264 decoder")?;
-        Ok(Self { decoder })
+        Ok(Self { decoder, needs_keyframe: false })
     }
 
     pub fn decode(&mut self, data: &[u8]) -> Result<Option<DecodedFrame>> {

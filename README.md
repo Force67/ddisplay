@@ -14,7 +14,11 @@ sudo apt install build-essential pkg-config clang libclang-dev \
 cargo build --release -p ddisplay-server
 ```
 
-The native client needs `libssl-dev` and `nasm` on Linux, or the MSVC toolchain and `nasm` on Windows. On Windows it prefers a DX12 renderer that imports Media Foundation's D3D11 NV12 output through a shared GPU texture ring, avoiding video-frame readback and re-upload. Unsupported adapters or drivers automatically use the existing wgpu upload path. Set `DDISPLAY_NO_DX12=1` to force that fallback or `DDISPLAY_NO_HWDEC=1` to disable Media Foundation decoding.
+The native client needs `libssl-dev` and `nasm` on Linux, or the MSVC toolchain and `nasm` on Windows.
+
+On Windows it prefers a DX12 renderer that imports Media Foundation's D3D11 NV12 output through a shared GPU texture ring, avoiding video-frame readback and re-upload. Unsupported adapters or drivers automatically use the existing wgpu upload path. Set `DDISPLAY_NO_DX12=1` to force that fallback or `DDISPLAY_NO_HWDEC=1` to disable Media Foundation decoding.
+
+On Linux it prefers a Vulkan device with Vulkan Video support, so H.264 decodes on the GPU straight into NV12 textures the renderer samples in place, with no frame readback or re-upload. Drivers without video decode queues (or `DDISPLAY_NO_VKVIDEO=1`) automatically use the existing software decode path.
 
 ```sh
 cargo build --release -p ddisplay-client

@@ -21,6 +21,8 @@ mod decode_pipeline;
 mod decoder;
 #[cfg(windows)]
 mod decoder_mf;
+#[cfg(target_os = "linux")]
+mod decoder_vk;
 #[cfg(windows)]
 mod dx12_interop;
 mod files;
@@ -120,28 +122,47 @@ struct MonitorWindow {
     window: Arc<Window>,
     renderer: renderer::Renderer,
     decode: DecodePipeline,
+    /// This window's own hardware decode support (its renderer may have
+    /// landed on a different device than the primary's).
     hw_decode: (bool, bool),
     input: input::InputState,
     /// False while minimized/occluded — decode and render are skipped then.
     visible: bool,
 }
 
+/// Decoder configuration for a window: the probe result plus the renderer's
+/// GPU identity so decode output lands on its device.
 fn decoder_options(renderer: &renderer::Renderer, hardware: (bool, bool)) -> DecoderOptions {
     let options = DecoderOptions::new(hardware);
     #[cfg(windows)]
     let options = options.with_dx12(renderer.dx12_decode_config());
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    let options = options.with_vulkan(renderer.vk_video());
+    #[cfg(not(any(windows, target_os = "linux")))]
     let _ = renderer;
     options
 }
 
+/// Hardware decode support as seen by this window's renderer: its DX12
+/// adapter on Windows, its Vulkan Video context on Linux, else the startup
+/// probe result.
 fn hardware_for_renderer(renderer: &renderer::Renderer, fallback: (bool, bool)) -> (bool, bool) {
     #[cfg(windows)]
     if let Some(config) = renderer.dx12_decode_config() {
         return decoder_mf::probe_adapter(config);
     }
-    let _ = renderer;
-    fallback
+    #[cfg(target_os = "linux")]
+    {
+        let _ = fallback;
+        renderer
+            .vk_video()
+            .map_or((false, false), |ctx| (ctx.supports_h264(), false))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = renderer;
+        fallback
+    }
 }
 
 impl MonitorWindow {
@@ -264,6 +285,8 @@ impl ApplicationHandler for App {
                 return;
             }
         };
+        // The renderer knows what its device can hardware-decode; this runs
+        // before the transport connects, so ClientCaps reflects it.
         self.hw_decode = hardware_for_renderer(&renderer, self.hw_decode);
 
         eprintln!("[init] Initializing decoder...");

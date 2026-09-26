@@ -45,6 +45,8 @@ pub struct AppState {
     server_codecs: Vec<String>,
     /// Resize the X display to a connecting client's native resolution.
     resize_to_client: bool,
+    /// Accept client USB devices (--allow-usb).
+    allow_usb: bool,
     /// Capabilities reported by currently connected clients, by connection id.
     client_caps: Mutex<HashMap<u64, ClientCaps>>,
     next_conn_id: AtomicU64,
@@ -174,6 +176,7 @@ pub async fn start_server(
     control: Arc<StreamControl>,
     server_codecs: Vec<String>,
     resize_to_client: bool,
+    allow_usb: bool,
 ) -> anyhow::Result<(FrameSender, InputReceiver)> {
     // Capacity absorbs short TCP send stalls without dropping frames (a drop
     // breaks the H.264/AV1 reference chain and costs a full IDR resync).
@@ -206,6 +209,7 @@ pub async fn start_server(
         control: control.clone(),
         server_codecs,
         resize_to_client,
+        allow_usb,
         client_caps: Mutex::new(HashMap::new()),
         next_conn_id: AtomicU64::new(1),
     });
@@ -278,6 +282,11 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
     // Per-client channel for direct (non-broadcast) replies, e.g. pong echoes.
     let (direct_tx, mut direct_rx) = mpsc::channel::<Vec<u8>>(32);
 
+    // Per-client channel for forwarded USB traffic. Bounded sends backpressure
+    // the vhci socket reads instead of dropping URB bytes (a lost chunk
+    // desyncs the usbip stream for good).
+    let (usb_tx, mut usb_rx) = mpsc::channel::<Vec<u8>>(64);
+
     // Send live session info (codec, resolution, etc.) so client can configure decoder.
     let session_info = protocol::encode_session_info(&state.control.session.lock().clone());
     if ws_sender.send(Message::Binary(session_info.into())).await.is_err() {
@@ -323,6 +332,18 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
                     }
                 }
 
+                // USB URB traffic: small, ordered, must not be dropped.
+                usb = usb_rx.recv() => {
+                    match usb {
+                        Some(data) => {
+                            if ws_sender.send(Message::Binary(data.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+
                 frame = frame_rx.recv() => {
                     match frame {
                         Ok(data) => {
@@ -353,6 +374,9 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
 
     // Task: this WebSocket client -> input channel
     let mut recv_task = tokio::spawn(async move {
+        // Forwarded USB devices live and die with this connection: dropping
+        // this (normal exit or abort) detaches every vhci port.
+        let mut usb = crate::usb::ConnectionUsb::new(usb_tx);
         while let Some(Ok(msg)) = ws_receiver.next().await {
             match msg {
                 Message::Binary(data) => {
@@ -399,6 +423,28 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
                             if let Some(ref tx) = clipboard_set_tx {
                                 let _ = tx.try_send(text);
                             }
+                        }
+                        // USB forwarding is a per-connection side channel, like
+                        // the clipboard: never injected as input. Gated for
+                        // readonly viewers (attaching hardware is write access).
+                        ClientEvent::UsbAttach(req) => {
+                            if readonly {
+                                continue;
+                            }
+                            if !recv_state.allow_usb {
+                                usb.reject(req.token, "USB forwarding is disabled on the server (start it with --allow-usb)").await;
+                                continue;
+                            }
+                            usb.attach(req).await;
+                        }
+                        ClientEvent::UsbData { token, data } => {
+                            if readonly {
+                                continue;
+                            }
+                            usb.data(token, data).await;
+                        }
+                        ClientEvent::UsbDetach { token } => {
+                            usb.detach(token);
                         }
                         // Plug/unplug a virtual head. The encode loop applies the
                         // new count (widen framebuffer + declare heads) and
@@ -730,7 +776,10 @@ fn normalize_input_events(
         | ClientEvent::Stats(_)
         | ClientEvent::Ping { .. }
         | ClientEvent::RequestAddMonitor
-        | ClientEvent::RequestRemoveMonitor => {
+        | ClientEvent::RequestRemoveMonitor
+        | ClientEvent::UsbAttach(_)
+        | ClientEvent::UsbData { .. }
+        | ClientEvent::UsbDetach { .. } => {
             // Intercepted in the recv_task before reaching normalization.
             vec![]
         }

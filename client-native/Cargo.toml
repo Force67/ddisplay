@@ -41,6 +41,9 @@ clap = { version = "4", features = ["derive"] }
 # HTTP client for file transfer
 reqwest = { version = "0.12", features = ["multipart", "json"] }
 
+# USB forwarding (vendored libusb, so no system package or SDK is needed)
+rusb = { version = "0.9", features = ["vendored"] }
+
 # Native file open/save dialogs
 rfd = "0.15"
 

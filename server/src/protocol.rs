@@ -32,6 +32,15 @@
 ///   0x24 Ping: [u64 LE timestamp] — echoed back verbatim by the server (RTT probe)
 ///   0x29 RequestAddMonitor: (no payload), plug in another virtual monitor
 ///   0x2a RequestRemoveMonitor: (no payload), unplug the last virtual monitor
+///
+/// USB forwarding (client device -> server session, usbip):
+///   0x30 UsbAttach (C->S): JSON {token, vendor_id, product_id, busnum,
+///        devnum, speed, product} — offer a client-side USB device
+///   0x31 UsbAttached (S->C): JSON {token, port} — attached to a vhci port
+///   0x32 UsbDetach: [token: u32 LE]   (bidirectional teardown)
+///   0x33 UsbData: [token: u32 LE] [bytes...] — a chunk of the usbip URB
+///        byte stream, opaque to the server (bidirectional)
+///   0x34 UsbError (S->C): JSON {token, error}
 
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +73,19 @@ pub const MSG_PING: u8 = 0x24;
 pub const MSG_REQUEST_ADD_MONITOR: u8 = 0x29;
 /// Client asks the server to unplug the last virtual monitor.
 pub const MSG_REQUEST_REMOVE_MONITOR: u8 = 0x2a;
+
+/// Client offers a USB device for forwarding. JSON payload ([`UsbAttachRequest`]).
+pub const MSG_USB_ATTACH: u8 = 0x30;
+/// Server attached the device to a vhci port. JSON {token, port}.
+pub const MSG_USB_ATTACHED: u8 = 0x31;
+/// Tear down a forwarded device. [token: u32 LE]. Bidirectional.
+pub const MSG_USB_DETACH: u8 = 0x32;
+/// A chunk of a device's usbip URB byte stream. [token: u32 LE][bytes...].
+/// Bidirectional; the server pumps it verbatim between the client and the
+/// kernel's vhci socket.
+pub const MSG_USB_DATA: u8 = 0x33;
+/// Attach failed. JSON {token, error}.
+pub const MSG_USB_ERROR: u8 = 0x34;
 
 pub fn encode_clipboard_data(text: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(1 + text.len());
@@ -113,6 +135,23 @@ pub struct ClientCaps {
     /// Client's native monitor height in pixels (0 = unknown).
     #[serde(default)]
     pub height: u32,
+}
+
+/// A client-side USB device offered for forwarding (MSG_USB_ATTACH).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsbAttachRequest {
+    /// Client-chosen id for this device, echoed in every related message.
+    pub token: u32,
+    pub vendor_id: u16,
+    pub product_id: u16,
+    /// Bus/device number on the client, combined into the usbip devid.
+    pub busnum: u32,
+    pub devnum: u32,
+    /// Kernel usb_device_speed value (1=low, 2=full, 3=high, 5=super, 6=super+).
+    pub speed: u32,
+    /// Human-readable device name, for logs only.
+    #[serde(default)]
+    pub product: String,
 }
 
 /// Periodic feedback from a client, used for adaptive bitrate.
@@ -189,6 +228,41 @@ pub fn encode_monitor_layout(layout: &MonitorLayout) -> Vec<u8> {
     buf
 }
 
+/// Confirm a USB attach: the device now sits on this vhci port.
+pub fn encode_usb_attached(token: u32, port: u32) -> Vec<u8> {
+    let json = serde_json::to_vec(&serde_json::json!({ "token": token, "port": port })).unwrap();
+    let mut buf = Vec::with_capacity(1 + json.len());
+    buf.push(MSG_USB_ATTACHED);
+    buf.extend_from_slice(&json);
+    buf
+}
+
+/// Report a failed USB attach back to the offering client.
+pub fn encode_usb_error(token: u32, error: &str) -> Vec<u8> {
+    let json = serde_json::to_vec(&serde_json::json!({ "token": token, "error": error })).unwrap();
+    let mut buf = Vec::with_capacity(1 + json.len());
+    buf.push(MSG_USB_ERROR);
+    buf.extend_from_slice(&json);
+    buf
+}
+
+/// Encode a chunk of a forwarded device's usbip byte stream.
+pub fn encode_usb_data(token: u32, data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(5 + data.len());
+    buf.push(MSG_USB_DATA);
+    buf.extend_from_slice(&token.to_le_bytes());
+    buf.extend_from_slice(data);
+    buf
+}
+
+/// Tear down a forwarded device.
+pub fn encode_usb_detach(token: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(5);
+    buf.push(MSG_USB_DETACH);
+    buf.extend_from_slice(&token.to_le_bytes());
+    buf
+}
+
 /// Encode session info as a JSON message.
 pub fn encode_session_info(info: &SessionInfo) -> Vec<u8> {
     let json = serde_json::to_vec(info).unwrap();
@@ -224,6 +298,12 @@ pub enum ClientEvent {
     RequestAddMonitor,
     /// Unplug the last virtual monitor (handled by the transport).
     RequestRemoveMonitor,
+    /// Offer a client-side USB device (handled by the transport, never injected).
+    UsbAttach(UsbAttachRequest),
+    /// A chunk of a forwarded device's usbip stream (handled by the transport).
+    UsbData { token: u32, data: Vec<u8> },
+    /// Tear down a forwarded device (handled by the transport).
+    UsbDetach { token: u32 },
 }
 
 /// Parse a binary message from the client.
@@ -282,6 +362,18 @@ pub fn parse_client_message(data: &[u8]) -> Option<ClientEvent> {
         MSG_PING => Some(ClientEvent::Ping { payload: data.to_vec() }),
         MSG_REQUEST_ADD_MONITOR => Some(ClientEvent::RequestAddMonitor),
         MSG_REQUEST_REMOVE_MONITOR => Some(ClientEvent::RequestRemoveMonitor),
+        MSG_USB_ATTACH => {
+            let req = serde_json::from_slice::<UsbAttachRequest>(data.get(1..)?).ok()?;
+            Some(ClientEvent::UsbAttach(req))
+        }
+        MSG_USB_DATA if data.len() >= 5 => {
+            let token = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+            Some(ClientEvent::UsbData { token, data: data[5..].to_vec() })
+        }
+        MSG_USB_DETACH if data.len() >= 5 => {
+            let token = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+            Some(ClientEvent::UsbDetach { token })
+        }
         _ => None,
     }
 }

@@ -1,6 +1,6 @@
 # ddisplay
 
-ddisplay captures a Linux desktop session and streams it to remote clients with low latency. Encoding runs on the GPU through NVENC (H.264 or AV1) and falls back to OpenH264 in software. Input and clipboard sync both ways, and files transfer in either direction.
+ddisplay captures a Linux desktop session and streams it to remote clients with low latency. Encoding runs on the GPU through NVENC (H.264 or AV1) and falls back to OpenH264 in software. Input and clipboard sync both ways, and files transfer in either direction. Client USB devices can be forwarded into the session KVM-style over usbip (see `docs/usb-forwarding.md`).
 
 > Status: pre-alpha (`0.1.0-prealpha`). Protocol and CLI change without notice.
 
@@ -41,6 +41,7 @@ The web client is served at `http://<host>:9550`. Without `--display` the server
 | `--backend` | `auto` | `auto` / `x11` / `wayland` / `portal` |
 | `--resize-to-client` | `true` | Match the X display to the client size |
 | `--shared-dir <dir>` | none | Serve a folder over HTTP |
+| `--allow-usb` | off | Accept forwarded client USB devices (no auth, see `docs/usb-forwarding.md`) |
 
 `--help` lists the rest.
 

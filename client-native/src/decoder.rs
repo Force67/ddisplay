@@ -1,5 +1,4 @@
 /// Video decoder supporting H.264 (OpenH264) and AV1 (rav1d).
-
 use anyhow::{Context, Result};
 use openh264::decoder::Decoder;
 use openh264::formats::YUVSource;
@@ -7,17 +6,50 @@ use openh264::formats::YUVSource;
 // dav1d uses POSIX errno values even on Windows
 const DAV1D_EAGAIN: i32 = -11;
 
+/// Per-window decoder configuration. On Windows the renderer contributes its
+/// actual DX12 adapter identity so MF decode and presentation share one GPU.
+#[derive(Clone)]
+pub struct DecoderOptions {
+    hardware: (bool, bool),
+    #[cfg(windows)]
+    dx12: Option<crate::dx12_interop::Dx12DecodeConfig>,
+}
+
+impl DecoderOptions {
+    pub fn new(hardware: (bool, bool)) -> Self {
+        Self {
+            hardware,
+            #[cfg(windows)]
+            dx12: None,
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn with_dx12(mut self, config: Option<crate::dx12_interop::Dx12DecodeConfig>) -> Self {
+        self.dx12 = config;
+        self
+    }
+
+    fn try_hardware(&self, codec: &str) -> bool {
+        if codec == "av1" {
+            self.hardware.1
+        } else {
+            self.hardware.0
+        }
+    }
+}
+
 fn dav1d_strerror(code: i32) -> &'static str {
     match code {
         -11 => "EAGAIN",
         -12 => "ENOMEM",
         -22 => "EINVAL",
-        -5  => "EIO",
+        -5 => "EIO",
         -28 => "ENOSPC",
         -16 => "EBUSY",
-        -2  => "ENOENT",
+        -2 => "ENOENT",
         -32 => "EPIPE",
-        _   => "?",
+        _ => "?",
     }
 }
 
@@ -33,7 +65,10 @@ fn obu_type_name(first_byte: u8) -> &'static str {
         7 => "REDUNDANT_FRAME_HEADER",
         8 => "TILE_LIST",
         15 => "PADDING",
-        n  => { let _ = n; "RESERVED" },
+        n => {
+            let _ = n;
+            "RESERVED"
+        }
     }
 }
 
@@ -75,12 +110,17 @@ pub enum PlaneStorage {
         uv: Vec<u8>,
         stride: usize,
     },
+    /// D3D11 decode output copied into a shared texture and imported by DX12.
+    #[cfg(windows)]
+    Dx12(crate::dx12_interop::SharedNv12Frame),
 }
 
 impl DecodedFrame {
     pub fn format(&self) -> FrameFormat {
         match &self.storage {
             PlaneStorage::Nv12 { .. } => FrameFormat::Nv12,
+            #[cfg(windows)]
+            PlaneStorage::Dx12(_) => FrameFormat::Nv12,
             _ => FrameFormat::I420,
         }
     }
@@ -91,6 +131,8 @@ impl DecodedFrame {
             PlaneStorage::Packed { y, .. } => (y, self.width as usize),
             PlaneStorage::Dav1d(g) => (g.y(), g.y_stride),
             PlaneStorage::Nv12 { y, stride, .. } => (y, *stride),
+            #[cfg(windows)]
+            PlaneStorage::Dx12(_) => unreachable!("DX12 frames have no CPU planes"),
         }
     }
 
@@ -99,6 +141,8 @@ impl DecodedFrame {
             PlaneStorage::Packed { u, .. } => (u, (self.width as usize).div_ceil(2)),
             PlaneStorage::Dav1d(g) => (g.u(), g.uv_stride),
             PlaneStorage::Nv12 { .. } => unreachable!("use uv_plane() for NV12"),
+            #[cfg(windows)]
+            PlaneStorage::Dx12(_) => unreachable!("DX12 frames have no CPU planes"),
         }
     }
 
@@ -107,6 +151,8 @@ impl DecodedFrame {
             PlaneStorage::Packed { v, .. } => (v, (self.width as usize).div_ceil(2)),
             PlaneStorage::Dav1d(g) => (g.v(), g.uv_stride),
             PlaneStorage::Nv12 { .. } => unreachable!("use uv_plane() for NV12"),
+            #[cfg(windows)]
+            PlaneStorage::Dx12(_) => unreachable!("DX12 frames have no CPU planes"),
         }
     }
 
@@ -114,6 +160,8 @@ impl DecodedFrame {
     pub fn uv_plane(&self) -> (&[u8], usize) {
         match &self.storage {
             PlaneStorage::Nv12 { uv, stride, .. } => (uv, *stride),
+            #[cfg(windows)]
+            PlaneStorage::Dx12(_) => unreachable!("DX12 frames have no CPU planes"),
             _ => unreachable!("uv_plane() is NV12-only"),
         }
     }
@@ -160,7 +208,8 @@ fn pack_plane(src: &[u8], src_stride: usize, w: usize, h: usize) -> Vec<u8> {
         out.copy_from_slice(&src[..w * h]);
     } else {
         for row in 0..h {
-            out[row * w..(row + 1) * w].copy_from_slice(&src[row * src_stride..row * src_stride + w]);
+            out[row * w..(row + 1) * w]
+                .copy_from_slice(&src[row * src_stride..row * src_stride + w]);
         }
     }
     out
@@ -178,10 +227,11 @@ impl VideoDecoder {
     /// Build a decoder for `codec`. When `try_hw` is set (the startup probe
     /// found a GPU decode block for this codec), the hardware path is tried
     /// first and any init failure falls back to software with a log line.
-    pub fn for_codec(codec: &str, try_hw: bool) -> Result<Self> {
+    pub fn for_codec(codec: &str, options: &DecoderOptions) -> Result<Self> {
+        let try_hw = options.try_hardware(codec);
         #[cfg(windows)]
         if try_hw {
-            match crate::decoder_mf::MfHwDecoder::new(codec) {
+            match crate::decoder_mf::MfHwDecoder::new(codec, options.dx12) {
                 Ok(d) => return Ok(Self::Mf(d)),
                 Err(e) => {
                     eprintln!(
@@ -252,7 +302,9 @@ impl H264Decoder {
     }
 
     pub fn decode(&mut self, data: &[u8]) -> Result<Option<DecodedFrame>> {
-        let maybe_yuv = self.decoder.decode(data)
+        let maybe_yuv = self
+            .decoder
+            .decode(data)
             .map_err(|e| anyhow::anyhow!("OpenH264 decode error: {:?}", e))?;
 
         let yuv = match maybe_yuv {
@@ -261,7 +313,9 @@ impl H264Decoder {
         };
 
         let (w, h) = yuv.dimensions();
-        if w == 0 || h == 0 { return Ok(None); }
+        if w == 0 || h == 0 {
+            return Ok(None);
+        }
 
         let (ys, us, vs) = yuv.strides();
         let cw = w.div_ceil(2);
@@ -288,11 +342,10 @@ impl H264Decoder {
 // not the 8-byte pointer C expects.  We use *mut c_void for the opaque handle.
 // -
 
-use std::ffi::c_void;
-use std::ptr::NonNull;
-use rav1d::include::dav1d::dav1d::Dav1dSettings;
 use rav1d::include::dav1d::data::Dav1dData;
+use rav1d::include::dav1d::dav1d::Dav1dSettings;
 use rav1d::include::dav1d::picture::Dav1dPicture;
+use std::ffi::c_void;
 
 /// Low-latency decoder settings.
 ///
@@ -303,7 +356,9 @@ use rav1d::include::dav1d::picture::Dav1dPicture;
 /// in_cdf.try_write().unwrap() panic in a nounwind function).
 /// Override for experiments via DDISPLAY_AV1_THREADS / DDISPLAY_AV1_DELAY.
 fn apply_low_latency_settings(settings: &mut Dav1dSettings) {
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     let threads = std::env::var("DDISPLAY_AV1_THREADS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -395,8 +450,13 @@ impl Av1Decoder {
         if verbose {
             let n = data.len().min(16);
             let hex: Vec<String> = data[..n].iter().map(|b| format!("{:02x}", b)).collect();
-            eprintln!("[av1] >> frame #{}: {} bytes  first_obu={} hdr=[{}]",
-                self.frames_in, data.len(), obu_type_name(data[0]), hex.join(" "));
+            eprintln!(
+                "[av1] >> frame #{}: {} bytes  first_obu={} hdr=[{}]",
+                self.frames_in,
+                data.len(),
+                obu_type_name(data[0]),
+                hex.join(" ")
+            );
         }
 
         unsafe {
@@ -413,24 +473,35 @@ impl Av1Decoder {
                 let send_rc = dav1d_send_data(self.ctx, &mut dav1d_data);
                 match send_rc {
                     0 => {
-                        if verbose { eprintln!("[av1]   send_data OK"); }
+                        if verbose {
+                            eprintln!("[av1]   send_data OK");
+                        }
                         break;
                     }
                     DAV1D_EAGAIN => {
                         self.send_eagain += 1;
                         if verbose || self.send_eagain <= 3 {
-                            eprintln!("[av1]   send_data EAGAIN #{} (draining before retry)", self.send_eagain);
+                            eprintln!(
+                                "[av1]   send_data EAGAIN #{} (draining before retry)",
+                                self.send_eagain
+                            );
                         }
                         // Drain all available pictures so dav1d frees internal buffers.
                         self.drain_pictures(verbose);
                         // dav1d consumed part of the data; if sz == 0 we're done.
-                        if dav1d_data.sz == 0 { break; }
+                        if dav1d_data.sz == 0 {
+                            break;
+                        }
                     }
                     rc => {
                         dav1d_data_unref(&mut dav1d_data);
                         self.decode_errors += 1;
-                        anyhow::bail!("dav1d_send_data error {} ({}) on frame #{}",
-                            rc, dav1d_strerror(rc), self.frames_in);
+                        anyhow::bail!(
+                            "dav1d_send_data error {} ({}) on frame #{}",
+                            rc,
+                            dav1d_strerror(rc),
+                            self.frames_in
+                        );
                     }
                 }
             }
@@ -454,8 +525,10 @@ impl Av1Decoder {
                     let w = pic.p.w as usize;
                     let h = pic.p.h as usize;
                     if verbose {
-                        eprintln!("[av1]   get_picture OK → {}x{}  strides Y={} UV={}",
-                            w, h, pic.stride[0], pic.stride[1]);
+                        eprintln!(
+                            "[av1]   get_picture OK → {}x{}  strides Y={} UV={}",
+                            w, h, pic.stride[0], pic.stride[1]
+                        );
                     }
 
                     if w == 0 || h == 0 {
@@ -495,9 +568,14 @@ impl Av1Decoder {
                     self.consecutive_errors = 0;
 
                     if self.frames_out % 300 == 0 {
-                        eprintln!("[av1] stats: in={} out={} send_eagain={} get_eagain={} errors={}",
-                            self.frames_in, self.frames_out,
-                            self.send_eagain, self.get_eagain, self.decode_errors);
+                        eprintln!(
+                            "[av1] stats: in={} out={} send_eagain={} get_eagain={} errors={}",
+                            self.frames_in,
+                            self.frames_out,
+                            self.send_eagain,
+                            self.get_eagain,
+                            self.decode_errors
+                        );
                     }
 
                     self.last_frame = Some(frame);
@@ -510,12 +588,18 @@ impl Av1Decoder {
                 _ => {
                     self.decode_errors += 1;
                     self.consecutive_errors += 1;
-                    eprintln!("[av1]   get_picture ERROR {} ({}) on frame #{}",
-                        rc, dav1d_strerror(rc), self.frames_in);
+                    eprintln!(
+                        "[av1]   get_picture ERROR {} ({}) on frame #{}",
+                        rc,
+                        dav1d_strerror(rc),
+                        self.frames_in
+                    );
 
                     if self.consecutive_errors >= 3 {
-                        eprintln!("[av1] decoder stuck after {} consecutive errors — reinitialising",
-                            self.consecutive_errors);
+                        eprintln!(
+                            "[av1] decoder stuck after {} consecutive errors — reinitialising",
+                            self.consecutive_errors
+                        );
                         dav1d_close(&mut self.ctx);
 
                         let mut settings: Dav1dSettings = std::mem::zeroed();
@@ -527,7 +611,9 @@ impl Av1Decoder {
                             self.ctx = new_ctx;
                             self.consecutive_errors = 0;
                             self.needs_keyframe = true;
-                            eprintln!("[av1] decoder reinitialised — requesting keyframe from server");
+                            eprintln!(
+                                "[av1] decoder reinitialised — requesting keyframe from server"
+                            );
                         } else {
                             eprintln!("[av1] FATAL: failed to reopen dav1d after reset: {}", rc2);
                         }
@@ -542,8 +628,9 @@ impl Av1Decoder {
 impl Drop for Av1Decoder {
     fn drop(&mut self) {
         unsafe { dav1d_close(&mut self.ctx) };
-        eprintln!("[av1] decoder closed (in={} out={} errors={})",
-            self.frames_in, self.frames_out, self.decode_errors);
+        eprintln!(
+            "[av1] decoder closed (in={} out={} errors={})",
+            self.frames_in, self.frames_out, self.decode_errors
+        );
     }
 }
-

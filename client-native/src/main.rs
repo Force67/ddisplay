@@ -16,22 +16,25 @@ use winit::event::{DeviceEvent, DeviceId, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-mod protocol;
-mod transport;
-mod decoder;
+mod clipboard;
 mod decode_pipeline;
+mod decoder;
 #[cfg(windows)]
 mod decoder_mf;
-mod renderer;
-mod input;
-mod clipboard;
-mod overlay;
+#[cfg(windows)]
+mod dx12_interop;
 mod files;
+mod input;
+mod overlay;
+mod protocol;
+mod renderer;
+mod transport;
 mod usb;
 
 use overlay::{OverlayAction, OverlayState};
 
 use decode_pipeline::DecodePipeline;
+use decoder::DecoderOptions;
 use protocol::ServerMessage;
 use transport::TransportEvent;
 
@@ -117,22 +120,44 @@ struct MonitorWindow {
     window: Arc<Window>,
     renderer: renderer::Renderer,
     decode: DecodePipeline,
+    hw_decode: (bool, bool),
     input: input::InputState,
     /// False while minimized/occluded — decode and render are skipped then.
     visible: bool,
+}
+
+fn decoder_options(renderer: &renderer::Renderer, hardware: (bool, bool)) -> DecoderOptions {
+    let options = DecoderOptions::new(hardware);
+    #[cfg(windows)]
+    let options = options.with_dx12(renderer.dx12_decode_config());
+    #[cfg(not(windows))]
+    let _ = renderer;
+    options
+}
+
+fn hardware_for_renderer(renderer: &renderer::Renderer, fallback: (bool, bool)) -> (bool, bool) {
+    #[cfg(windows)]
+    if let Some(config) = renderer.dx12_decode_config() {
+        return decoder_mf::probe_adapter(config);
+    }
+    let _ = renderer;
+    fallback
 }
 
 impl MonitorWindow {
     /// Point this window at a (possibly different) head: retitle it, and when
     /// the head actually changed, restart the decoder on the new stream and
     /// ask that stream for an IDR to sync onto.
-    fn assign_head(&mut self, head: &MonitorInfo, title: &str, codec: &str, hw: (bool, bool)) {
+    fn assign_head(&mut self, head: &MonitorInfo, title: &str, codec: &str) {
         let id = head.id as u8;
         if self.id != id {
             self.id = id;
-            self.window.set_title(&format!("{} (monitor {})", title, head.id + 1));
-            self.decode = DecodePipeline::new(codec, hw);
-            self.input.send_raw(protocol::encode_request_keyframe_head(id));
+            self.window
+                .set_title(&format!("{} (monitor {})", title, head.id + 1));
+            self.decode =
+                DecodePipeline::new(codec, decoder_options(&self.renderer, self.hw_decode));
+            self.input
+                .send_raw(protocol::encode_request_keyframe_head(id));
         }
         self.input.set_remote_size(head.width, head.height);
         self.input.set_remote_offset(head.x, head.y);
@@ -222,7 +247,11 @@ impl ApplicationHandler for App {
             attrs.with_drag_and_drop(false)
         };
 
-        let window = Arc::new(event_loop.create_window(attrs).expect("Failed to create window"));
+        let window = Arc::new(
+            event_loop
+                .create_window(attrs)
+                .expect("Failed to create window"),
+        );
 
         eprintln!("[init] Initializing GPU renderer...");
 
@@ -235,19 +264,28 @@ impl ApplicationHandler for App {
                 return;
             }
         };
+        self.hw_decode = hardware_for_renderer(&renderer, self.hw_decode);
 
         eprintln!("[init] Initializing decoder...");
 
         // Determine startup codec: honour --force-codec if provided.
-        let startup_codec = self.args.force_codec
+        let startup_codec = self
+            .args
+            .force_codec
             .as_deref()
             .unwrap_or("h264")
             .to_lowercase();
         if let Some(ref fc) = self.args.force_codec {
-            eprintln!("[init] --force-codec={} (server SessionInfo codec will be IGNORED)", fc);
+            eprintln!(
+                "[init] --force-codec={} (server SessionInfo codec will be IGNORED)",
+                fc
+            );
         }
 
-        self.decode = Some(DecodePipeline::new(&startup_codec, self.hw_decode));
+        self.decode = Some(DecodePipeline::new(
+            &startup_codec,
+            decoder_options(&renderer, self.hw_decode),
+        ));
         self.codec = startup_codec;
 
         eprintln!("[init] Connecting to ws://{}...", self.args.server());
@@ -335,17 +373,24 @@ impl ApplicationHandler for App {
                     }
                 }
             }
-            WindowEvent::KeyboardInput { event: ref key_event, .. } => {
+            WindowEvent::KeyboardInput {
+                event: ref key_event,
+                ..
+            } => {
                 // F2 toggles overlay (not forwarded to server)
                 if key_event.state == winit::event::ElementState::Pressed {
-                    if let winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::F2) = key_event.physical_key {
+                    if let winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::F2) =
+                        key_event.physical_key
+                    {
                         if let Some(overlay) = &mut self.overlay {
                             overlay.visible = !overlay.visible;
                             return;
                         }
                     }
                     // F3 toggles the stats HUD (latency/fps/bandwidth histograms)
-                    if let winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::F3) = key_event.physical_key {
+                    if let winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::F3) =
+                        key_event.physical_key
+                    {
                         if let Some(overlay) = &mut self.overlay {
                             overlay.stats_visible = !overlay.stats_visible;
                             return;
@@ -478,14 +523,19 @@ impl ApplicationHandler for App {
 
         // If a head's decoder reset itself, ask its stream (and only its
         // stream) for a fresh keyframe.
-        if self.decode.as_ref().map_or(false, |d| d.take_needs_keyframe()) {
+        if self
+            .decode
+            .as_ref()
+            .map_or(false, |d| d.take_needs_keyframe())
+        {
             if let Some(input) = &self.input_state {
                 input.send_raw(protocol::encode_request_keyframe_head(0));
             }
         }
         for sec in &self.extras {
             if sec.decode.take_needs_keyframe() {
-                sec.input.send_raw(protocol::encode_request_keyframe_head(sec.id));
+                sec.input
+                    .send_raw(protocol::encode_request_keyframe_head(sec.id));
             }
         }
 
@@ -561,7 +611,12 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn device_event(&mut self, _event_loop: &ActiveEventLoop, _device_id: DeviceId, _event: DeviceEvent) {
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        _event: DeviceEvent,
+    ) {
         // Could use raw mouse motion here for pointer-lock mode later
     }
 }
@@ -616,8 +671,7 @@ impl App {
                         input.send_raw(protocol::encode_client_caps(&codecs, mon_w, mon_h));
                     }
                     // Auto-upload --share-dir contents to the server's shared folder.
-                    if let (Some(dir), Some(files)) =
-                        (&self.args.share_dir, &mut self.files_state)
+                    if let (Some(dir), Some(files)) = (&self.args.share_dir, &mut self.files_state)
                     {
                         files.upload_dir(dir.clone());
                     }
@@ -656,10 +710,16 @@ impl App {
 
                 // Log first 5 frames + occasional status; suppress per-frame spam after priming.
                 if self.frame_count <= 5 || self.frame_count % 300 == 0 {
-                    eprintln!("[frame #{}] kf={} pts={} data_bytes={} dim={}x{}  codec={}",
-                        self.frame_count, frame.keyframe, frame.pts,
-                        frame.data.len(), frame.width, frame.height,
-                        self.codec);
+                    eprintln!(
+                        "[frame #{}] kf={} pts={} data_bytes={} dim={}x{}  codec={}",
+                        self.frame_count,
+                        frame.keyframe,
+                        frame.pts,
+                        frame.data.len(),
+                        frame.width,
+                        frame.height,
+                        self.codec
+                    );
                 }
 
                 // Feed the primary head's decode pipeline. Skip only when the
@@ -683,19 +743,27 @@ impl App {
                 eprintln!("[session] raw JSON: {}", raw);
 
                 if let Ok(info) = serde_json::from_slice::<SessionInfo>(json_bytes) {
-                    eprintln!("[session] parsed: codec={} {}x{} @ {} fps",
-                        info.codec, info.width, info.height, info.fps);
+                    eprintln!(
+                        "[session] parsed: codec={} {}x{} @ {} fps",
+                        info.codec, info.width, info.height, info.fps
+                    );
 
                     self.session_fps = info.fps;
 
                     // --force-codec wins over server-sent codec.
                     if self.args.force_codec.is_some() {
-                        eprintln!("[session] --force-codec active — ignoring server codec '{}'", info.codec);
+                        eprintln!(
+                            "[session] --force-codec active — ignoring server codec '{}'",
+                            info.codec
+                        );
                         return;
                     }
 
                     if !info.codec.is_empty() && info.codec != self.codec {
-                        eprintln!("[session] switching decoder: {} -> {}", self.codec, info.codec);
+                        eprintln!(
+                            "[session] switching decoder: {} -> {}",
+                            self.codec, info.codec
+                        );
                         if let Some(decode) = &mut self.decode {
                             decode.set_codec(&info.codec);
                         }
@@ -730,9 +798,7 @@ impl App {
             }
             ServerMessage::MonitorFrame(frame) => {
                 // (Wire bytes were already counted above, like every message.)
-                if let Some(sec) =
-                    self.extras.iter_mut().find(|s| s.id == frame.monitor_id)
-                {
+                if let Some(sec) = self.extras.iter_mut().find(|s| s.id == frame.monitor_id) {
                     if !sec.visible {
                         return;
                     }
@@ -810,7 +876,10 @@ impl App {
 
         let target = self.monitors.len() - 1;
         if self.extras.len() > target {
-            eprintln!("[monitor] closing {} extra window(s)", self.extras.len() - target);
+            eprintln!(
+                "[monitor] closing {} extra window(s)",
+                self.extras.len() - target
+            );
             self.extras.truncate(target);
         }
         for i in 0..target {
@@ -820,13 +889,16 @@ impl App {
                 match self.create_extra(event_loop, &head) {
                     Ok(sec) => self.extras.push(sec),
                     Err(e) => {
-                        eprintln!("[monitor] failed to open window for head {}: {e:#}", head.id);
+                        eprintln!(
+                            "[monitor] failed to open window for head {}: {e:#}",
+                            head.id
+                        );
                         break;
                     }
                 }
             }
-            let (title, codec, hw) = (self.args.title.clone(), self.codec.clone(), self.hw_decode);
-            self.extras[i].assign_head(&head, &title, &codec, hw);
+            let (title, codec) = (self.args.title.clone(), self.codec.clone());
+            self.extras[i].assign_head(&head, &title, &codec);
         }
     }
 
@@ -855,7 +927,8 @@ impl App {
         // Resized event (which some platforms don't deliver on creation).
         let size = window.inner_size();
         input.set_window_size(size.width, size.height);
-        let decode = DecodePipeline::new(&self.codec, self.hw_decode);
+        let hw_decode = hardware_for_renderer(&renderer, self.hw_decode);
+        let decode = DecodePipeline::new(&self.codec, decoder_options(&renderer, hw_decode));
         // Ask this head's stream for an IDR: the layout-change IDR may have
         // been broadcast before this window (and its fresh decoder) existed.
         input.send_raw(protocol::encode_request_keyframe_head(head.id as u8));
@@ -864,6 +937,7 @@ impl App {
             window,
             renderer,
             decode,
+            hw_decode,
             input,
             visible: true,
         })
@@ -895,7 +969,9 @@ impl App {
             WindowEvent::MouseWheel { delta, .. } => {
                 sec.input.on_scroll(delta);
             }
-            WindowEvent::KeyboardInput { event: key_event, .. } => {
+            WindowEvent::KeyboardInput {
+                event: key_event, ..
+            } => {
                 sec.input.on_key(key_event.physical_key, key_event.state);
             }
             WindowEvent::Focused(false) => {
@@ -907,7 +983,8 @@ impl App {
                 // Frames were skipped while hidden, so the decoder needs a
                 // fresh IDR to sync back onto the stream.
                 if sec.visible && !was_visible {
-                    sec.input.send_raw(protocol::encode_request_keyframe_head(sec.id));
+                    sec.input
+                        .send_raw(protocol::encode_request_keyframe_head(sec.id));
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -918,7 +995,6 @@ impl App {
             _ => {}
         }
     }
-
 }
 
 fn main() {

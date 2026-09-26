@@ -4,8 +4,8 @@
 //! QuickSync / VCN) — the same path Moonlight uses. Flow:
 //!
 //!   Annex-B / OBU packet → IMFSample → decoder MFT (D3D11-bound, low
-//!   latency) → NV12 ID3D11Texture2D → staging copy → CPU NV12 planes →
-//!   wgpu NV12 textures (YUV→RGB stays on the GPU in the fragment shader).
+//!   latency) → NV12 ID3D11Texture2D → shared NV12 ring → DX12 sampling.
+//!   The staging/CPU upload path remains as a compatibility fallback.
 //!
 //! `probe()` checks the actual D3D11 video decoder profiles so we only
 //! report hardware support when the GPU truly has the codec block —
@@ -14,29 +14,32 @@
 
 use anyhow::{bail, Context, Result};
 use windows::core::Interface;
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread,
-    ID3D11Texture2D, ID3D11VideoDevice, D3D11_CPU_ACCESS_READ,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-    D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
+    ID3D11VideoDevice, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_NV12, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::{
+    CreateDXGIFactory2, IDXGIAdapter, IDXGIFactory4, DXGI_CREATE_FACTORY_FLAGS,
+};
 use windows::Win32::Media::MediaFoundation::{
-    IMFActivate, IMFDXGIBuffer, IMFDXGIDeviceManager, IMFMediaType, IMFSample,
-    IMFTransform, MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateMemoryBuffer,
-    MFCreateSample, MFMediaType_Video, MFStartup, MFTEnumEx, MFSTARTUP_FULL,
-    MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT,
-    MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER,
-    MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
-    MFT_REGISTER_TYPE_INFO, MFVideoFormat_AV1, MFVideoFormat_H264, MFVideoFormat_NV12,
-    MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE,
-    MF_LOW_LATENCY, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
+    IMFActivate, IMFDXGIBuffer, IMFDXGIDeviceManager, IMFMediaType, IMFSample, IMFTransform,
+    MFCreateDXGIDeviceManager, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
+    MFMediaType_Video, MFStartup, MFTEnumEx, MFVideoFormat_AV1, MFVideoFormat_H264,
+    MFVideoFormat_NV12, MFSTARTUP_FULL, MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_SORTANDFILTER,
+    MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
+    MFT_OUTPUT_STREAM_PROVIDES_SAMPLES, MFT_REGISTER_TYPE_INFO, MF_E_NOTACCEPTING,
+    MF_E_TRANSFORM_NEED_MORE_INPUT, MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY, MF_MT_FRAME_SIZE,
+    MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
 };
 use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_MULTITHREADED};
 
 use crate::decoder::{DecodedFrame, PlaneStorage};
+use crate::dx12_interop::{Dx12DecodeConfig, SharedNv12Producer};
 
 /// D3D11 video decoder profile GUIDs (dxva.h) — presence means the GPU has
 /// a hardware decode block for the codec.
@@ -57,13 +60,31 @@ fn ensure_mf_initialized() -> Result<()> {
     Ok(())
 }
 
-fn create_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
+fn create_d3d11_device(
+    dx12: Option<Dx12DecodeConfig>,
+) -> Result<(ID3D11Device, ID3D11DeviceContext)> {
     unsafe {
+        let adapter: Option<IDXGIAdapter> = if let Some(config) = dx12 {
+            let factory: IDXGIFactory4 =
+                CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).context("CreateDXGIFactory2")?;
+            Some(
+                factory
+                    .EnumAdapterByLuid(config.luid())
+                    .context("find the renderer's DX12 adapter for D3D11 decode")?,
+            )
+        } else {
+            None
+        };
+        let driver_type = if adapter.is_some() {
+            D3D_DRIVER_TYPE_UNKNOWN
+        } else {
+            D3D_DRIVER_TYPE_HARDWARE
+        };
         let mut device: Option<ID3D11Device> = None;
         let mut context: Option<ID3D11DeviceContext> = None;
         D3D11CreateDevice(
-            None,
-            D3D_DRIVER_TYPE_HARDWARE,
+            adapter.as_ref(),
+            driver_type,
             windows::Win32::Foundation::HMODULE::default(),
             D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
             None,
@@ -90,7 +111,11 @@ fn gpu_has_profile(device: &ID3D11Device, profile: &windows::core::GUID) -> bool
         };
         let count = video.GetVideoDecoderProfileCount();
         for i in 0..count {
-            if video.GetVideoDecoderProfile(i).map(|g| g == *profile).unwrap_or(false) {
+            if video
+                .GetVideoDecoderProfile(i)
+                .map(|g| g == *profile)
+                .unwrap_or(false)
+            {
                 return true;
             }
         }
@@ -149,6 +174,9 @@ pub struct MfHwDecoder {
     provides_samples: bool,
     /// Staging texture sized to the decoder's (aligned) output texture.
     staging: Option<(ID3D11Texture2D, u32, u32)>,
+    dx12_config: Option<Dx12DecodeConfig>,
+    shared_nv12: Option<SharedNv12Producer>,
+    shared_nv12_disabled: bool,
     /// Display dimensions from the negotiated output type.
     width: u32,
     height: u32,
@@ -162,7 +190,7 @@ pub struct MfHwDecoder {
 unsafe impl Send for MfHwDecoder {}
 
 impl MfHwDecoder {
-    pub fn new(codec: &str) -> Result<Self> {
+    pub fn new(codec: &str, dx12_config: Option<Dx12DecodeConfig>) -> Result<Self> {
         ensure_mf_initialized()?;
 
         let (subtype, profile) = match codec {
@@ -170,7 +198,7 @@ impl MfHwDecoder {
             _ => (MFVideoFormat_H264, PROFILE_H264_VLD_NOFGT),
         };
 
-        let (device, context) = create_d3d11_device()?;
+        let (device, context) = create_d3d11_device(dx12_config)?;
         if !gpu_has_profile(&device, &profile) {
             bail!("GPU has no hardware decode profile for {}", codec);
         }
@@ -186,7 +214,8 @@ impl MfHwDecoder {
             MFCreateDXGIDeviceManager(&mut reset_token, &mut mgr)
                 .context("MFCreateDXGIDeviceManager")?;
             let mgr = mgr.context("no DXGI device manager")?;
-            mgr.ResetDevice(&device, reset_token).context("ResetDevice")?;
+            mgr.ResetDevice(&device, reset_token)
+                .context("ResetDevice")?;
             mft.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, mgr.as_raw() as usize)
                 .context("MFT rejected D3D11 device manager (no DXVA)")?;
 
@@ -208,6 +237,9 @@ impl MfHwDecoder {
                 _dxgi_mgr: mgr,
                 provides_samples: false,
                 staging: None,
+                dx12_config,
+                shared_nv12: None,
+                shared_nv12_disabled: false,
                 width: 0,
                 height: 0,
                 pts: 0,
@@ -259,11 +291,15 @@ impl MfHwDecoder {
                 }
                 i += 1;
             }
-            let info = self.mft.GetOutputStreamInfo(0).context("GetOutputStreamInfo")?;
-            self.provides_samples =
-                info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0;
-            // Old staging texture may be the wrong size now.
+            let info = self
+                .mft
+                .GetOutputStreamInfo(0)
+                .context("GetOutputStreamInfo")?;
+            self.provides_samples = info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 as u32 != 0;
+            // Old output resources may be the wrong size now.
             self.staging = None;
+            self.shared_nv12 = None;
+            self.shared_nv12_disabled = false;
             Ok(())
         }
     }
@@ -325,7 +361,7 @@ impl MfHwDecoder {
                 Ok(()) => {
                     if let Some(sample) = sample {
                         match unsafe { self.read_nv12_sample(&sample) } {
-                            Ok(frame) => {
+                            Ok(Some(frame)) => {
                                 self.frames_out += 1;
                                 if self.frames_out <= 3 || self.frames_out % 600 == 0 {
                                     eprintln!(
@@ -335,6 +371,7 @@ impl MfHwDecoder {
                                 }
                                 *latest = Some(frame);
                             }
+                            Ok(None) => {}
                             Err(e) => eprintln!("[mf-decode] readback failed: {e:#}"),
                         }
                     }
@@ -343,20 +380,16 @@ impl MfHwDecoder {
                 Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
                     self.negotiate_output_type()
                         .context("renegotiate after stream change")?;
-                    eprintln!(
-                        "[mf-decode] stream change → {}x{}",
-                        self.width, self.height
-                    );
+                    eprintln!("[mf-decode] stream change → {}x{}", self.width, self.height);
                 }
                 Err(e) => return Err(e).context("ProcessOutput"),
             }
         }
     }
 
-    /// Copy the decoder's NV12 D3D11 texture through a staging texture into
-    /// CPU-visible planes. (The decode itself already happened on the GPU's
-    /// video block; this is the one unavoidable readback before wgpu upload.)
-    unsafe fn read_nv12_sample(&mut self, sample: &IMFSample) -> Result<DecodedFrame> {
+    /// Move decoder output into the shared DX12 ring when available. The
+    /// staging readback below is retained for unsupported drivers/backends.
+    unsafe fn read_nv12_sample(&mut self, sample: &IMFSample) -> Result<Option<DecodedFrame>> {
         let buffer = unsafe { sample.GetBufferByIndex(0) }.context("GetBufferByIndex")?;
         let dxgi: IMFDXGIBuffer = buffer.cast().context("output is not a D3D11 texture")?;
 
@@ -371,6 +404,54 @@ impl MfHwDecoder {
         let mut src_desc = D3D11_TEXTURE2D_DESC::default();
         unsafe { texture.GetDesc(&mut src_desc) };
         let (aligned_w, aligned_h) = (src_desc.Width, src_desc.Height);
+        let visible_w = if self.width > 0 {
+            self.width.min(aligned_w)
+        } else {
+            aligned_w
+        };
+        let visible_h = if self.height > 0 {
+            self.height.min(aligned_h)
+        } else {
+            aligned_h
+        };
+
+        if self.dx12_config.is_some() && !self.shared_nv12_disabled {
+            let needs_ring = self
+                .shared_nv12
+                .as_ref()
+                .map_or(true, |ring| ring.size() != (aligned_w, aligned_h));
+            if needs_ring {
+                match SharedNv12Producer::new(&self._device, &self.context, aligned_w, aligned_h) {
+                    Ok(ring) => self.shared_nv12 = Some(ring),
+                    Err(e) => {
+                        eprintln!(
+                            "[dx12-video] shared NV12 unavailable ({e:#}); using CPU readback"
+                        );
+                        self.shared_nv12_disabled = true;
+                    }
+                }
+            }
+
+            if let Some(ring) = &mut self.shared_nv12 {
+                match ring.copy_frame(&texture, subresource, visible_w, visible_h) {
+                    Ok(Some(shared)) => {
+                        return Ok(Some(DecodedFrame {
+                            storage: PlaneStorage::Dx12(shared),
+                            width: visible_w,
+                            height: visible_h,
+                        }));
+                    }
+                    Ok(None) => return Ok(None),
+                    Err(e) => {
+                        eprintln!(
+                            "[dx12-video] shared NV12 path failed ({e:#}); using CPU readback"
+                        );
+                        self.shared_nv12 = None;
+                        self.shared_nv12_disabled = true;
+                    }
+                }
+            }
+        }
 
         if self
             .staging
@@ -384,38 +465,38 @@ impl MfHwDecoder {
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: DXGI_FORMAT_NV12,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 Usage: D3D11_USAGE_STAGING,
                 BindFlags: 0,
                 CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
                 MiscFlags: 0,
             };
             let mut staging: Option<ID3D11Texture2D> = None;
-            unsafe { self._device.CreateTexture2D(&desc, None, Some(&mut staging)) }
-                .context("create staging texture")?;
+            unsafe {
+                self._device
+                    .CreateTexture2D(&desc, None, Some(&mut staging))
+            }
+            .context("create staging texture")?;
             self.staging = Some((staging.context("no staging texture")?, aligned_w, aligned_h));
         }
         let (staging, _, _) = self.staging.as_ref().unwrap();
 
         unsafe {
-            self.context.CopySubresourceRegion(
-                staging,
-                0,
-                0,
-                0,
-                0,
-                &texture,
-                subresource,
-                None,
-            );
+            self.context
+                .CopySubresourceRegion(staging, 0, 0, 0, 0, &texture, subresource, None);
         }
 
-        let w = if self.width > 0 { self.width.min(aligned_w) } else { aligned_w };
-        let h = if self.height > 0 { self.height.min(aligned_h) } else { aligned_h };
+        let (w, h) = (visible_w, visible_h);
 
         let mut mapped = windows::Win32::Graphics::Direct3D11::D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe { self.context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
-            .context("map staging texture")?;
+        unsafe {
+            self.context
+                .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+        }
+        .context("map staging texture")?;
         let pitch = mapped.RowPitch as usize;
         let base = mapped.pData as *const u8;
 
@@ -436,11 +517,15 @@ impl MfHwDecoder {
             self.context.Unmap(staging, 0);
         }
 
-        Ok(DecodedFrame {
-            storage: PlaneStorage::Nv12 { y, uv, stride: pitch },
+        Ok(Some(DecodedFrame {
+            storage: PlaneStorage::Nv12 {
+                y,
+                uv,
+                stride: pitch,
+            },
             width: w,
             height: h,
-        })
+        }))
     }
 
     /// Reset the decoder after a corrupt-stream condition; the caller should
@@ -448,7 +533,9 @@ impl MfHwDecoder {
     pub fn flush(&mut self) {
         unsafe {
             let _ = self.mft.ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
-            let _ = self.mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+            let _ = self
+                .mft
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
         }
     }
 }
@@ -456,14 +543,26 @@ impl MfHwDecoder {
 /// Probe hardware decode support: (h264, av1). Cheap — one D3D11 device,
 /// profile enumeration, and an MFT registry lookup per codec.
 pub fn probe() -> (bool, bool) {
-    if std::env::var("DDISPLAY_NO_HWDEC").map(|v| v == "1").unwrap_or(false) {
+    probe_device(None)
+}
+
+/// Probe the same physical adapter selected by a DX12 renderer.
+pub fn probe_adapter(config: Dx12DecodeConfig) -> (bool, bool) {
+    probe_device(Some(config))
+}
+
+fn probe_device(dx12: Option<Dx12DecodeConfig>) -> (bool, bool) {
+    if std::env::var("DDISPLAY_NO_HWDEC")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         eprintln!("[mf-decode] hardware decode disabled by DDISPLAY_NO_HWDEC");
         return (false, false);
     }
     if ensure_mf_initialized().is_err() {
         return (false, false);
     }
-    let Ok((device, _context)) = create_d3d11_device() else {
+    let Ok((device, _context)) = create_d3d11_device(dx12) else {
         eprintln!("[mf-decode] no D3D11 hardware device — software decode");
         return (false, false);
     };

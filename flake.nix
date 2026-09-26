@@ -15,7 +15,15 @@
     flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (
       system:
       let
-        pkgs = import nixpkgs { inherit system; };
+        pkgs = import nixpkgs {
+          inherit system;
+          # The Android SDK is unfree and its license must be accepted; both
+          # are needed to compose the toolchain for the `android` dev shell.
+          config = {
+            allowUnfree = true;
+            android_sdk.accept_license = true;
+          };
+        };
         inherit (pkgs) lib;
 
         # ---- Shared build inputs ----
@@ -139,8 +147,46 @@
           };
         };
 
+        # ---- Android client toolchain ----
+        # Compose the Android SDK so aapt2 and the build-tools are autopatchelf'd
+        # for NixOS (Google's own binaries are FHS-linked and fail otherwise).
+        # Versions match client-android: compileSdk 36, AGP 9.2.1 -> build-tools
+        # 36.0.0. buildToolsVersions must be a superset of what AGP requests.
+        androidComposition = pkgs.androidenv.composeAndroidPackages {
+          platformVersions = [ "36" ];
+          buildToolsVersions = [ "36.0.0" ];
+          platformToolsVersion = "35.0.2";
+          includeEmulator = false;
+          includeSystemImages = false;
+          includeNDK = false;
+        };
+        androidSdk = androidComposition.androidsdk;
+        androidHome = "${androidSdk}/libexec/android-sdk";
+
       in
       {
+        # Toolchain for building and installing the Kotlin/Compose Android client.
+        # Usage: `nix develop .#android` then, from client-android/,
+        #   ./gradlew :app:assembleDebug
+        # ANDROID_HOME and the aapt2 override are exported below, and adb is on PATH.
+        devShells.android = pkgs.mkShell {
+          buildInputs = [
+            pkgs.jdk17
+            androidSdk
+          ];
+
+          ANDROID_HOME = androidHome;
+          ANDROID_SDK_ROOT = androidHome;
+          JAVA_HOME = "${pkgs.jdk17}";
+
+          shellHook = ''
+            # Force AGP to use the patched aapt2 from the composed SDK instead of
+            # downloading its own FHS-linked one (which cannot run on NixOS).
+            export GRADLE_OPTS="-Dandroid.aapt2FromMavenOverride=${androidHome}/build-tools/36.0.0/aapt2 $GRADLE_OPTS"
+            export PATH="${androidHome}/platform-tools:$PATH"
+          '';
+        };
+
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = sharedNativeBuildInputs;
           buildInputs = serverBuildInputs ++ clientBuildInputs;

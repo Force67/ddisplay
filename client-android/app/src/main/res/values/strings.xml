@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ddisplay</string>
+
+    <string name="connect_field_label">Server address</string>
+    <string name="connect_button">Connect</string>
+    <string name="connect_recent">Recent</string>
+    <string name="connect_forget">Remove</string>
+    <string name="connect_invalid">Enter host or host:port</string>
+
+    <string name="mode_trackpad">Trackpad</string>
+    <string name="mode_direct">Direct</string>
+
+    <string name="action_keyboard">Keyboard</string>
+    <string name="action_keys">Keys</string>
+    <string name="action_hud">Stats</string>
+    <string name="action_clipboard">Copy</string>
+    <string name="action_reset_zoom">1x</string>
+    <string name="action_disconnect">Disconnect</string>
+    <string name="action_back">Back</string>
+    <string name="action_retry">Retry</string>
+    <string name="action_cancel">Cancel</string>
+
+    <string name="key_ctrl">Ctrl</string>
+    <string name="key_alt">Alt</string>
+    <string name="key_shift">Shift</string>
+    <string name="key_super">Super</string>
+    <string name="key_fn">Fn</string>
+    <string name="key_esc">Esc</string>
+    <string name="key_tab">Tab</string>
+    <string name="key_del">Del</string>
+    <string name="key_home">Home</string>
+    <string name="key_end">End</string>
+    <string name="key_pgup">PgUp</string>
+    <string name="key_pgdn">PgDn</string>
+
+    <string name="status_connecting">Connecting…</string>
+    <string name="status_disconnected">Disconnected</string>
+
+    <string name="disconnect_title">Disconnect?</string>
+    <string name="disconnect_message">End this session and return to the server list?</string>
+
+    <string name="hud_rtt">rtt %1$s ms</string>
+    <string name="hud_fps">fps %1$s</string>
+    <string name="hud_mbps">%1$s Mbps</string>
+    <string name="hud_decode">dec %1$s ms</string>
+    <string name="hud_dropped">dropped %1$d</string>
+    <string name="hud_codec">codec %1$s</string>
+    <string name="hud_size">%1$d x %2$d</string>
+</resources>

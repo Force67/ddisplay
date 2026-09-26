@@ -2,6 +2,7 @@ package com.ddisplay.app.session
 
 import android.content.res.Resources
 import android.os.SystemClock
+import android.util.Log
 import android.view.Surface
 import com.ddisplay.app.decode.CodecCaps
 import com.ddisplay.app.decode.DecoderEvents
@@ -81,6 +82,8 @@ class RemoteSession(
     private var surface: Surface? = null
     private var codec: String? = null
     private var configuredCodec: String? = null
+    private var configuredWidth = 0
+    private var configuredHeight = 0
     private var sessionWidth = 0
     private var sessionHeight = 0
     private var lastFrameWidth = 0
@@ -88,14 +91,14 @@ class RemoteSession(
 
     // Per-interval counters, reset each tick (consumer-confined).
     private var received = 0
-    private var dropped = 0
     private var bytes = 0L
     private var lastRttMs = 0f
     private var lastTickMs = SystemClock.elapsedRealtime()
 
-    // decode_ms is fed from the decoder's callback thread, so it needs atomics.
+    // Fed from decoder callbacks, so these need atomics.
     private val decodeSumMicros = LongAdder()
     private val decodeCount = LongAdder()
+    private val dropped = LongAdder()
 
     private val displayWidth = Resources.getSystem().displayMetrics.widthPixels
     private val displayHeight = Resources.getSystem().displayMetrics.heightPixels
@@ -108,6 +111,10 @@ class RemoteSession(
         override fun onDecodedFrame(decodeMs: Float) {
             decodeSumMicros.add((decodeMs * 1000f).toLong())
             decodeCount.increment()
+        }
+
+        override fun onFrameDropped() {
+            dropped.increment()
         }
     }
 
@@ -221,12 +228,7 @@ class RemoteSession(
                 lastFrameWidth = msg.width
                 lastFrameHeight = msg.height
                 _remoteSize.value = RemoteSize(msg.width, msg.height)
-                val d = decoder
-                if (d != null) {
-                    d.submit(msg.data, msg.keyframe, msg.pts)
-                } else {
-                    dropped++ // no decoder yet (no surface or codec unknown)
-                }
+                decoder?.submit(msg.data, msg.keyframe, msg.pts)
             }
 
             is ServerMessage.Session -> onSessionInfo(msg.info)
@@ -283,16 +285,27 @@ class RemoteSession(
         val s = surface ?: return
         val c = codec ?: return
         if (c.isEmpty()) return
-        if (decoder != null && configuredCodec == c) return
         val w = if (sessionWidth > 0) sessionWidth else lastFrameWidth
         val h = if (sessionHeight > 0) sessionHeight else lastFrameHeight
         if (w <= 0 || h <= 0) return
+        if (decoder != null && configuredCodec == c && configuredWidth == w && configuredHeight == h) return
 
         decoder?.close()
+        decoder = null
+        configuredCodec = null
         val d = decoderFactory()
-        d.configure(c, w, h, s, decoderEvents)
+        try {
+            d.configure(c, w, h, s, decoderEvents)
+        } catch (e: Exception) {
+            // e.g. the Surface was released under us; a new Surface or SessionInfo retries.
+            Log.w(TAG, "decoder configure failed", e)
+            d.close()
+            return
+        }
         decoder = d
         configuredCodec = c
+        configuredWidth = w
+        configuredHeight = h
         client.send(ProtocolCodec.encodeRequestKeyframe(HEAD_PRIMARY))
     }
 
@@ -302,13 +315,14 @@ class RemoteSession(
         lastTickMs = now
 
         val count = decodeCount.sumThenReset()
+        val droppedNow = dropped.sumThenReset().toInt()
         val sumMicros = decodeSumMicros.sumThenReset()
         val decodeMs = if (count > 0) sumMicros.toFloat() / count / 1000f else 0f
 
         client.send(ProtocolCodec.encodePing(now))
         client.send(
             ProtocolCodec.encodeClientStats(
-                ClientStats(received, dropped, decodeMs, lastRttMs),
+                ClientStats(received, droppedNow, decodeMs, lastRttMs),
             ),
         )
 
@@ -317,11 +331,10 @@ class RemoteSession(
             fps = received / secs,
             mbps = bytes * 8f / 1_000_000f / secs,
             decodeMs = decodeMs,
-            dropped = dropped,
+            dropped = droppedNow,
         )
 
         received = 0
-        dropped = 0
         bytes = 0L
     }
 
@@ -333,16 +346,19 @@ class RemoteSession(
     }
 
     private companion object {
+        const val TAG = "RemoteSession"
         const val DEFAULT_PORT = 9550
         const val HEAD_PRIMARY: Int = 0
 
         fun toWsUrl(input: String): String {
-            val authority = input.trim()
+            val trimmed = input.trim()
+            val scheme = if (trimmed.startsWith("wss://")) "wss" else "ws"
+            val authority = trimmed
                 .removePrefix("ws://")
                 .removePrefix("wss://")
                 .substringBefore('/') // we always target the /ws endpoint
             val withPort = if (authority.contains(':')) authority else "$authority:$DEFAULT_PORT"
-            return "ws://$withPort/ws"
+            return "$scheme://$withPort/ws"
         }
     }
 }

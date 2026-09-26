@@ -23,4 +23,7 @@ interface DecoderEvents {
 
     /** A frame was decoded and presented. [decodeMs] feeds ClientStats. */
     fun onDecodedFrame(decodeMs: Float)
+
+    /** A frame was dropped because the decoder is behind. Feeds ClientStats. */
+    fun onFrameDropped()
 }

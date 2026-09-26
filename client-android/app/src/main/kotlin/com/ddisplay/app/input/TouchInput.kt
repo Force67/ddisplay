@@ -111,13 +111,24 @@ private class GestureHandler(
     private var mouseLeft = false
     private var mouseRight = false
     private var mouseMiddle = false
+    private var touchLeft = false
 
     // Timestamp and place of the last trackpad tap, so a quick second touch that
     // moves becomes a tap-and-drag rather than a fresh cursor move.
     private var lastTapUpTime = 0L
     private var lastTapPos = Offset.Zero
 
-    suspend fun run() = scope.awaitPointerEventScope {
+    suspend fun run() {
+        try {
+            loop()
+        } finally {
+            // The handler restarts (mode or remote size change) or leaves
+            // mid-gesture: never leave a button held on the server.
+            releaseHeld()
+        }
+    }
+
+    private suspend fun loop() = scope.awaitPointerEventScope {
         while (true) {
             val event = awaitPointerEvent()
             val vp = viewSize()
@@ -260,6 +271,7 @@ private class GestureHandler(
             is Classification.Move -> {
                 val p = emitAbsMove(result.pos)
                 sink.mouseButton(MouseButtonCode.LEFT, true, p.x, p.y)
+                touchLeft = true
                 absDragLoop(firstDown.id)
             }
             is Classification.Multi -> handleTwoFinger(result.event)
@@ -371,8 +383,8 @@ private class GestureHandler(
 
         val sd = change.scrollDelta
         if (sd.x != 0f || sd.y != 0f) {
-            // Compose reports wheel-up as positive y; the server wants dy>0 for down.
-            val dy = -sd.y.roundToInt()
+            // Compose negates AXIS_VSCROLL, so positive y is wheel-down, as the server wants.
+            val dy = sd.y.roundToInt()
             val dx = sd.x.roundToInt()
             if (dx != 0 || dy != 0) sink.scroll(dx, dy, p.x, p.y)
         }
@@ -404,11 +416,24 @@ private class GestureHandler(
         val p = pointer.position
         sink.mouseMove(p.x, p.y)
         sink.mouseButton(MouseButtonCode.LEFT, true, p.x, p.y)
+        touchLeft = true
     }
 
     private fun releaseLeftAtCursor() {
         val p = pointer.position
         sink.mouseButton(MouseButtonCode.LEFT, false, p.x, p.y)
+        touchLeft = false
+    }
+
+    private fun releaseHeld() {
+        val p = pointer.position
+        if (touchLeft || mouseLeft) sink.mouseButton(MouseButtonCode.LEFT, false, p.x, p.y)
+        if (mouseMiddle) sink.mouseButton(MouseButtonCode.MIDDLE, false, p.x, p.y)
+        if (mouseRight) sink.mouseButton(MouseButtonCode.RIGHT, false, p.x, p.y)
+        touchLeft = false
+        mouseLeft = false
+        mouseMiddle = false
+        mouseRight = false
     }
 
     private fun leftClickAtCursor() {

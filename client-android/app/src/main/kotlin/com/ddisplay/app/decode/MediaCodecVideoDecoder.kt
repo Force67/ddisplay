@@ -32,9 +32,11 @@ class MediaCodecVideoDecoder : VideoDecoder {
     // parse inter-frames, and after any drop the reference chain is broken.
     private var awaitingKeyframe = true
 
-    // Deduplicates the resync request so a stalled decoder can't emit a request
-    // per dropped frame. Cleared when a keyframe is queued.
+    // Rate-limits the resync request so a stalled decoder can't emit one per
+    // dropped frame, yet a lost IDR is asked for again (the server never sends
+    // one on its own). Cleared when a keyframe is queued.
     private var keyframeRequested = true
+    private var keyframeRequestedAt = 0L
 
     // A codec-level failure recreate is in flight on the handler thread; drop
     // all input (even keyframes) until the new codec is running.
@@ -66,6 +68,7 @@ class MediaCodecVideoDecoder : VideoDecoder {
             // rather than asking; keyframeRequested starts set to suppress a
             // request until we actually lose sync mid-stream.
             this.keyframeRequested = true
+            this.keyframeRequestedAt = System.nanoTime()
             this.recreatePending = false
             ensureHandlerLocked()
             buildCodecLocked()
@@ -74,14 +77,18 @@ class MediaCodecVideoDecoder : VideoDecoder {
 
     override fun submit(data: ByteArray, keyframe: Boolean, pts: Long) {
         synchronized(lock) {
-            if (closed || recreatePending) return
+            if (closed) return
+            if (recreatePending || (awaitingKeyframe && !keyframe)) {
+                requestResyncLocked()
+                return
+            }
             val c = codec ?: return
-            if (awaitingKeyframe && !keyframe) return
 
             val index = availableInputs.removeFirstOrNull()
             if (index == null) {
                 // No free input buffer: the decoder is behind. Drop and resync
                 // on the next IDR, mirroring the native client.
+                events?.onFrameDropped()
                 requestResyncLocked()
                 return
             }
@@ -213,9 +220,14 @@ class MediaCodecVideoDecoder : VideoDecoder {
                 setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             }
         }
-        created.setCallback(callback, handler)
-        created.configure(format, target, null, 0)
-        created.start()
+        try {
+            created.setCallback(callback, handler)
+            created.configure(format, target, null, 0)
+            created.start()
+        } catch (e: Exception) {
+            created.release()
+            throw e
+        }
         codec = created
         availableInputs.clear()
         submitTimes.clear()
@@ -238,15 +250,18 @@ class MediaCodecVideoDecoder : VideoDecoder {
         recreatePending = true
         awaitingKeyframe = true
         keyframeRequested = true
+        keyframeRequestedAt = System.nanoTime()
         handler?.post { recreate() }
         events?.onNeedsKeyframe()
     }
 
-    /** Dropped a frame but the codec is healthy: resync on the next IDR, once. */
+    /** Out of sync: resync on the next IDR, re-asking if it has not arrived in time. */
     private fun requestResyncLocked() {
         awaitingKeyframe = true
-        if (!keyframeRequested) {
+        val now = System.nanoTime()
+        if (!keyframeRequested || now - keyframeRequestedAt >= RESYNC_RETRY_NS) {
             keyframeRequested = true
+            keyframeRequestedAt = now
             events?.onNeedsKeyframe()
         }
     }
@@ -287,6 +302,7 @@ class MediaCodecVideoDecoder : VideoDecoder {
         const val MAX_INFLIGHT = 32
         const val RETRY_DELAY_MS = 100L
         const val JOIN_TIMEOUT_MS = 500L
+        const val RESYNC_RETRY_NS = 1_000_000_000L
 
         fun mimeFor(codec: String): String = if (codec == "av1") MIME_AV1 else MIME_H264
 

@@ -11,9 +11,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -37,13 +37,11 @@ class OkHttpSessionClient(
     private val httpClient: OkHttpClient = defaultClient(),
 ) : SessionClient {
 
-    // DROP_OLDEST bounds memory when the consumer stalls: stale video frames are
-    // dropped rather than blocking the OkHttp reader thread.
-    private val _events = MutableSharedFlow<SessionEvent>(
-        extraBufferCapacity = 256,
-        onBufferOverflow = BufferOverflow.DROP_OLDEST,
-    )
-    override val events: Flow<SessionEvent> = _events
+    // Unbounded so the OkHttp reader thread never blocks and nothing is lost:
+    // a dropped control message or video frame would desync the session. The
+    // single consumer never blocks, so the queue stays short in practice.
+    private val _events = Channel<SessionEvent>(Channel.UNLIMITED)
+    override val events: Flow<SessionEvent> = _events.receiveAsFlow()
 
     @Volatile private var webSocket: WebSocket? = null
     @Volatile private var connected = false
@@ -58,7 +56,8 @@ class OkHttpSessionClient(
         loopJob?.cancel()
         loopJob = null
         connected = false
-        webSocket?.cancel()
+        // close() rather than cancel() so already queued sends (ReleaseAll) still go out.
+        webSocket?.close(NORMAL_CLOSURE, null)
         webSocket = null
     }
 
@@ -78,7 +77,7 @@ class OkHttpSessionClient(
             val opened = try {
                 closed.await()
             } catch (e: CancellationException) {
-                ws.cancel()
+                ws.close(NORMAL_CLOSURE, null)
                 throw e
             }
             connected = false
@@ -99,11 +98,11 @@ class OkHttpSessionClient(
         override fun onOpen(webSocket: WebSocket, response: Response) {
             opened = true
             connected = true
-            _events.tryEmit(SessionEvent.Connected)
+            _events.trySend(SessionEvent.Connected)
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-            _events.tryEmit(SessionEvent.BinaryMessage(bytes.toByteArray()))
+            _events.trySend(SessionEvent.BinaryMessage(bytes.toByteArray()))
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
@@ -116,13 +115,13 @@ class OkHttpSessionClient(
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             connected = false
-            _events.tryEmit(SessionEvent.Disconnected(reason.ifEmpty { null }))
+            _events.trySend(SessionEvent.Disconnected(reason.ifEmpty { null }))
             closed.complete(opened)
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             connected = false
-            _events.tryEmit(SessionEvent.Disconnected(t.message))
+            _events.trySend(SessionEvent.Disconnected(t.message))
             closed.complete(opened)
         }
     }

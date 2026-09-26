@@ -98,8 +98,14 @@ pub struct VkHwDecoder {
     decoder: WgpuTexturesDecoder,
     pub needs_keyframe: bool,
     consecutive_errors: u32,
+    /// Error-free decode calls since the last error. Strikes are forgiven
+    /// only after a sustained run, so a driver that decodes IDRs but fails
+    /// every P-frame still reaches is_dead().
+    clean_streak: u32,
     frames_out: u64,
 }
+
+const CLEAN_STREAK_TO_RECOVER: u32 = 30;
 
 impl VkHwDecoder {
     pub fn new(ctx: Arc<VkVideoContext>) -> Result<Self> {
@@ -115,6 +121,7 @@ impl VkHwDecoder {
             decoder,
             needs_keyframe: false,
             consecutive_errors: 0,
+            clean_streak: 0,
             frames_out: 0,
         })
     }
@@ -139,14 +146,21 @@ impl VkHwDecoder {
             Err(e) => return Err(self.on_error(e)),
         };
         match self.decoder.flush() {
-            Ok(mut flushed) => frames.append(&mut flushed),
+            Ok(mut flushed) => {
+                frames.append(&mut flushed);
+                if !frames.is_empty() {
+                    self.clean_streak += 1;
+                    if self.clean_streak >= CLEAN_STREAK_TO_RECOVER {
+                        self.consecutive_errors = 0;
+                    }
+                }
+            }
             Err(e) => {
                 if frames.is_empty() {
                     return Err(self.on_error(e));
                 }
                 // Keep what decode() already produced; still resync on an IDR.
-                self.consecutive_errors += 1;
-                self.needs_keyframe = true;
+                let e = self.on_error(e);
                 eprintln!("[vk-video] flush error (keeping decoded frames): {e}");
             }
         }
@@ -170,9 +184,6 @@ impl VkHwDecoder {
                 height: h,
             });
         }
-        if newest.is_some() {
-            self.consecutive_errors = 0;
-        }
         Ok(newest)
     }
 
@@ -180,6 +191,7 @@ impl VkHwDecoder {
     /// missed-frame handling); ask for one and count strikes toward is_dead.
     fn on_error(&mut self, e: gpu_video::DecoderError) -> anyhow::Error {
         self.consecutive_errors += 1;
+        self.clean_streak = 0;
         self.needs_keyframe = true;
         anyhow::anyhow!("vulkan decode error: {e}")
     }

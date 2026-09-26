@@ -41,6 +41,7 @@ The web client is served at `http://<host>:9550`. Without `--display` the server
 | `--backend` | `auto` | `auto` / `x11` / `wayland` / `portal` |
 | `--resize-to-client` | `true` | Match the X display to the client size |
 | `--shared-dir <dir>` | none | Serve a folder over HTTP |
+| `--allow-usb` | off | Accept forwarded client USB devices (no auth, see `docs/usb-forwarding.md`) |
 
 `--help` lists the rest.
 

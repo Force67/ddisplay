@@ -28,6 +28,8 @@ pub const ENODEV: i32 = -19;
 /// Endpoint stalled.
 pub const EPIPE: i32 = -32;
 pub const ETIMEDOUT: i32 = -110;
+/// Transfer-level I/O error (what the kernel reports for CRC/bit-stuff errors).
+pub const EPROTO: i32 = -71;
 pub const EIO: i32 = -5;
 
 #[derive(Debug, PartialEq)]

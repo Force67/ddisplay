@@ -138,6 +138,12 @@ struct Args {
     /// The file will be wrapped in a zip and offered as a download.
     #[arg(long)]
     client_bin: Option<PathBuf>,
+
+    /// Accept USB devices forwarded by clients (attached via usbip vhci-hcd).
+    /// There is no authentication: anyone who can reach the port can then
+    /// attach arbitrary USB devices to this machine.
+    #[arg(long)]
+    allow_usb: bool,
 }
 
 /// Everything needed to (re)build an encoder at runtime.
@@ -403,6 +409,7 @@ async fn main() -> anyhow::Result<()> {
         stream_control.clone(),
         server_codecs,
         args.resize_to_client,
+        args.allow_usb,
     )
     .await?;
 

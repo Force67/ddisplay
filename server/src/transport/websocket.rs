@@ -45,6 +45,8 @@ pub struct AppState {
     server_codecs: Vec<String>,
     /// Resize the X display to a connecting client's native resolution.
     resize_to_client: bool,
+    /// Accept client USB devices (--allow-usb).
+    allow_usb: bool,
     /// Capabilities reported by currently connected clients, by connection id.
     client_caps: Mutex<HashMap<u64, ClientCaps>>,
     next_conn_id: AtomicU64,
@@ -174,6 +176,7 @@ pub async fn start_server(
     control: Arc<StreamControl>,
     server_codecs: Vec<String>,
     resize_to_client: bool,
+    allow_usb: bool,
 ) -> anyhow::Result<(FrameSender, InputReceiver)> {
     // Capacity absorbs short TCP send stalls without dropping frames (a drop
     // breaks the H.264/AV1 reference chain and costs a full IDR resync).
@@ -206,6 +209,7 @@ pub async fn start_server(
         control: control.clone(),
         server_codecs,
         resize_to_client,
+        allow_usb,
         client_caps: Mutex::new(HashMap::new()),
         next_conn_id: AtomicU64::new(1),
     });
@@ -425,6 +429,10 @@ async fn handle_websocket(socket: WebSocket, state: Arc<AppState>, readonly: boo
                         // readonly viewers (attaching hardware is write access).
                         ClientEvent::UsbAttach(req) => {
                             if readonly {
+                                continue;
+                            }
+                            if !recv_state.allow_usb {
+                                usb.reject(req.token, "USB forwarding is disabled on the server (start it with --allow-usb)").await;
                                 continue;
                             }
                             usb.attach(req).await;

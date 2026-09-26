@@ -8,8 +8,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
+use rusb::constants::*;
 use rusb::{DeviceHandle, GlobalContext, TransferType};
 
 use crate::protocol;
@@ -27,6 +29,7 @@ pub struct SharedDevice {
     /// One URB queue per endpoint; key is the endpoint address (direction
     /// bit included, 0 for the shared control pipe).
     workers: HashMap<u8, mpsc::Sender<SubmitCmd>>,
+    threads: Vec<JoinHandle<()>>,
     exec: Arc<Exec>,
     attach_json: Vec<u8>,
 }
@@ -40,6 +43,8 @@ struct Exec {
     /// Set on the first ENODEV; stops all workers answering further URBs.
     dead: AtomicBool,
     detach_sent: AtomicBool,
+    /// Set when the SharedDevice is dropped; workers exit without replying.
+    stop: AtomicBool,
     sender: TransportSender,
 }
 
@@ -104,6 +109,7 @@ impl SharedDevice {
             token,
             reader: PduReader::new(),
             workers: HashMap::new(),
+            threads: Vec::new(),
             exec: Arc::new(Exec {
                 token,
                 handle,
@@ -111,6 +117,7 @@ impl SharedDevice {
                 urbs: Mutex::new(UrbMaps::default()),
                 dead: AtomicBool::new(false),
                 detach_sent: AtomicBool::new(false),
+                stop: AtomicBool::new(false),
                 sender,
             }),
             attach_json,
@@ -157,16 +164,33 @@ impl SharedDevice {
         self.workers.entry(key).or_insert_with(|| {
             let (tx, rx) = mpsc::channel::<SubmitCmd>();
             let exec = self.exec.clone();
-            std::thread::Builder::new()
+            let thread = std::thread::Builder::new()
                 .name(format!("usb-{}-ep{:02x}", self.token, key))
                 .spawn(move || {
                     while let Ok(cmd) = rx.recv() {
+                        if exec.stop.load(Ordering::Relaxed) {
+                            break;
+                        }
                         exec.run(cmd);
                     }
                 })
                 .expect("spawn usb worker");
+            self.threads.push(thread);
             tx
         })
+    }
+}
+
+/// Stop and join the workers so the last Exec reference, and with it the
+/// DeviceHandle, goes away here: that releases the interfaces and gives the
+/// device back to its host driver before a reconnect claims it again.
+impl Drop for SharedDevice {
+    fn drop(&mut self) {
+        self.exec.stop.store(true, Ordering::Relaxed);
+        self.workers.clear();
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -270,10 +294,15 @@ impl Exec {
             .unwrap_or(TransferType::Bulk);
 
         if cmd.direction == DIR_IN {
-            // Stay pending (like a real URB) until data, an error, or an
-            // unlink; the slice bounds how late an unlink is noticed.
+            // Stay pending (like a real URB) until the transfer completes, an
+            // error, or an unlink; the slice bounds how late an unlink or stop
+            // is noticed. Bytes read before a slice timed out stay in buf.
             let mut buf = vec![0u8; cmd.transfer_buffer_length as usize];
+            let mut done = 0;
             loop {
+                if self.stop.load(Ordering::Relaxed) {
+                    return;
+                }
                 if self.dead.load(Ordering::Relaxed) {
                     return self.finish(&cmd, proto::ENODEV, 0, &[]);
                 }
@@ -281,14 +310,12 @@ impl Exec {
                     // finish() turns this into the RET_UNLINK reply.
                     return self.finish(&cmd, proto::ECONNRESET, 0, &[]);
                 }
-                let r = match ttype {
-                    TransferType::Interrupt => self.handle.read_interrupt(ep, &mut buf, IN_SLICE),
-                    _ => self.handle.read_bulk(ep, &mut buf, IN_SLICE),
-                };
-                match r {
-                    Ok(n) => return self.finish(&cmd, 0, n as u32, &buf[..n]),
-                    Err(rusb::Error::Timeout) => continue,
-                    Err(e) => return self.finish(&cmd, self.errno(e), 0, &[]),
+                let (rc, n) = self.read_slice(ep, ttype, &mut buf[done..]);
+                done += n;
+                match rc {
+                    0 => return self.finish(&cmd, 0, done as u32, &buf[..done]),
+                    LIBUSB_ERROR_TIMEOUT => continue,
+                    rc => return self.finish(&cmd, self.errno(libusb_error(rc)), 0, &[]),
                 }
             }
         } else {
@@ -302,6 +329,28 @@ impl Exec {
             };
             self.finish_result(&cmd, r);
         }
+    }
+
+    /// One IN wait. Calls libusb directly because rusb reports a timeout
+    /// after partial data as plain success, which would complete the URB
+    /// short at a slice boundary. Returns the libusb code and bytes read.
+    fn read_slice(&self, ep: u8, ttype: TransferType, buf: &mut [u8]) -> (i32, usize) {
+        let transfer = match ttype {
+            TransferType::Interrupt => rusb::ffi::libusb_interrupt_transfer,
+            _ => rusb::ffi::libusb_bulk_transfer,
+        };
+        let mut transferred = 0;
+        let rc = unsafe {
+            transfer(
+                self.handle.as_raw(),
+                ep,
+                buf.as_mut_ptr(),
+                buf.len() as i32,
+                &mut transferred,
+                IN_SLICE.as_millis() as u32,
+            )
+        };
+        (rc, transferred.max(0) as usize)
     }
 
     fn finish_result(&self, cmd: &SubmitCmd, r: rusb::Result<usize>) {
@@ -337,7 +386,8 @@ impl Exec {
             rusb::Error::Pipe => proto::EPIPE,
             rusb::Error::Timeout => proto::ETIMEDOUT,
             rusb::Error::InvalidParam | rusb::Error::NotSupported => proto::EINVAL,
-            rusb::Error::NoDevice | rusb::Error::NotFound | rusb::Error::Io => {
+            rusb::Error::Io => proto::EPROTO,
+            rusb::Error::NoDevice => {
                 self.dead.store(true, Ordering::Relaxed);
                 if !self.detach_sent.swap(true, Ordering::Relaxed) {
                     eprintln!("[usb] token {}: device lost ({e})", self.token);
@@ -347,6 +397,18 @@ impl Exec {
             }
             _ => proto::EIO,
         }
+    }
+}
+
+/// The rusb error for a raw libusb code, as far as errno() tells them apart.
+fn libusb_error(rc: i32) -> rusb::Error {
+    match rc {
+        LIBUSB_ERROR_PIPE => rusb::Error::Pipe,
+        LIBUSB_ERROR_IO => rusb::Error::Io,
+        LIBUSB_ERROR_NO_DEVICE => rusb::Error::NoDevice,
+        LIBUSB_ERROR_INVALID_PARAM => rusb::Error::InvalidParam,
+        LIBUSB_ERROR_NOT_SUPPORTED => rusb::Error::NotSupported,
+        _ => rusb::Error::Other,
     }
 }
 

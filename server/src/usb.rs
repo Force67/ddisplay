@@ -10,6 +10,8 @@
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -43,13 +45,18 @@ struct Port {
     writer: mpsc::Sender<Vec<u8>>,
     reader_task: JoinHandle<()>,
     writer_task: JoinHandle<()>,
+    /// Set once the kernel closed its socket: the port is free again and may
+    /// already belong to another connection, so it must not be detached.
+    released: Arc<AtomicBool>,
 }
 
 impl Drop for Port {
     fn drop(&mut self) {
         self.reader_task.abort();
         self.writer_task.abort();
-        detach_port(self.hub_port);
+        if !self.released.load(Ordering::Acquire) {
+            detach_port(self.hub_port);
+        }
     }
 }
 
@@ -63,6 +70,7 @@ impl ConnectionUsb {
     pub async fn attach(&mut self, req: UsbAttachRequest) {
         let token = req.token;
         self.ports.remove(&token);
+        self.ports.retain(|_, p| !p.released.load(Ordering::Acquire));
 
         let (hub_port, sock) = match vhci_attach(&req).await {
             Ok(v) => v,
@@ -71,7 +79,7 @@ impl ConnectionUsb {
                     "[usb] attach {:04x}:{:04x} failed: {e:#}",
                     req.vendor_id, req.product_id,
                 );
-                let _ = self.usb_tx.send(protocol::encode_usb_error(token, &format!("{e:#}"))).await;
+                self.reject(token, &format!("{e:#}")).await;
                 return;
             }
         };
@@ -84,6 +92,8 @@ impl ConnectionUsb {
         let (mut rd, mut wr) = sock.into_split();
 
         let usb_tx = self.usb_tx.clone();
+        let released = Arc::new(AtomicBool::new(false));
+        let reader_released = released.clone();
         let reader_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 64 * 1024];
             loop {
@@ -98,6 +108,7 @@ impl ConnectionUsb {
             }
             // The kernel closed its end (port error or detach): the port is
             // already gone, so just tell the client to stop serving URBs.
+            reader_released.store(true, Ordering::Release);
             let _ = usb_tx.send(protocol::encode_usb_detach(token)).await;
         });
 
@@ -110,7 +121,11 @@ impl ConnectionUsb {
         });
 
         let _ = self.usb_tx.send(protocol::encode_usb_attached(token, hub_port)).await;
-        self.ports.insert(token, Port { hub_port, writer: write_tx, reader_task, writer_task });
+        self.ports.insert(token, Port { hub_port, writer: write_tx, reader_task, writer_task, released });
+    }
+
+    pub async fn reject(&self, token: u32, reason: &str) {
+        let _ = self.usb_tx.send(protocol::encode_usb_error(token, reason)).await;
     }
 
     /// Forward a chunk of the client's usbip stream to the kernel socket.

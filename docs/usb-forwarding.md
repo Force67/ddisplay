@@ -35,11 +35,15 @@ network: usbip. The server never interprets USB traffic, it only moves bytes.
   requests that change libusb-visible state (`SET_CONFIGURATION`,
   `SET_INTERFACE`, `CLEAR_FEATURE(ENDPOINT_HALT)`) go through the libusb API
   instead of the raw pipe, mirroring the kernel stub driver. IN transfers
-  wait in 500ms slices so a pending URB notices its unlink promptly.
+  wait in 500ms slices so a pending URB notices its unlink promptly; data
+  read before a slice times out is kept and the transfer continues.
 
 ## Usage
 
 ```sh
+# server: USB forwarding is off unless enabled
+ddisplay-server --allow-usb ...
+
 # see what is connected
 ddisplay-client --list-usb
 
@@ -49,6 +53,12 @@ ddisplay-client --server <host>:9550 --share-usb 046d:c52b
 
 Devices are offered on every (re)connect and released on disconnect, which
 also returns them to their local drivers.
+
+**Security:** there is no authentication. With `--allow-usb`, anyone who
+can reach the server port (and is not a readonly viewer, which the client
+chooses itself) can attach arbitrary USB devices to the server's kernel.
+Only enable it on trusted networks. Without the flag the server rejects
+every attach with an error.
 
 ## Requirements
 
